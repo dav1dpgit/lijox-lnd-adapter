@@ -1,0 +1,103 @@
+// lightning-openchannel.proto — LIJOX LSP adapter v0.18+ (Phase D.2).
+//
+// Minimal subset of LND's lnrpc/lightning.proto, containing only the
+// OpenChannelSync RPC and the messages/enums it uses. Loaded as a SEPARATE
+// proto from lightning.proto (the v0.1 custom-message stub) so neither
+// touches the other.
+//
+// v0.18.8 (CORRECTED FIELD NUMBERS — root cause of all openChannelSync
+// failures since the 11:51 AM deploy on 2026-05-31):
+//
+//   The previous version of this file had field numbers fabricated from
+//   memory in an earlier session. In particular:
+//     - `node_pubkey_string` was declared at field 14, but in LND's actual
+//       proto field 14 is `funding_shim` (a FundingShim message). When the
+//       adapter sent the 66-char hex pubkey with tag 14, LND parsed it
+//       as a length-delimited FundingShim payload and crashed on the
+//       garbage contents — producing "proto: cannot parse invalid
+//       wire-format data".
+//     - `commitment_type` was declared at field 21, but in LND's actual
+//       proto field 21 is `base_fee` (uint64). The enum-vs-uint64 type
+//       mismatch at the same wire-type is silently tolerated for the
+//       varint, but the FundingShim mis-parse above kills the request
+//       first.
+//     - `zero_conf` and `scid_alias` were also at the wrong field numbers
+//       (24, 25 — those are `use_fee_rate` and `remote_chan_reserve_sat`
+//       in LND).
+//
+//   Field numbers in this version verified against LND's authoritative
+//   proto via the lightningj javadoc (auto-generated from
+//   lnrpc/lightning.proto). The relevant block from LND:
+//     int64 min_htlc_msat = 9;
+//     uint32 remote_csv_delay = 10;
+//     int32 min_confs = 11;
+//     bool spend_unconfirmed = 12;
+//     ... close_address = 13, funding_shim = 14 ...
+//     uint64 remote_max_value_in_flight_msat = 15;
+//     uint32 remote_max_htlcs = 16;
+//     uint32 max_local_csv = 17;
+//     CommitmentType commitment_type = 18;
+//     bool zero_conf = 19;
+//     bool scid_alias = 20;
+//
+//   Why 9:09 AM worked: the proto file deployed on UM890 BEFORE today's
+//   scp had the correct field numbers from a prior session. The 11:51 AM
+//   scp of v0.18.5 OVERWROTE that file with my stale (wrong) base.
+
+syntax = "proto3";
+
+package lnrpc;
+
+enum CommitmentType {
+    UNKNOWN_COMMITMENT_TYPE = 0;
+    LEGACY = 1;
+    STATIC_REMOTE_KEY = 2;
+    ANCHORS = 3;
+    SCRIPT_ENFORCED_LEASE = 4;
+    SIMPLE_TAPROOT = 5;
+    SIMPLE_TAPROOT_OVERLAY = 6;
+}
+
+service Lightning {
+    rpc OpenChannelSync (OpenChannelRequest) returns (ChannelPoint);
+}
+
+message OpenChannelRequest {
+    // Field numbers MUST match LND's actual lightning.proto. Field 14 in
+    // LND is `funding_shim` (FundingShim message). Sending a string here
+    // would be re-parsed by LND as a FundingShim and fail. The deprecated
+    // node_pubkey_string is at field 3; OpenChannelSync REQUIRES the hex
+    // string form (it doesn't read the bytes node_pubkey field).
+    string node_pubkey_string = 3;
+    int64 local_funding_amount = 4;
+    int64 push_sat = 5;
+    int32 target_conf = 6;
+    int64 sat_per_byte = 7;
+    bool private = 8;
+    int64 min_htlc_msat = 9;
+    int32 min_confs = 11;
+    CommitmentType commitment_type = 18;
+    bool zero_conf = 19;
+    bool scid_alias = 20;
+    // 0.66.0 (S43, DP): LND fields 21–24 (lnd ≥ 0.16, verified in the header
+    // notes above: 21 = base_fee, 24 = use_fee_rate). The channel's OWN fee
+    // policy is set in the open itself, so LND never applies its config
+    // default to a LiJ channel. use_* must be true for a true 0 to count.
+    uint64 base_fee = 21;
+    uint64 fee_rate = 22;
+    bool use_base_fee = 23;
+    bool use_fee_rate = 24;
+    // v0.54: LND field 25 (verified in the header notes above from
+    // LND's authoritative proto). Sets the WALLET-side channel
+    // reserve at open. PROTO3: 0 == unset ⇒ LND uses its ~1%
+    // default; true zero is inexpressible — floor is BOLT2 dust.
+    uint64 remote_chan_reserve_sat = 25;
+}
+
+message ChannelPoint {
+    oneof funding_txid {
+        bytes funding_txid_bytes = 1;
+        string funding_txid_str = 2;
+    }
+    uint32 output_index = 3;
+}

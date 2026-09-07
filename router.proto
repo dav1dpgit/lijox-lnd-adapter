@@ -1,0 +1,130 @@
+// router.proto — minimal subset for LIJOX LSP adapter v0.17+ (v0.18 extended)
+//
+// v0.17: HtlcInterceptor bidirectional RPC (Phase D.1 observability)
+// v0.18: + SendToRouteV2 unary RPC (Phase D.2 trampoline outbound)
+// v0.18.7-enumfix: CORRECTED ResolveHoldForwardAction enum values to match
+//   LND canonical wire order (SETTLE=0, FAIL=1, RESUME=2). Prior values were
+//   reversed (RESUME=0, SETTLE=1, FAIL=2), which — under enums:String — caused
+//   every interceptor action to be mis-encoded on the wire:
+//       'SETTLE' -> 1 -> LND read FAIL   (inbound HTLC failed, never settled)
+//       'FAIL'   -> 2 -> LND read RESUME (stale SCIDs forwarded -> missing-preimage)
+//       'RESUME' -> 0 -> LND read SETTLE (settle attempted with no preimage)
+//   No JS changes required; the adapter passes action by name.
+//
+// Sourced from LND's lnrpc/routerrpc/router.proto. Field numbers must
+// match LND's wire format exactly.
+
+syntax = "proto3";
+
+package routerrpc;
+
+service Router {
+    // ── HtlcInterceptor (v0.17 — Phase D.1) ──────────────────────────────────
+    rpc HtlcInterceptor (stream ForwardHtlcInterceptResponse)
+        returns (stream ForwardHtlcInterceptRequest);
+
+    // ── SendToRouteV2 (v0.18 — Phase D.2) ────────────────────────────────────
+    // Send a payment along a caller-specified route with a caller-specified
+    // payment_hash. Returns the HTLC attempt result (preimage on success).
+    rpc SendToRouteV2 (SendToRouteRequest) returns (HTLCAttempt);
+}
+
+// ── HtlcInterceptor messages (v0.17) ─────────────────────────────────────────
+
+message CircuitKey {
+    uint64 chan_id = 1;
+    uint64 htlc_id = 2;
+}
+
+message ForwardHtlcInterceptRequest {
+    CircuitKey incoming_circuit_key = 1;
+    uint64 incoming_amount_msat = 5;
+    uint32 incoming_expiry = 6;
+    bytes payment_hash = 2;
+    uint64 outgoing_requested_chan_id = 7;
+    uint64 outgoing_amount_msat = 3;
+    uint32 outgoing_expiry = 4;
+    map<uint64, bytes> custom_records = 8;
+    bytes onion_blob = 9;
+    int32 auto_fail_height = 10;
+}
+
+// v0.18.7-enumfix: canonical LND order. DO NOT reorder — values are wire-significant.
+enum ResolveHoldForwardAction {
+    SETTLE = 0;
+    FAIL = 1;
+    RESUME = 2;
+}
+
+message ForwardHtlcInterceptResponse {
+    CircuitKey incoming_circuit_key = 1;
+    ResolveHoldForwardAction action = 2;
+    bytes preimage = 3;
+    bytes failure_message = 4;
+    uint32 failure_code = 5;
+}
+
+// ── SendToRouteV2 messages (v0.18) ───────────────────────────────────────────
+
+message SendToRouteRequest {
+    bytes payment_hash = 1;
+    Route route = 2;
+    bool skip_temp_err = 3;
+}
+
+message Route {
+    uint32 total_time_lock = 1;
+    int64 total_fees = 2;
+    int64 total_amt = 3;
+    repeated Hop hops = 4;
+    uint64 total_fees_msat = 5;
+    uint64 total_amt_msat = 6;
+}
+
+message Hop {
+    uint64 chan_id = 1;
+    int64 chan_capacity = 2;
+    int64 amt_to_forward = 3;
+    int64 fee = 4;
+    uint32 expiry = 5;
+    uint64 amt_to_forward_msat = 6;
+    uint64 fee_msat = 7;
+    string pub_key = 8;
+    bool tlv_payload = 9;
+    MppRecord mpp_record = 10;
+    map<uint64, bytes> custom_records = 11;
+    bytes metadata = 13;
+}
+
+message MppRecord {
+    bytes payment_addr = 11;
+    int64 total_amt_msat = 10;
+}
+
+enum HTLCStatus {
+    IN_FLIGHT = 0;
+    SUCCEEDED = 1;
+    FAILED = 2;
+}
+
+message HTLCAttempt {
+    uint64 attempt_id = 7;
+    HTLCStatus status = 1;
+    Route route = 2;
+    int64 attempt_time_ns = 3;
+    int64 resolve_time_ns = 4;
+    Failure failure = 5;
+    bytes preimage = 6;
+}
+
+message Failure {
+    enum FailureCode {
+        RESERVED = 0;
+        INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS = 1;
+        UNKNOWN_FAILURE = 998;
+        INTERNAL_FAILURE = 997;
+    }
+    FailureCode code = 1;
+    uint32 failure_source_index = 6;
+    bytes onion_sha_256 = 7;
+}

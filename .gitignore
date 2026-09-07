@@ -1,0 +1,30 @@
+# lijox-adapter — P3 hard excludes. Written BEFORE the first import.
+# Secrets / identity — never in this repo, in any form
+.env
+.env.*
+*.macaroon
+*.cert
+*.pem
+*.key
+# Operator state — user-linked data stays on the operator's box
+push-subs.json
+delegate-slips.json
+client-prefs.json
+attempt-journal.json
+jit-counters.json
+openintents.json
+lnurlp-registry.json
+lease-state.json
+lease-log.ndjson
+tapes/
+*.db
+*.db-shm
+*.db-wal
+# Backup droppings — the patcher era's exhaust
+*.bak
+*.bak-*
+*backup*
+*.pre-*
+*.broken-*
+# Runtime
+node_modules/

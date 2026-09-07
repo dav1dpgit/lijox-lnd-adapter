@@ -1,0 +1,37 @@
+// walletkit.proto — LND WalletKit subset
+//
+// Only PublishTransaction is needed for Step 3. It accepts a serialized raw
+// transaction (bytes) and asks LND's wallet subsystem to relay it to the
+// Bitcoin P2P network. Used to fulfill wallet-initiated BroadcastTx requests
+// for force-close commitments, sweeps, and cooperative-close txs.
+//
+// Lives in package walletrpc / service WalletKit on the same LND gRPC port
+// (10009) with the same TLS cert and macaroon as ChainNotifier and Lightning.
+// The lij-adapter-v2 macaroon's onchain:write scope covers this RPC.
+
+syntax = "proto3";
+
+package walletrpc;
+
+service WalletKit {
+    // Unary. Submit a raw transaction for relay. Empty publish_error in the
+    // response = success. Non-empty = error string from the wallet/mempool
+    // (e.g. "transaction already exists in mempool", "insufficient fee", etc).
+    // The bridge classifies these into BroadcastAck::{Relayed,Rejected,Unavailable}.
+    rpc PublishTransaction (Transaction) returns (PublishResponse);
+}
+
+message Transaction {
+    // The raw bytes of the transaction. Field is named tx_hex for legacy
+    // reasons but the type is bytes — pass the binary serialization, not hex.
+    bytes tx_hex = 1;
+
+    // Optional human-readable label LND will store with the tx. We pass a
+    // tag like "lij-broadcast:<request_id>" for traceability.
+    string label = 2;
+}
+
+message PublishResponse {
+    // Empty string = success. Non-empty = mempool/wallet error.
+    string publish_error = 1;
+}

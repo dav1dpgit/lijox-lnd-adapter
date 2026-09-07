@@ -1,0 +1,21 @@
+{
+  "name": "lijox-adapter",
+  "version": "0.70.1",
+  "description": "LIJOX Adapter \u2014 open-source, self-hosted software that translates an operator's existing Lightning services into a LIJOX-standard LSP for LiJ-class wallets.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.0",
+    "better-sqlite3": "^12.10.0",
+    "dotenv": "^17.4.2",
+    "secp256k1": "^5.0.1",
+    "web-push": "^3.6.7",
+    "ws": "^8.20.0"
+  }
+}

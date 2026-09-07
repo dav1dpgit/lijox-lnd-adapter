@@ -1,0 +1,96 @@
+// chainnotifier.proto — LND ChainNotifier + WalletKit subset
+//
+// Two LND subservices needed for Step 3 cooperative chain integration:
+//
+//   chainrpc.ChainNotifier  - block / conf / spend notification streams
+//   walletrpc.WalletKit     - raw tx broadcast (PublishTransaction)
+//
+// Both live behind the same LND gRPC port (10009), TLS cert, and macaroon
+// (the lij-adapter-v2 macaroon already covers onchain:read+write needed here).
+//
+// Field numbers MUST match LND's real protos exactly — gRPC dispatches on
+// fully-qualified path /chainrpc.ChainNotifier/RegisterBlockEpochNtfn etc.,
+// and decodes fields by their numeric tag. Any mismatch silently corrupts
+// payloads. Source: github.com/lightningnetwork/lnd/lnrpc/chainrpc and
+// /walletrpc.
+
+syntax = "proto3";
+
+package chainrpc;
+
+// ── ChainNotifier service ────────────────────────────────────────────────────
+
+service ChainNotifier {
+    // Server-streaming. Emits one BlockEpoch per new block at LND's tip.
+    // The request can be empty (start from current tip) or seeded with a
+    // prior BlockEpoch to resume from a known point.
+    rpc RegisterBlockEpochNtfn (BlockEpoch) returns (stream BlockEpoch);
+
+    // Server-streaming. Emits ConfDetails when txid reaches num_confs depth,
+    // or Reorg if the confirming block is reorged out. Stream stays open
+    // through reorgs — does not auto-close after first conf event.
+    rpc RegisterConfirmationsNtfn (ConfRequest) returns (stream ConfEvent);
+
+    // Server-streaming. Emits SpendDetails when outpoint is spent on chain,
+    // or Reorg if the spending block is reorged out.
+    rpc RegisterSpendNtfn (SpendRequest) returns (stream SpendEvent);
+}
+
+message BlockEpoch {
+    bytes hash = 1;     // 32-byte little-endian blockhash
+    uint32 height = 2;
+}
+
+message ConfRequest {
+    bytes txid = 1;         // 32-byte little-endian txid (or zeros to use script-only matching)
+    bytes script = 2;       // pkScript bytes; required so SPV clients can match
+    uint32 num_confs = 3;   // confirmation depth at which event fires
+    uint32 height_hint = 4; // start search from this block height (lower = wider scan)
+    bool include_block = 5; // if true, ConfDetails.raw_block populated (we don't need it)
+}
+
+message ConfDetails {
+    bytes raw_tx = 1;       // raw transaction bytes when confirmed
+    bytes block_hash = 2;   // 32-byte blockhash of confirming block
+    uint32 block_height = 3;
+    uint32 tx_index = 4;    // position of tx within the block
+    bytes raw_block = 5;    // present only if ConfRequest.include_block=true
+}
+
+message Reorg {
+    // Empty marker. Signals the previously-emitted conf/spend was reorged out.
+    // Stream remains open and will re-emit if/when re-confirmed.
+}
+
+message ConfEvent {
+    oneof event {
+        ConfDetails conf = 1;
+        Reorg reorg = 2;
+    }
+}
+
+message Outpoint {
+    bytes hash = 1;     // 32-byte funding txid (little-endian)
+    uint32 index = 2;   // output index within the funding tx
+}
+
+message SpendRequest {
+    Outpoint outpoint = 1;
+    bytes script = 2;       // pkScript of the output being watched (can be empty if outpoint is set)
+    uint32 height_hint = 3;
+}
+
+message SpendDetails {
+    Outpoint spending_outpoint = 1;     // outpoint of the spending tx's input that consumed our outpoint
+    bytes raw_spending_tx = 2;
+    bytes spending_tx_hash = 3;         // 32-byte txid of the spending tx
+    uint32 spending_input_index = 4;    // index within spending tx of the consuming input
+    uint32 spending_height = 5;         // block height where the spend confirmed
+}
+
+message SpendEvent {
+    oneof event {
+        SpendDetails spend = 1;
+        Reorg reorg = 2;
+    }
+}

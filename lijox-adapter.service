@@ -1,0 +1,46 @@
+# lijox-adapter systemd unit template (v0.48)
+# Install: cp lijox-adapter.service /etc/systemd/system/
+#          systemctl daemon-reload && systemctl enable --now lijox-adapter
+# Adjust User=, WorkingDirectory=, EnvironmentFile= to your install.
+[Unit]
+# 0.57.0 (d): park a truly sick service instead of flapping forever
+StartLimitIntervalSec=600
+StartLimitBurst=20
+Description=LIJOX Adapter — LIJOX-standard LSP front for an existing Lightning node
+After=network-online.target lnd.service
+Wants=network-online.target
+
+[Service]
+# 0.57.0 (c): watchdog — the adapter pets via systemd-notify every 30s
+# while its liveness-critical loops are fresh; NotifyAccess=all because
+# the pet arrives from a short-lived child process
+WatchdogSec=90
+NotifyAccess=all
+Type=simple
+User=lijox
+WorkingDirectory=/opt/lijox-adapter
+EnvironmentFile=/etc/lijox-adapter/config.env
+Environment=LIJ_DATA_DIR=/var/lib/lijox-adapter
+ExecStart=/usr/bin/node /opt/lijox-adapter/lij-adapter.js
+Restart=always
+RestartSec=5
+
+# Privacy: bound what journald keeps of this service's logs.
+# (Also consider SystemMaxUse= in /etc/systemd/journald.conf.)
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=1000
+
+# Hardening — least privilege by default.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/lijox-adapter
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

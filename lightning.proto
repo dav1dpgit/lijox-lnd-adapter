@@ -1,0 +1,44 @@
+// lightning.proto — minimal subset
+//
+// Self-contained subset of LND's lnrpc/lightning.proto, vendoring only the
+// messages we use:
+//   - SubscribeCustomMessages (server-streaming)
+//   - SendCustomMessage       (unary)
+//
+// gRPC ignores fields not declared on either side, so a subset works fine
+// against LND's full proto. The package, service, method, and field numbers
+// MUST match LND's real lightning.proto exactly — gRPC dispatches on the
+// fully-qualified path /lnrpc.Lightning/SubscribeCustomMessages and decodes
+// fields by their numeric tag.
+
+syntax = "proto3";
+
+package lnrpc;
+
+service Lightning {
+    // Server-streaming RPC. LND emits one CustomMessage per incoming peer
+    // message with type >= 32768 (custom range).
+    rpc SubscribeCustomMessages (SubscribeCustomMessagesRequest) returns (stream CustomMessage);
+
+    // Unary RPC. Sends a single custom message to the named peer.
+    // Response is empty on success; failures surface as gRPC errors.
+    rpc SendCustomMessage (SendCustomMessageRequest) returns (SendCustomMessageResponse);
+}
+
+message SubscribeCustomMessagesRequest {
+}
+
+message CustomMessage {
+    bytes peer  = 1;  // 33-byte compressed peer pubkey
+    uint32 type = 2;  // u16 message type, widened to u32 in proto
+    bytes data  = 3;  // raw message body bytes (the LiJ-encoded payload)
+}
+
+message SendCustomMessageRequest {
+    bytes peer  = 1;
+    uint32 type = 2;
+    bytes data  = 3;
+}
+
+message SendCustomMessageResponse {
+}
