@@ -130,3 +130,5 @@ WHAT YOU NEED BEFORE STARTING
 
 Design documents live in the LiJ repo:
 docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
+
+Names and marks (Lightning in a Jar, LiJ, LIJOX, the jar logo) are not licensed with the code — see [TRADEMARKS.md](TRADEMARKS.md).
