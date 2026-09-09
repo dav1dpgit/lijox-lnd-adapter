@@ -503,6 +503,11 @@ function oiRateLimited(ip) {
 // Possession-gated (uploader pubkey must be a live peer), 256KB cap,
 // 20/hour per IP. Written to tapes/ beside the adapter + a journal digest.
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
+// 0.72.0 (S45 #10): the PL engine — fee ledger + daily snapshots (pl.js). Created
+// at boot next to the console; the fee-realization points below write through
+// plRecord, which is a no-op until then.
+let plEngine = null;
+function plRecord(kind, fields) { try { if (plEngine) plEngine.record(kind, fields); } catch (_) {} }
 try { require('fs').mkdirSync(TAPES_DIR, { recursive: true }); } catch (e) {}
 const _tdRate = new Map();
 function tdRateLimited(ip) {
@@ -947,6 +952,14 @@ let SM;
 // 0.54.2 hotfix shipped with a stale banner constant (rule-2 violation:
 // the banner is the operator's deploy tracker). A constant can drift; a
 // read cannot.
+// 0.71.0 (S45 #6+#10): `node lij-adapter.js --totp-enroll` prints a fresh console
+// secret for config.env and the otpauth URI for an authenticator app, then exits.
+if (process.argv.includes('--totp-enroll')) {
+  const { totpEnroll } = require('./console');
+  const e = totpEnroll('LIJOX console @ ' + require('os').hostname());
+  console.log('\nCONSOLE_TOTP_SECRET=' + e.secret + '\n\nAdd that line to config.env, then in your authenticator app choose "enter a setup key"\nand type the secret (or add this URI):\n\n' + e.uri + '\n');
+  process.exit(0);
+}
 const ADAPTER_LOGIC_VERSION = 'v' + require('./package.json').version; /* O3: JIT_REMOTE_RESERVE_SATS honored at gRPC open (field 25) — the deferred REST-path reserve override, un-deferred; startup line tells the truth */ /* P7: /health default answers wallet needs only (detail behind HEALTH_DETAIL=on incl. lnd_version + counters); /health/jit admin-gated unless detail on */ /* step 1: first-run doctor — startup-only checks (cert readable, macaroon present, data-dir write probe, REST+macaroon+identity-match with 5s timeout, gRPC TCP probe), plain-sentence failures, LIJOX_DOCTOR=off escape; banner reads this const */ void ADAPTER_LOGIC_VERSION;
 try { SM = require('./lij-sm.js'); }
 catch (e) { SM = { emit: () => {} }; console.warn('[SM] shadow module not loaded:', e.message); }
@@ -1452,6 +1465,7 @@ async function lnurlpDeliver(name, entry) {
       }
       console.log(`[LNURLP] ${name}: no usable channel — zero-conf JIT open ${sizeSats} sats to ${client.slice(0,16)}…`);
       try {
+        leaseRememberWalletPeer(client);   // 0.72.3: a JIT open marks the peer as a wallet for the lease
         await openChannelSync(lightningOpenChannelClient, {
           node_pubkey_string: client,
           local_funding_amount: sizeSats,
@@ -1532,6 +1546,8 @@ async function lnurlpDeliver(name, entry) {
     lnurlpPersist();
     lnurlpStopWatch(entry.hash);
     console.log(`[LNURLP] ${name}: SETTLED ${innerMsat} msat delivered, fee ${feeMsat} msat kept, hash=${entry.hash.slice(0,16)}…`);
+    plRecord(feeMsat > 0n ? 'open_fee' : 'hold_fee', { msat: Number(feeMsat), wallet: client, name, hash: entry.hash });   // 0.72.0 PL ledger
+    leaseTouch(client, 'lnurl:delivered');   // 0.73.0
   } finally {
     delete entry._delivering;
   }
@@ -2556,6 +2572,8 @@ async function peersConnectedSet() {
   try {
     const data = await lndGet('/v1/peers');
     _peersCache = { ts: now, set: new Set((data.peers || []).map(p => (p.pub_key || '').toLowerCase())) };
+    // (0.72.2's lease stamp moved to leasePresenceTick — this function is only called
+    // while HTLCs are pending, so it was never a reliable presence signal.)
   } catch (e) { /* keep last known */ }
   return _peersCache.set;
 }
@@ -2881,6 +2899,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   const _dtOpenT0 = Date.now();  /* v0.40.0 */
   let channelPoint;
   try {
+    leaseRememberWalletPeer(promise.client_pubkey);   // 0.72.3
     channelPoint = await openChannelSync(lightningOpenChannelClient, {
       node_pubkey_string: promise.client_pubkey,
       local_funding_amount: channelSizeSats,
@@ -3079,6 +3098,8 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
 
   trampolineForwardsSucceeded += 1;
   console.log(`[LSPS2] sendToRouteV2 succeeded — preimage received, SETTLING inbound`);
+  plRecord('open_fee', { msat: Number(promise.fee_msat || 0), wallet: promise.client_pubkey, hash: paymentHashHex, scarcity_pct: promise.scarcity_mult_pct || 100 });   // 0.72.0 PL ledger
+  leaseTouch(promise.client_pubkey, 'jit:settled');   // 0.73.0
   // B-16: payment settled — release the hash→promise binding.
   if (promise && promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
   try { SM.emit('settle', { hash: paymentHashHex }); } catch (_) {}
@@ -3902,6 +3923,7 @@ async function connectPeer(pubkey, host) {
 }
 
 async function openChannel(pubkey, size_sats, push_sats) {
+  leaseRememberWalletPeer(pubkey);   // 0.72.3
   console.log(`[LSP] Opening channel to ${pubkey} — ${size_sats} sats, pushing ${push_sats}`);
   const result = await lndPost('/v1/channels', {
     node_pubkey_string:   pubkey,
@@ -4163,6 +4185,29 @@ function canonicalRegisterMsg(f) {
   return 'lijox-register:v1:' + fields.map(encodeURIComponent).join(':');
 }
 
+// 0.71.0: verbatim twin of the worker's canonicalUnregisterMsg (lij-worker/src/index.js).
+function canonicalUnregisterMsg(pubkey, ts) {
+  return 'lijox-unregister:v1:' + [String(pubkey), String(Number(ts) || 0)].map(encodeURIComponent).join(':');
+}
+// 0.71.0: registry liveness. The worker marks a record stale after 24h without a
+// registration, so we re-register every LIJOX_REGISTER_EVERY_HOURS (6). The
+// console reads registryStatus.
+const registryStatus = { last_ok: 0, last_error: '', next_ms: 0, every_h: parseFloat(process.env.LIJOX_REGISTER_EVERY_HOURS || '6') };
+let registryTimer = null;
+
+// `node lij-adapter.js --unregister`: sign a departure with the node key and POST
+// it; the worker deletes the record. Operator's hand only — never on restart.
+async function unregisterFromRegistry() {
+  if (!CONFIG.registry) { console.log('[Registry] no registry configured — nothing to leave'); return { ok: false, code: 'NO_REGISTRY' }; }
+  const ts = Math.floor(Date.now() / 1000);
+  const canonical = canonicalUnregisterMsg(CONFIG.node.pubkey, ts);
+  const signed = await lndPost('/v1/signmessage', { msg: Buffer.from(canonical, 'utf8').toString('base64') });
+  if (!signed || !signed.signature) throw new Error('LND signmessage returned no signature; LND said: ' + JSON.stringify(signed).slice(0, 300));
+  const result = await httpsPost(`${CONFIG.registry}/lsps/unregister`, { pubkey: CONFIG.node.pubkey, ts, signature: signed.signature });
+  console.log('[Registry] Unregister:', result);
+  return result;
+}
+
 async function registerWithRegistry() {
   if (!CONFIG.registry) {
     console.log('[Registry] no registry configured — running registry-free (LIJOX registries are optional)');
@@ -4221,9 +4266,151 @@ async function registerWithRegistry() {
     body.signature = signed.signature;
     const result = await httpsPost(`${CONFIG.registry}/lsps/register`, body);
     console.log('[Registry] Registered:', result);
+    if (result && result.ok) { registryStatus.last_ok = Date.now(); registryStatus.last_error = ''; }
+    else registryStatus.last_error = (result && (result.error || JSON.stringify(result))) || 'unknown';
   } catch (e) {
     console.error('[Registry] Registration failed:', e.message);
+    registryStatus.last_error = e.message;
   }
+  registryStatus.next_ms = Date.now() + registryStatus.every_h * 3600 * 1000;
+}
+
+// ── 0.73.0: console notes — per instance, DATA_DIR/console-notes.json, never in git.
+// Shape keeps the old lij-console's notes.json (summary + per-channel-point notes),
+// adds wallet labels (per pubkey). The old file is imported once if ours is absent.
+const CONSOLE_NOTES_PATH = process.env.CONSOLE_NOTES_PATH || require('path').join(DATA_DIR, 'console-notes.json');
+let consoleNotes = { version: 1, summary: { text: '', updated: 0 }, channels: {}, wallets: {} };
+try {
+  const fs0 = require('fs');
+  if (fs0.existsSync(CONSOLE_NOTES_PATH)) {
+    const j = JSON.parse(fs0.readFileSync(CONSOLE_NOTES_PATH, 'utf8'));
+    consoleNotes = Object.assign(consoleNotes, j, { summary: Object.assign({ text: '', updated: 0 }, j.summary || {}), channels: j.channels || {}, wallets: j.wallets || {} });
+  } else {
+    const old = process.env.CONSOLE_NOTES_IMPORT || require('path').join(require('os').homedir(), 'lij-console', 'notes.json');
+    if (fs0.existsSync(old)) {
+      const j = JSON.parse(fs0.readFileSync(old, 'utf8'));
+      consoleNotes.summary = Object.assign({ text: '', updated: 0 }, j.summary || {});
+      consoleNotes.channels = j.channels || {};
+      fs0.writeFileSync(CONSOLE_NOTES_PATH, JSON.stringify(consoleNotes, null, 1));
+      console.log(`[Console] imported notes from ${old} (${Object.keys(consoleNotes.channels).length} channel notes)`);
+    }
+  }
+} catch (e) { console.error('[Console] notes load failed: ' + e.message); }
+function consoleNotesSave() { require('fs').writeFileSync(CONSOLE_NOTES_PATH, JSON.stringify(consoleNotes, null, 1)); }
+function consoleNoteSet(kind, key, text) {
+  const t = String(text || '').slice(0, 2000);
+  if (kind === 'summary') consoleNotes.summary = { text: t, updated: Date.now() };
+  else if (kind === 'channel') { if (!/^[0-9a-f]{64}:\d+$/.test(key)) throw new Error('bad channel point'); if (t) consoleNotes.channels[key] = { text: t, updated: Date.now() }; else delete consoleNotes.channels[key]; }
+  else if (kind === 'wallet') { if (!/^0[23][0-9a-f]{64}$/.test(key)) throw new Error('bad pubkey'); if (t) consoleNotes.wallets[key] = { label: t.slice(0, 80), updated: Date.now() }; else delete consoleNotes.wallets[key]; }
+  else throw new Error('bad kind');
+  consoleNotesSave();
+  return { ok: true, kind, key, text: t };
+}
+
+// ── 0.71.0: the console's snapshot — what the panes show, assembled here so the
+// console module knows nothing about the adapter's internals. Balances and
+// channels from LND's REST API; wallets from the LNURL registry; leases, loops,
+// registry status and backup legs from this process. Tor/clearnet per peer from
+// listpeers' address.
+async function consoleSnapshot() {
+  const fs = require('fs');
+  const [info, chans, peers, pending, wb] = await Promise.all([
+    lndGet('/v1/getinfo').catch(() => ({})),
+    lndGet('/v1/channels').catch(() => ({ channels: [] })),
+    lndGet('/v1/peers').catch(() => ({ peers: [] })),
+    lndGet('/v1/channels/pending').catch(() => ({})),
+    lndGet('/v1/balance/blockchain').catch(() => ({})),
+  ]);
+  // 0.71.2: channel balances are summed from ListChannels — ChannelBalance is not in
+  // the URI-level macaroon (bake-permissions.json), so 0.71.0/0.71.1 showed 0/0.
+  let sumLocal = 0, sumRemote = 0, sumUnsettled = 0;
+  for (const c of (chans.channels || [])) { sumLocal += Number(c.local_balance || 0); sumRemote += Number(c.remote_balance || 0); sumUnsettled += Number(c.unsettled_balance || 0); }
+  const peerAddr = {};
+  for (const p of (peers.peers || [])) peerAddr[p.pub_key] = p.address || '';
+  const walletPubkeys = new Set(Object.values(lnurlpRegistry).map((r) => r && r.client_pubkey).filter(Boolean));
+  const nowMs = Date.now();
+  const channels = (chans.channels || []).map((c) => {
+    const lease = leaseState.channels && leaseState.channels[c.channel_point];
+    let leaseTxt = '';
+    if (lease && lease.last_seen_ms) {
+      // 0.71.1: the effective ttl is the channel's own or the global default —
+      // ttl_days is null by default, which 0.71.0 read as 0 ("past ttl" everywhere).
+      const daysLeft = leaseTtlDays(lease) - (nowMs - lease.last_seen_ms) / 86400000;
+      leaseTxt = (daysLeft > 0 ? Math.floor(daysLeft) + ' d left' : 'past ttl') + (!(CONFIG.lease && CONFIG.lease.enabled) ? ' (lease off)' : (CONFIG.lease.dry_run ? ' (dry run)' : ''));
+    }
+    return {
+      remote_pubkey: c.remote_pubkey, alias: c.peer_alias || '', address: peerAddr[c.remote_pubkey] || '',
+      capacity: Number(c.capacity), local_balance: Number(c.local_balance), remote_balance: Number(c.remote_balance),
+      active: !!c.active, private: !!c.private, pending_htlcs: (c.pending_htlcs || []).length,
+      wallet: leaseIsWalletPeer(c.remote_pubkey), lease: leaseTxt, excluded: leaseIsExcluded(c.channel_point), channel_point: c.channel_point,
+      last_seen_ms: lease ? (lease.last_seen_ms || 0) : 0, last_source: lease ? (lease.last_source || '') : '',
+      note: (consoleNotes.channels[c.channel_point] || {}).text || '', label: (consoleNotes.wallets[c.remote_pubkey] || {}).label || '',
+    };
+  }).sort((a, b) => {   // 0.73.2 (DP): by peer, then by channel
+    const la = (a.label || a.alias || a.remote_pubkey).toLowerCase(), lb = (b.label || b.alias || b.remote_pubkey).toLowerCase();
+    return la < lb ? -1 : la > lb ? 1 : (a.remote_pubkey < b.remote_pubkey ? -1 : a.remote_pubkey > b.remote_pubkey ? 1 : (a.channel_point < b.channel_point ? -1 : a.channel_point > b.channel_point ? 1 : 0));
+  });
+  // 0.71.1: "first seen" = the name's registration; "last heard" = the newest
+  // lease stamp for that wallet's channel(s) (the lease loop stamps a channel
+  // whenever its peer is connected), or its newest hold/settle.
+  const heardByPeer = {};
+  for (const rec of Object.values((leaseState && leaseState.channels) || {})) if (rec && rec.peer && rec.last_seen_ms) heardByPeer[rec.peer] = Math.max(heardByPeer[rec.peer] || 0, rec.last_seen_ms);
+  const wallets = [];
+  for (const [name, rec] of Object.entries(lnurlpRegistry)) {
+    if (!rec) continue;
+    const entries = rec.entries || [];
+    let act = 0; for (const e of entries) { if (e && e.accepted_at > act) act = e.accepted_at; if (e && e.settled_at > act) act = e.settled_at; }
+    wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '' });
+  }
+  // 0.71.1: unconfirmed on-chain — the wallet's 0-conf transactions and LND's
+  // pending sweeps. Needs GetTransactions / PendingSweeps in the macaroon;
+  // without them the pane says so instead of guessing.
+  const unconfirmed = {};
+  try {
+    const tx = await lndGet('/v1/transactions');
+    if (tx && tx.transactions) unconfirmed.txs = tx.transactions.filter((t) => Number(t.num_confirmations) === 0).map((t) => ({ txid: t.tx_hash, amount: Number(t.amount), fee: Number(t.total_fees), label: t.label || '', time_ms: Number(t.time_stamp) * 1000 }));
+    else unconfirmed.error = 'GetTransactions: ' + JSON.stringify(tx).slice(0, 120);
+  } catch (e) { unconfirmed.error = 'GetTransactions: ' + e.message; }
+  try {
+    const sw = await lndGet('/v2/wallet/sweeps/pending');
+    if (sw && sw.pending_sweeps) unconfirmed.sweeps = sw.pending_sweeps.map((x) => ({ outpoint: ((x.outpoint || {}).txid_str || '') + ':' + ((x.outpoint || {}).output_index || 0), amount: Number(x.amount_sat), kind: x.witness_type || '', fee_rate: x.sat_per_vbyte || x.requested_sat_per_vbyte || '', tries: x.broadcast_attempts || 0 }));
+  } catch (_) {}
+  if (unconfirmed.error && !unconfirmed.sweeps) unconfirmed.error += ' — add lnrpc.Lightning/GetTransactions and walletrpc.WalletKit/PendingSweeps to the macaroon (MACAROON.md) to see this pane';
+  const pend = [];
+  for (const [kind, key] of [['opening', 'pending_open_channels'], ['closing', 'pending_closing_channels'], ['force-closing', 'pending_force_closing_channels'], ['waiting close', 'waiting_close_channels']]) {
+    for (const x of (pending[key] || [])) { const ch = x.channel || {}; pend.push({ kind, remote_pubkey: ch.remote_node_pub || '', capacity: Number(ch.capacity || 0), channel_point: ch.channel_point || '' }); }
+  }
+  const backups = {};
+  const SCB_DIR = process.env.LIJ_SCB_STATE_DIR || '/var/lib/lij-scb';
+  for (const leg of ['local', 'cloud']) {
+    try {
+      const st = JSON.parse(fs.readFileSync(`${SCB_DIR}/status-${leg}.json`, 'utf8'));
+      backups[leg] = { ok: st.ok !== false, at_ms: (st.last_ok || st.last_attempt || 0) * 1000, stale: !st.last_ok || (nowMs / 1000 - st.last_ok) > 26 * 3600, note: st.err || '' };
+    } catch (_) {}
+  }
+  const loops = {};
+  for (const [name, v] of Object.entries(loopStamps)) loops[name] = { last: v.last || 0, period_ms: v.period_ms, stale: !v.last || (nowMs - v.last) > Math.max(5 * v.period_ms, 120000) };
+  let tapes = 0, lastTape = 0;
+  try { for (const f of fs.readdirSync(TAPES_DIR)) { tapes++; const t = parseInt(f.split('-')[0], 10); if (t > lastTape) lastTape = t; } } catch (_) {}
+  const pendingOpenLocal = (pending.pending_open_channels || []).reduce((a, x) => a + Number((x.channel || {}).local_balance || 0), 0);
+  return {
+    node: { alias: info.alias, pubkey: info.identity_pubkey, version: info.version, block_height: info.block_height, synced: !!info.synced_to_chain, synced_to_graph: info.synced_to_graph, num_peers: info.num_peers, num_active: info.num_active_channels, num_inactive: info.num_inactive_channels, num_pending: info.num_pending_channels, uris: info.uris || [] },
+    balances: { onchain_confirmed: Number(wb.confirmed_balance || 0), onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), local: sumLocal, remote: sumRemote, unsettled: sumUnsettled, pending_open_local: pendingOpenLocal, reserved_anchor: Number(wb.reserved_balance_anchor_chan || 0) },
+    // 0.71.2 (DP: "bring in the guardrail multipliers we set for the desktop" — the
+    // [JIT] self-protection boot line, live): the scarcity multiplier and its inputs,
+    // the per-wallet open ladder, the JIT sizing and the daily floor cap.
+    guardrails: {
+      live_mult_pct: scarcityMultPct(), onchain_confirmed: scarcityCache.confirmed, headroom: scarcityCache.headroom, refreshed_ms: scarcityCache.ts,
+      reserve_floor_sats: CONFIG.lsps2.jit_min_onchain_reserve_sats, ramp_start_sats: CONFIG.lsps2.jit_scarcity_ramp_start_sats, max_mult_pct: CONFIG.lsps2.jit_scarcity_max_pct,
+      free_opens: CONFIG.lsps2.jit_fee_free_opens, step_pct: CONFIG.lsps2.jit_fee_step_pct, window_days: Math.round(JIT_WINDOW_MS / 86400000), floor_max_opens_per_day: JIT_FLOOR_MAX_OPENS_PER_DAY,
+      channel_min_sats: CONFIG.channel.min_sats, channel_size_sats: CONFIG.channel.size_sats, channel_max_sats: CONFIG.channel.max_sats,
+      open_fee_min_sats: Math.round(CONFIG.lsps2.open_fee_min_msat / 1000), fee_ppm: CONFIG.node.fee_ppm, lease_days: CONFIG.lease.days, lease_enabled: !!(CONFIG.lease && CONFIG.lease.enabled), lease_dry_run: !!(CONFIG.lease && CONFIG.lease.dry_run), lease_cycle_min: CONFIG.lease.cycle_minutes,
+      lease_list_saved_at: leaseExclude.saved_at || 0, lease_excluded: (chans.channels || []).filter((c) => leaseIsExcluded(c.channel_point)).length, lease_leased: (chans.channels || []).filter((c) => !leaseIsExcluded(c.channel_point) && c.remote_pubkey !== LEASE_WORLD_PEER).length,
+    },
+    channels, wallets, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
+    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url },
+    backups, loops, watchdog: !!process.env.NOTIFY_SOCKET, uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
+  };
 }
 
 // ── HTTP Server ───────────────────────────────────────────────────────────────
@@ -4260,7 +4447,12 @@ function readBody(req) {
     let body = '';
     req.on('data', chunk => body += chunk);
     req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
+      try {
+        const parsed = body ? JSON.parse(body) : {};
+        // 0.73.0: any POST that names its wallet is proof of life for the lease
+        if (parsed && typeof parsed.client_pubkey === 'string') leaseTouch(parsed.client_pubkey, 'api:' + String(req.url || '').split('?')[0]);
+        resolve(parsed);
+      }
       catch (e) { reject(new Error('Invalid JSON')); }
     });
     req.on('error', reject);
@@ -4310,6 +4502,103 @@ function setCorsHeaders(req, res) {
 // secret; the fuller build fronts it with an order+invoice flow that
 // lands on this same setter.
 const leaseFs = require('fs');
+// ── 0.72.3 (DP asked "are we certain the lease only impacts wallets?" — it was NOT:
+// the cycle walked EVERY channel in listchannels — exchange peers, routing peers,
+// the Umbrel — skipping only LEASE_WORLD_PEER and LEASE_EXCLUDE_CHANPOINTS; the dry
+// run was the only protection). The lease now considers a channel ONLY when its
+// peer is a known LiJ wallet: a pubkey this adapter opened a JIT channel to
+// (persisted here, survives restarts), or one that registered a pay-code pool
+// (lnurlpRegistry), or one holding a live LSPS2 promise. Everything else is
+// skipped and logged once per boot as skip_non_wallet.
+const LEASE_WALLETS_PATH = process.env.LEASE_WALLETS_PATH || require('path').join(DATA_DIR, 'lease-wallet-peers.json');
+let leaseWalletPeers = new Set();
+try { leaseWalletPeers = new Set(JSON.parse(require('fs').readFileSync(LEASE_WALLETS_PATH, 'utf8')).map((k) => String(k).toLowerCase())); } catch (_) {}
+function leaseRememberWalletPeer(pubkey) {
+  const k = String(pubkey || '').toLowerCase();
+  if (!/^0[23][0-9a-f]{64}$/.test(k) || leaseWalletPeers.has(k)) return;
+  leaseWalletPeers.add(k);
+  try { require('fs').writeFileSync(LEASE_WALLETS_PATH, JSON.stringify([...leaseWalletPeers])); } catch (e) { console.error('[LEASE] wallet-peer file write failed: ' + e.message); }
+}
+function leaseIsWalletPeer(pubkey) {
+  const k = String(pubkey || '').toLowerCase();
+  if (leaseWalletPeers.has(k)) return true;
+  for (const rec of Object.values(lnurlpRegistry)) if (rec && String(rec.client_pubkey || '').toLowerCase() === k) return true;
+  for (const pr of promiseByPaymentHash.values()) if (pr && String(pr.client_pubkey || '').toLowerCase() === k) return true;
+  return false;
+}
+// ── 0.72.4 (DP RULED, 2026-09-08: "I would rather have a safe list of what is
+// EXCLUDED from the lease, rather than the reverse. I know with whom I have
+// channels open."): the lease considers every channel EXCEPT the ones on the
+// operator's exclusion list — set and saved from the console, per instance,
+// in DATA_DIR/lease-exclude.json (gitignored; never shared). Until the operator
+// has SAVED the list at least once, the lease closes nothing (it behaves as a
+// dry run and logs exclusion_list_unsaved once per boot): an unset list is not
+// consent. The wallet-peer recognition above is used for LABELS only.
+const LEASE_EXCLUDE_PATH = process.env.LEASE_EXCLUDE_PATH || require('path').join(DATA_DIR, 'lease-exclude.json');
+let leaseExclude = { version: 1, saved_at: 0, chan_points: {} };   // cp -> { excluded: bool, peer, note, set_at }
+try { const j = JSON.parse(require('fs').readFileSync(LEASE_EXCLUDE_PATH, 'utf8')); if (j && j.chan_points) leaseExclude = Object.assign({ version: 1, saved_at: 0, chan_points: {} }, j); } catch (_) {}
+function leaseExcludeSave() {
+  leaseExclude.saved_at = Date.now();
+  require('fs').writeFileSync(LEASE_EXCLUDE_PATH, JSON.stringify(leaseExclude, null, 1));
+}
+function leaseIsExcluded(cp) {
+  if (CONFIG.lease.exclude.includes(cp)) return true;                       // .env list still honoured
+  const e = leaseExclude.chan_points[cp];
+  return !!(e && e.excluded);
+}
+function leaseListSaved() { return !!leaseExclude.saved_at; }
+let leaseUnsavedLogged = false;
+// ── 0.73.0 (DP RULED 2026-09-08: "any contact" is liveliness; measure it when the
+// wallet ACTS, not when the adapter happens to look; write once per session):
+// leaseTouch(pubkey, source) is called from every place a wallet identifies
+// itself — every custom message a peer sends (the chain bridge), every POST body
+// carrying client_pubkey (readBody), the GET routes that name a wallet, the JIT
+// interceptor, the LNURL delivery, tapes. It stamps last_seen on every lease
+// record with that peer, in memory. A SESSION starts when the previous stamp is
+// older than LEASE_SESSION_GAP_MIN (10): that first touch persists the state and
+// writes one `touch` line with its source; later touches in the session only
+// move the in-memory stamp (the hourly cycle persists it anyway).
+const LEASE_SESSION_GAP_MS = Math.max(1, parseFloat(process.env.LEASE_SESSION_GAP_MIN || '10')) * 60000;
+function leaseTouch(pubkey, source) {
+  try {
+    const k = String(pubkey || '').toLowerCase();
+    if (!/^0[23][0-9a-f]{64}$/.test(k) || !leaseState || !leaseState.channels) return;
+    const now = Date.now();
+    let newSession = false, hit = false;
+    for (const [cp, rec] of Object.entries(leaseState.channels)) {
+      if (!rec || String(rec.peer || '').toLowerCase() !== k) continue;
+      hit = true;
+      if (!rec.last_seen_ms || now - rec.last_seen_ms > LEASE_SESSION_GAP_MS) { newSession = true; rec.last_source = source; }
+      rec.last_seen_ms = now;
+    }
+    if (hit && newSession) { leaseSaveState(); leaseLog({ event: 'touch', peer: k.slice(0, 16), source }); }
+  } catch (_) {}
+}
+// (0.72.5's 30-second presence poll is retired — with contact-driven stamps it is
+// not a measure of anything; the hourly cycle still stamps peers that are merely
+// connected, which is what a routing peer's "contact" looks like.)
+// ── 0.72.5: LEASE PRESENCE LOOP. Every 30 s: one listpeers, and every lease record
+// whose peer is connected gets last_seen_ms = now; persisted when anything moved.
+// (0.72.2 put the stamp inside peersConnectedSet(), which the adapter only calls
+// while HTLCs are pending for an offline wallet — so in ordinary conditions it never
+// ran, and DP's channel stayed at 58 d through a day of use.) Runs whenever the
+// adapter runs, lease enabled or not, so the stamps are true the day it is enabled.
+let leasePresenceDirty = false;
+async function leasePresenceTick() {
+  stampLoop('lease_presence', 30000);
+  try {
+    const data = await lndGet('/v1/peers');
+    const connected = new Set((data.peers || []).map((p) => String(p.pub_key || '').toLowerCase()));
+    const now = Date.now();
+    if (leaseState && leaseState.channels) {
+      for (const rec of Object.values(leaseState.channels)) {
+        if (rec && rec.peer && connected.has(String(rec.peer).toLowerCase())) { rec.last_seen_ms = now; leasePresenceDirty = true; }
+      }
+    }
+    if (leasePresenceDirty) { leasePresenceDirty = false; leaseSaveState(); }
+  } catch (_) { /* keep last known */ }
+}
+// (not scheduled since 0.73.0 — see leaseTouch above)
 const LEASE_WORLD_PEER = (process.env.LEASE_WORLD_PEER || '').trim(); // v0.47: operator-set pubkey of a world conduit that must never be leased; empty = no exclusion
 let leaseState = { version: 1, channels: {} }; // chan_point -> { last_seen_ms, ttl_days, peer }
 let leaseTimer = null;
@@ -4481,11 +4770,11 @@ async function leaseCycle() {
       rec = leaseState.channels[cp] = { last_seen_ms: now, ttl_days: null, peer: c.remote_pubkey };
       leaseLog({ event: 'seed', chan_point: cp, peer: c.remote_pubkey.slice(0, 16) });
     }
-    if (connected.has(c.remote_pubkey)) rec.last_seen_ms = now; // heard from
+    if (connected.has(c.remote_pubkey)) { if (!rec.last_seen_ms || now - rec.last_seen_ms > LEASE_SESSION_GAP_MS) rec.last_source = 'connected'; rec.last_seen_ms = now; } // heard from
     const idleMs = now - rec.last_seen_ms;
     const ttlMs = leaseTtlDays(rec) * 86400000;
     if (idleMs <= ttlMs) continue;
-    if (CONFIG.lease.exclude.includes(cp)) continue; // status shows the flag
+    if (leaseIsExcluded(cp)) continue;               // 0.72.4: the operator's exclusion list (console) + the .env list
     const detail = {
       chan_point: cp,
       peer: c.remote_pubkey.slice(0, 16),
@@ -4494,6 +4783,12 @@ async function leaseCycle() {
     };
     if (CONFIG.lease.dry_run) {
       leaseLog(Object.assign({ event: 'would_close' }, detail));
+      continue;
+    }
+    if (!leaseListSaved()) {
+      // 0.72.4: no exclusion list has ever been saved from the console — refuse to close.
+      if (!leaseUnsavedLogged) { leaseUnsavedLogged = true; leaseLog({ event: 'exclusion_list_unsaved', note: 'lease will not close anything until the operator saves the exclusion list in the console' }); console.error('[LEASE] would close ' + cp + ' but the exclusion list has never been saved from the console — refusing (see lease-log.ndjson)'); }
+      leaseLog(Object.assign({ event: 'would_close_unsaved_list' }, detail));
       continue;
     }
     leaseLog(Object.assign({ event: 'closing' }, detail));
@@ -4988,6 +5283,7 @@ const server = http.createServer(async (req, res) => {
   // this lists ALL wallets' pending — fine single-tenant; revisit at the
   // external-tester gate.
   if (path === '/lsps2/pending' && method === 'GET') {
+    try { const _q = new URL(req.url, 'http://lsp.local').searchParams; if (_q.get('client_pubkey')) leaseTouch(_q.get('client_pubkey'), 'api:/lsps2/pending'); } catch (_) {}   // 0.73.0
     let clientQ = null;
     try {
       const q = new URL(req.url, 'http://lsp.local').searchParams;
@@ -5842,6 +6138,8 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       enabled: CONFIG.lease.enabled,
       dry_run: CONFIG.lease.dry_run,
+      wallet_peers_known: leaseWalletPeers.size,
+      exclusion_list: { saved_at: leaseExclude.saved_at || 0, excluded: Object.entries(leaseExclude.chan_points).filter(([, v]) => v && v.excluded).map(([cp]) => cp) },   // 0.72.4
       default_ttl_days: CONFIG.lease.days,
       cycle_minutes: CONFIG.lease.cycle_minutes,
       cycles: leaseCycles,
@@ -6032,6 +6330,7 @@ async function main() {
       console.log(`[Startup] gRPC clients ready: Lightning + ChainNotifier + WalletKit (endpoint=${CONFIG.lnd.grpc_endpoint})`);
 
       chainBridge = startBridge({
+        onPeerActivity: (peerHex, typeId) => leaseTouch(peerHex, 'msg:' + typeId),   // 0.73.0
         lightningClient,
         chainNotifierClient,
         walletKitClient,
@@ -6052,8 +6351,44 @@ async function main() {
   // (0.61.0's LSPS2_CHANNEL_OPEN_FEE_SATS mismatch warning retired in 0.69.0 —
   // the knob is ignored and says so at config load.)
 
-  // Register with LIJOX registry
+  // 0.71.0: `--unregister` — leave the registry and exit (operator's hand only).
+  if (process.argv.includes('--unregister')) {
+    try { const r = await unregisterFromRegistry(); process.exit(r && r.ok ? 0 : 1); }
+    catch (e) { console.error('[Registry] Unregister failed:', e.message); process.exit(1); }
+  }
+
+  // Register with LIJOX registry, then re-register on a cadence (0.71.0: the
+  // worker marks a record stale after 24h without one).
   await registerWithRegistry();
+  if (CONFIG.registry && registryStatus.every_h > 0) {
+    registryTimer = setInterval(() => { registerWithRegistry().catch(() => {}); stampLoop('registry', registryStatus.every_h * 3600 * 1000); }, registryStatus.every_h * 3600 * 1000);
+  }
+
+  // 0.71.0: the operator console (loopback + Tailscale, TOTP). Disabled until
+  // CONSOLE_TOTP_SECRET is set — see --totp-enroll.
+  try {
+    const { createPL } = require('./pl');
+    plEngine = createPL({
+      dataDir: DATA_DIR, lndGet, lndPost, log: (l) => console.log(l),
+      isWalletPubkey: (pk) => Object.values(lnurlpRegistry).some((r) => r && r.client_pubkey === pk) || Object.values((leaseState && leaseState.channels) || {}).some((r) => r && r.peer === pk),
+      channelPoints: () => new Set(Object.keys((leaseState && leaseState.channels) || {}).map((cp) => cp.split(':')[0])),
+      rates: () => (ratesCache && ratesCache.rates) || null,
+    });
+    const { createConsole } = require('./console');
+    const con = createConsole({ version: ADAPTER_LOGIC_VERSION, lndGet, snapshot: consoleSnapshot, pl: (date, opts) => plEngine.report(date, opts), log: (l) => console.log(l),
+      // 0.72.4: the one operator action so far — lease exclusions (safety-increasing, so behind the session only)
+      setNote: async (kind, key, text) => consoleNoteSet(kind, key, text),   // 0.73.0 notes + labels
+      setLeaseExclude: async (cp, excluded, peer) => {
+        if (!/^[0-9a-f]{64}:\d+$/.test(cp)) throw new Error('bad channel point');
+        const prev = leaseExclude.chan_points[cp] || {};
+        leaseExclude.chan_points[cp] = { excluded: !!excluded, peer: String(peer || prev.peer || '').slice(0, 66), set_at: Date.now() };
+        leaseExcludeSave();
+        leaseLog({ event: 'exclude_set', chan_point: cp, excluded: !!excluded, peer: String(peer || '').slice(0, 16) });
+        return { ok: true, chan_point: cp, excluded: !!excluded, saved_at: leaseExclude.saved_at };
+      },
+    });
+    con.start();
+  } catch (e) { console.error('[Console] failed to start:', e.message); }
 
   // v0.11: Start critical-peer keepalive (Umbrel etc. — see CRITICAL_PEERS env).
   // Runs every 60s; also force-checked before each /v1/route/build query.
@@ -6166,6 +6501,7 @@ function shutdown(signal) {
     try { clearInterval(reconnectPollTimer); } catch (_) {}
     reconnectPollTimer = null;
   }
+  if (registryTimer) { try { clearInterval(registryTimer); } catch (_) {} registryTimer = null; }
   if (leaseTimer) {
     try { clearInterval(leaseTimer); } catch (_) {}
     leaseTimer = null;

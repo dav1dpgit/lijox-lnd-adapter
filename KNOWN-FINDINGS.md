@@ -57,3 +57,51 @@ reuses it) could not have executed on that box; the UM890 (`lncli` on PATH)
 was unaffected. Fixed in 0.70.1: the string is split on whitespace — first
 token is the program, the rest lead the arguments. Found while reading the
 Umbrel's .env line during the 0.70.0 ride; not observed in a journal.
+
+## 2026-09-08 — a dead cooperative close lingered as "unconfirmed" in LND's wallet
+
+**Seen:** the UM890's `walletbalance` showed `unconfirmed_balance: 189994` for days
+with no activity. `lncli listchaintxns` had three 0-conf transactions labelled
+`lij-broadcast:N` (the adapter's chain-bridge broadcast label): `fd916231…`
+(189,994 sats to us) and two 0-amount ones. `bitcoin-cli getmempoolentry` answered
+"not in mempool" for all three; `pendingsweeps` was empty.
+
+**Cause:** `fd916231…` was a wallet's cooperative close, broadcast through this node
+on 2026-09-03, then double-spent by the wallet's holder commitment (`f27b2772…`,
+block 965353 — the boot force-close defect fixed by the engine's `lij_coop_hold`).
+The real funds arrived via the commitment and are confirmed. LND's wallet keeps a
+published transaction whose inputs were spent by another confirmed transaction as
+"unconfirmed" indefinitely and counts it in `unconfirmed_balance`; the 0-amount
+ones are other wallets' broadcasts LND recorded because it published them.
+
+**Fix (operator's hand):** verify `getmempoolentry` says "not in mempool", then
+`lncli wallet removetx <txid>` for each. Result: `unconfirmed_balance: 0`, confirmed
+unchanged. Nothing moves; a record of an impossible transaction is deleted.
+
+**Console:** 0.71.1's Unconfirmed on-chain pane shows such transactions (needs
+GetTransactions in the macaroon). A "remove dead transaction" action behind
+arm-and-confirm is on the phase-2 list.
+
+## 2026-09-08 — the lease considered every channel, not only wallets' (found before dry run was turned off)
+
+**Seen:** DP asked whether the lease only affects wallet channels before switching
+`LEASE_DRY_RUN` off. Reading the cycle: it walked EVERY channel in `listchannels`
+— exchange peers, routing peers, the other LSP — skipping only `LEASE_WORLD_PEER`
+and `LEASE_EXCLUDE_CHANPOINTS`. With dry run off, any of those peers offline for
+60 days (Tor hiccups included) would have been force-closed. Compounded by the
+stamping defect fixed in 0.72.2 (a wallet online between hourly ticks kept
+ageing). The dry run — on since the lease shipped — was the only protection.
+
+**Fix (0.72.4, DP RULED — "a safe list of what is excluded, rather than the
+reverse; I know with whom I have channels open"):** the lease considers every
+channel EXCEPT the ones on the operator's exclusion list, set and saved from the
+console per channel (DATA_DIR/lease-exclude.json — per instance, gitignored, never
+shared). Until that list has been saved at least once, the lease refuses to close
+anything, even with dry run off (`exclusion_list_unsaved` / `would_close_unsaved_list`
+in the log): an unset list is not consent. The 0.72.3 wallet-recognition stays
+only as the console's "wallet" label.
+
+**Before flipping dry run off on any box:** ride ≥0.72.4, exclude every
+non-wallet channel in the console (the Guardrails row must show "list saved" and
+the right excluded count), read `lease-log.ndjson` for `would_close` (wallet
+channels only), and re-seed if stamps predate 0.72.2.

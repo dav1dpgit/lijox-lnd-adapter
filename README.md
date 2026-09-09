@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.70.1). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with the file hashes in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the file hash to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.73.2). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with the file hashes in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the file hash to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -130,5 +130,13 @@ WHAT YOU NEED BEFORE STARTING
 
 Design documents live in the LiJ repo:
 docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
+
+## The operator console (0.71+)
+
+The adapter serves its own monitor at `/console` on a separate port (`CONSOLE_PORT`, default 7004), bound to loopback and the Tailscale interface only — it has no place on the public tunnel. Login is a six-digit TOTP code and nothing else (`node lij-adapter.js --totp-enroll` prints the secret for `config.env` and the setup key for an authenticator app); a code is accepted once, five wrong codes lock the address for ten minutes, a correct one opens a 12-hour session bound to the caller's address. The page loads nothing from anywhere (CSP `default-src 'none'`, script and style by hash) and the adapter makes no outbound call on its behalf — there is no update check by design.
+
+Panes: guardrails (the live open-fee multiplier and its inputs, the per-wallet open ladder, JIT sizing, the lease), PL (day / MTD / YTD / LTD with a calendar, from a fee ledger the adapter writes when a fee is actually kept plus LND's forwarding, payment and chain history; daily snapshots so life-to-date never rescans), node, balances, channels (Tor/clearnet per peer, lease clock with what last renewed it, a per-channel note, exclude/include from the lease), wallets served (with an operator label), pending, unconfirmed on-chain, registry status, SCB backup legs, loops. Notes and labels live in `console-notes.json` in the data folder — per instance, never in git. Some panes need read-only LND permissions the original macaroon lacks (`GetTransactions`, `ForwardingHistory`, `ClosedChannels`, `ChannelBalance`, `PendingSweeps`); a pane says which one it is missing rather than guessing, and `bake-permissions.json` carries them for the next bake.
+
+The lease (a silent wallet's channel is force-closed after `LEASE_DAYS`, its balance paid to the wallet's own address) measures liveliness as *contact*: any message or API call from the wallet renews it, stamped when the wallet acts, persisted once per session. It considers every channel except the ones the operator excludes in the console, and it closes nothing until that exclusion list has been saved at least once. See KNOWN-FINDINGS for the two defects that shaped this (2026-09-08).
 
 Names and marks (Lightning in a Jar, LiJ, LIJOX, the jar logo) are not licensed with the code — see [TRADEMARKS.md](TRADEMARKS.md).

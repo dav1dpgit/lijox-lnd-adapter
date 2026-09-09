@@ -28,3 +28,9 @@ tapes/
 *.broken-*
 # Runtime
 node_modules/
+# 0.72.x operator state (per instance, never shared)
+lease-exclude.json
+lease-wallet-peers.json
+pl-events.ndjson
+pl-daily.json
+console-notes.json

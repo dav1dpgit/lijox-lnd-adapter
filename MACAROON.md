@@ -19,6 +19,8 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
 | lnrpc.Lightning/WalletBalance | onchain reserve guard |
 | lnrpc.Lightning/GetChanInfo, QueryRoutes | route building |
 | lnrpc.Lightning/ListPeers, ConnectPeer | critical-peer keepalive, wallet checks |
+| lnrpc.Lightning/GetTransactions, walletrpc.WalletKit/PendingSweeps | 0.71.1 console: the Unconfirmed on-chain pane (read-only; the pane says so if they are missing) |
+| lnrpc.Lightning/ForwardingHistory, ClosedChannels, ChannelBalance | 0.72.0 console: PL (routing fees, close classification) and channel balances — read-only; the PL card names any of these it lacks |
 | lnrpc.Lightning/LookupInvoice | payment forensics, LNURLp |
 | lnrpc.Lightning/OpenChannelSync | JIT channel opens |
 | lnrpc.Lightning/SendCustomMessage, SubscribeCustomMessages | chain bridge |

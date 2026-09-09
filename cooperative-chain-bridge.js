@@ -734,6 +734,8 @@ function startBridge(opts) {
   function onCustomMessage(event) {
     const peerHex = event.peer;
     const typeId  = parseInt(event.type, 10);
+    // 0.73.0: a custom message from a peer is contact — the lease's proof of life.
+    try { if (typeof opts.onPeerActivity === 'function') opts.onPeerActivity(peerHex, typeId); } catch (_) {}
 
     // Filter to LiJ-reserved range (32801..=32819).
     if (!Number.isFinite(typeId) || typeId < 32801 || typeId > 32819) {
