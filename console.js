@@ -101,6 +101,7 @@ function setPane(id,html){
 }
 function render(d){
   $('sub').textContent=(d.node&&d.node.alias||'')+' \\u00b7 adapter '+d.version+' \\u00b7 '+new Date(d.ts).toLocaleTimeString();
+  if(d.node&&d.node.alias&&document.title!=='LIJOX console \\u2014 '+d.node.alias)document.title='LIJOX console \\u2014 '+d.node.alias;
   var n=d.node||{};
   setPane('node',kv([['alias',n.alias],['pubkey','<span class="mono">'+esc(n.pubkey)+'</span>',1],['LND',n.version],['height',fmt(n.block_height)+(n.synced?' <span class="ok">synced</span>':' <span class="warn">syncing</span>')+(n.synced_to_graph===false?' <span class="dim">graph syncing</span>':''),1],['peers',n.num_peers],['channels',fmt(n.num_active)+' active \\u00b7 '+fmt(n.num_inactive)+' inactive \\u00b7 '+fmt(n.num_pending)+' pending',1],['reach',(n.uris||[]).map(function(u){return net(u)+' <span class="mono">'+esc(u)+'</span>'}).join('<br>')||'<span class="dim">no URIs advertised</span>',1]]));
   var g=d.guardrails||{};var mult=Number(g.live_mult_pct||100);
@@ -213,6 +214,9 @@ function createConsole(deps) {
   const secret = secretB32 ? base32Decode(secretB32) : null;
   const port = parseInt(env.CONSOLE_PORT || '7004', 10);
   const sessionMs = parseFloat(env.CONSOLE_SESSION_HOURS || '12') * 3600 * 1000;
+  // 0.73.3: the cookie name carries a per-instance tag (from the TOTP secret's hash), so two
+  // consoles tunnelled to the same host on different ports keep separate sessions.
+  const COOKIE = 'lijc_' + crypto.createHash('sha256').update(secretB32).digest('hex').slice(0, 8);
   const sessions = new Map();     // cookie -> { ip, until }
   const failures = new Map();     // ip -> { n, until }
   const usedCounters = new Set();
@@ -232,7 +236,7 @@ function createConsole(deps) {
   }
 
   function remoteIp(req) { return String(req.socket.remoteAddress || '').replace(/^::ffff:/, ''); }
-  function cookieOf(req) { const m = /(?:^|;\s*)lijc=([a-f0-9]{64})/.exec(req.headers.cookie || ''); return m ? m[1] : null; }
+  function cookieOf(req) { const m = new RegExp('(?:^|;\\s*)' + COOKIE + '=([a-f0-9]{64})').exec(req.headers.cookie || ''); return m ? m[1] : null; }
   function sessionOf(req) {
     const c = cookieOf(req); if (!c) return null;
     const s = sessions.get(c); if (!s) return null;
@@ -271,13 +275,13 @@ function createConsole(deps) {
       const key = crypto.randomBytes(32).toString('hex');
       sessions.set(key, { ip, until: Date.now() + sessionMs });
       log(`[Console] login OK from ${ip}; session ${sessionMs / 3600000}h`);
-      return json(res, 200, { ok: true }, { 'set-cookie': `lijc=${key}; HttpOnly; SameSite=Strict; Path=/console; Max-Age=${Math.floor(sessionMs / 1000)}` });
+      return json(res, 200, { ok: true }, { 'set-cookie': `${COOKIE}=${key}; HttpOnly; SameSite=Strict; Path=/console; Max-Age=${Math.floor(sessionMs / 1000)}` });
     }
 
     const sess = sessionOf(req);
     if (path === '/console/logout' && req.method === 'POST') {
       if (sess) { sessions.delete(sess.key); log(`[Console] logout from ${ip}`); }
-      return json(res, 200, { ok: true }, { 'set-cookie': 'lijc=; HttpOnly; SameSite=Strict; Path=/console; Max-Age=0' });
+      return json(res, 200, { ok: true }, { 'set-cookie': `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/console; Max-Age=0` });
     }
     if (path === '/console' || path === '/console/') {
       return send(res, 200, 'text/html; charset=utf-8', sess ? pageConsole() : pageLogin(''));

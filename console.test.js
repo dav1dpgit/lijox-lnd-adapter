@@ -28,7 +28,7 @@ function req(method, p, body, cookie) {
   t('wrong code refused', bad.status === 401);
   const counter = Math.floor(Date.now() / 1000 / 30); const code = totpCode(secret, counter);
   const ok = await req('POST', '/console/login', { code });
-  t('right code accepted', ok.status === 200 && /lijc=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/console/.test(ok.headers['set-cookie'][0]));
+  t('right code accepted', ok.status === 200 && /lijc_[a-f0-9]{8}=[a-f0-9]{64}; HttpOnly; SameSite=Strict; Path=\/console/.test(ok.headers["set-cookie"][0]));
   const cookie = ok.headers['set-cookie'][0].split(';')[0];
   const replay = await req('POST', '/console/login', { code });
   t('same code refused a second time (replay)', replay.status === 401);

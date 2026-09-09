@@ -4346,9 +4346,14 @@ async function consoleSnapshot() {
       last_seen_ms: lease ? (lease.last_seen_ms || 0) : 0, last_source: lease ? (lease.last_source || '') : '',
       note: (consoleNotes.channels[c.channel_point] || {}).text || '', label: (consoleNotes.wallets[c.remote_pubkey] || {}).label || '',
     };
-  }).sort((a, b) => {   // 0.73.2 (DP): by peer, then by channel
-    const la = (a.label || a.alias || a.remote_pubkey).toLowerCase(), lb = (b.label || b.alias || b.remote_pubkey).toLowerCase();
-    return la < lb ? -1 : la > lb ? 1 : (a.remote_pubkey < b.remote_pubkey ? -1 : a.remote_pubkey > b.remote_pubkey ? 1 : (a.channel_point < b.channel_point ? -1 : a.channel_point > b.channel_point ? 1 : 0));
+  }).sort((a, b) => {   // 0.73.3 (DP): the LiJ wallet channels together first, then the peer-node/LSP channels; within each group by peer, then by channel — a wallet's channels sit next to each other
+    if (a.wallet !== b.wallet) return a.wallet ? -1 : 1;
+    if (a.remote_pubkey !== b.remote_pubkey) {
+      const la = (a.label || a.alias || a.remote_pubkey).toLowerCase(), lb = (b.label || b.alias || b.remote_pubkey).toLowerCase();
+      if (la !== lb) return la < lb ? -1 : 1;
+      return a.remote_pubkey < b.remote_pubkey ? -1 : 1;
+    }
+    return a.channel_point < b.channel_point ? -1 : a.channel_point > b.channel_point ? 1 : 0;
   });
   // 0.71.1: "first seen" = the name's registration; "last heard" = the newest
   // lease stamp for that wallet's channel(s) (the lease loop stamps a channel
