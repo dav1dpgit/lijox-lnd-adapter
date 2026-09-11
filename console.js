@@ -70,13 +70,15 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:
 header h1{font-size:16px;margin:0;font-weight:600}header .sub{color:#8b949e;font-size:12px}header .sp{flex:1}
 button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}button:hover{background:#30363d}
 main{padding:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 12px 0;min-width:0;overflow:hidden}.card>div{min-width:0}.card>div:last-child{padding-bottom:12px}.card .tbl{overflow:auto;max-height:42vh;-webkit-overflow-scrolling:touch;margin:0 -12px;padding:0 12px}.card>.tbl:last-child,.card>div:last-child>.tbl:last-child{padding-bottom:0;margin-bottom:0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 12px 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;max-height:56vh}.card>div{min-width:0;flex:1 1 auto;min-height:0;display:flex;flex-direction:column}.card>div>*{flex:0 0 auto}.card>div>.tbl{flex:1 1 auto;min-height:0}.card>div:last-child{padding-bottom:12px}.card>div:last-child:has(>.tbl:last-child){padding-bottom:0}.card .tbl{overflow:auto;-webkit-overflow-scrolling:touch;margin:0 -12px;padding:0 12px}
 td button{padding:1px 6px;font-size:11px;line-height:1.3;border-radius:5px;white-space:nowrap}td{line-height:1.3}
 input.note{background:transparent;color:#e6edf3;border:1px solid transparent;border-radius:4px;padding:1px 4px;font:inherit;font-size:12px;width:16em;max-width:100%}input.note:hover,input.note:focus{border-color:#30363d;background:#0d1117;outline:none}
 textarea.note{width:100%;min-height:2.6em;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font:inherit;font-size:13px;resize:vertical;margin-bottom:8px}
-tr.grp td{background:#1c2129;cursor:pointer;font-weight:600}tr.grp td .tri{display:inline-block;width:1em;color:#8b949e}tr.sub td:first-child{padding-left:22px}.card h2{font-size:13px;margin:0 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em}
+tr.grp td{background:#1c2129;font-weight:600}tr.grp td .tri{display:inline-block;width:1em;color:#8b949e}tr.sub td:first-child{padding-left:22px}.card h2{font-size:13px;margin:0 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}.card h2:after{content:' ⤢';opacity:.35;font-size:12px}.card.full h2:after{content:' ⤡'}.card h2:hover{color:#e6edf3}
+.card.full{position:fixed;z-index:50;margin:0;border-radius:0;box-shadow:0 0 0 100vmax #0d1117;overflow:auto;transition:top .32s cubic-bezier(.2,.7,.2,1),left .32s cubic-bezier(.2,.7,.2,1),width .32s cubic-bezier(.2,.7,.2,1),height .32s cubic-bezier(.2,.7,.2,1),border-radius .32s}.card.full{max-height:none}.card.placeholder{visibility:hidden}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px}.kpi{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;min-width:0}.kpi .t{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em}.kpi .v{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;margin:2px 0;overflow-wrap:anywhere}.kpi .s{font-size:11px;color:#8b949e}.kpi.warn .v{color:#d29922}.kpi.bad .v{color:#f85149}.kpi.good .v{color:#3fb950}
 .kv{display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr);gap:4px 12px}.kv div{min-width:0;overflow-wrap:anywhere;word-break:break-word}.kv div:nth-child(odd){color:#8b949e}.kv div:nth-child(even){font-variant-numeric:tabular-nums}
-table{width:100%;border-collapse:collapse;font-size:13px;min-width:max-content}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid #21262d;vertical-align:top}th{color:#8b949e;font-weight:500}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:max-content}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid #21262d;vertical-align:top}th{color:#8b949e;font-weight:500;cursor:pointer;user-select:none;white-space:nowrap}th.sorted:after{content:' ▴';opacity:.7}th.sorted.desc:after{content:' ▾'}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 .ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}.dim{color:#8b949e}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere;word-break:break-all}
 .pill{display:inline-block;padding:1px 7px;border-radius:999px;font-size:11px;border:1px solid #30363d}.tor{border-color:#8957e5;color:#c297ff}.clear{border-color:#1f6feb;color:#79c0ff}
 #login{max-width:340px;margin:18vh auto;text-align:center}#login input{font:28px ui-monospace,Menlo,monospace;letter-spacing:.35em;text-align:center;width:100%;padding:12px;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:8px;margin:14px 0}
@@ -91,12 +93,28 @@ function ago(ms){if(!ms)return '\\u2014';var s=Math.max(0,(Date.now()-ms)/1000);
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function kv(rows){return '<div class="kv">'+rows.map(function(r){return '<div>'+esc(r[0])+'</div><div>'+(r[2]?r[1]:esc(r[1]))+'</div>'}).join('')+'</div>'}
 function net(addr){if(!addr)return '<span class="pill dim">?</span>';return /\\.onion/i.test(addr)?'<span class="pill tor">Tor</span>':'<span class="pill clear">clearnet</span>'}
-var lastPane={},expanded={};
+var lastPane={},expanded={},sortState={};
+function cellKey(td){var t=(td.textContent||'').trim();var n=parseFloat(t.replace(/[^0-9.\\-]/g,''));return (t!==''&&!isNaN(n)&&/^[\\s\\d.,\\-]*[\\d]/.test(t))?{n:n,t:t.toLowerCase()}:{n:null,t:t.toLowerCase()}}
+function applySort(paneEl){
+  var st=sortState[paneEl.id];if(!st)return;
+  Array.prototype.forEach.call(paneEl.querySelectorAll('table'),function(tbl){
+    var rows=Array.prototype.slice.call(tbl.rows);var head=rows.shift();if(!head)return;
+    Array.prototype.forEach.call(head.cells,function(th,i){th.classList.toggle('sorted',i===st.col);th.classList.toggle('desc',i===st.col&&st.dir<0)});
+    var segs=[],cur={head:null,blocks:[]};
+    rows.forEach(function(r){if(r.classList.contains('grp')){segs.push(cur);cur={head:r,blocks:[]}}else if(r.classList.contains('sub')&&cur.blocks.length){cur.blocks[cur.blocks.length-1].push(r)}else{cur.blocks.push([r])}});
+    segs.push(cur);
+    var body=tbl.tBodies[0]||tbl;
+    segs.forEach(function(seg){
+      seg.blocks.sort(function(a,b){var ka=cellKey(a[0].cells[st.col]||{textContent:''}),kb=cellKey(b[0].cells[st.col]||{textContent:''});var c=(ka.n!==null&&kb.n!==null)?ka.n-kb.n:ka.t<kb.t?-1:ka.t>kb.t?1:0;return c*st.dir});
+      if(seg.head)body.appendChild(seg.head);seg.blocks.forEach(function(bl){bl.forEach(function(r){body.appendChild(r)})});
+    });
+  });
+}
 function setPane(id,html){
   if(lastPane[id]===html)return;
   var el0=$(id);if(el0&&el0.contains(document.activeElement)&&/^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName))return;   // never yank a field out from under a typing operator
   var el=$(id);var sc=[];Array.prototype.forEach.call(el.querySelectorAll('.tbl'),function(t){sc.push([t.scrollLeft,t.scrollTop])});
-  el.innerHTML=html;lastPane[id]=html;
+  el.innerHTML=html;lastPane[id]=html;applySort(el);
   Array.prototype.forEach.call(el.querySelectorAll('.tbl'),function(t,i){if(sc[i]){t.scrollLeft=sc[i][0];t.scrollTop=sc[i][1]}});
 }
 function render(d){
@@ -107,19 +125,34 @@ function render(d){
   var g=d.guardrails||{};var mult=Number(g.live_mult_pct||100);
   setPane('guard',kv([['open-fee multiplier now','<span class="'+(mult>100?(mult>=Number(g.max_mult_pct)?'bad':'warn'):'ok')+'">'+mult+'%</span> <span class="dim">refreshed '+ago(g.refreshed_ms)+'</span>',1],['on-chain vs floor',fmt(g.onchain_confirmed)+' sats confirmed \\u00b7 floor '+fmt(g.reserve_floor_sats)+' \\u00b7 headroom '+(g.headroom==null?'\\u2014':fmt(g.headroom)),1],['scarcity ramp','starts at '+fmt(g.ramp_start_sats)+' headroom \\u2192 up to '+fmt(g.max_mult_pct)+'%',1],['per-wallet ladder',fmt(g.free_opens)+' free opens per '+fmt(g.window_days)+' d, then +'+fmt(g.step_pct)+'% each',1],['JIT channel size','min '+fmt(g.channel_min_sats)+' \\u00b7 default '+fmt(g.channel_size_sats)+' \\u00b7 max '+fmt(g.channel_max_sats)+' sats',1],['open fee floor',fmt(g.open_fee_min_sats)+' sats \\u00b7 routing '+fmt(g.fee_ppm)+' ppm',1],['floor opens/day',fmt(g.floor_max_opens_per_day)],['lease',(g.lease_enabled?(g.lease_dry_run?'<span class="warn">on, dry run</span> (logs, never closes)':'<span class="ok">on</span>'):'<span class="dim">off</span>')+' \\u00b7 '+fmt(g.lease_days)+' d silence \\u00b7 cycle '+fmt(g.lease_cycle_min)+' min<br>'+fmt(g.lease_leased)+' channels leased \\u00b7 '+fmt(g.lease_excluded)+' excluded \\u00b7 '+(g.lease_list_saved_at?'list saved '+ago(g.lease_list_saved_at):'<span class="bad">exclusion list never saved \\u2014 the lease closes nothing until you set it below</span>'),1]]));
   var b=d.balances||{};
-  setPane('bal',kv([['on-chain confirmed',fmt(b.onchain_confirmed)+' sats'+(b.reserved_anchor?' <span class="dim">('+fmt(b.reserved_anchor)+' reserved for anchors)</span>':''),1],['on-chain unconfirmed',fmt(b.onchain_unconfirmed)+' sats'],['channel local',fmt(b.local)+' sats'+(b.unsettled?' <span class="dim">('+fmt(b.unsettled)+' in flight)</span>':''),1],['channel remote',fmt(b.remote)+' sats'],['pending open local',fmt(b.pending_open_local)+' sats']]));
+  var pr=b.principles||{};function cov(x){return x==null?'<span class="dim">n/a</span>':x.toFixed(1)+'\\u00d7'}
+  var bx=b.boxes||{};function kpi(t,v,sub,cls){return '<div class="kpi '+(cls||'')+'"><div class="t">'+t+'</div><div class="v">'+v+'</div><div class="s">'+(sub||'')+'</div></div>'}
+  var ti=bx.top_inbound;var boxesHtml='<div class="kpis">'
+    +kpi('Treasury',fmt(bx.treasury)+' sats',(Number(bx.treasury||0)/1e8).toFixed(4)+' BTC')
+    +kpi('On-chain',fmt(bx.onchain_total)+' sats',fmt(bx.anchor_reserve)+' anchor reserve',bx.onchain_total<2e6?'bad':bx.onchain_total<5e6?'warn':'')
+    +kpi('Can send',fmt(bx.can_send)+' sats',fmt(bx.n_active)+' active channels')
+    +kpi('Can receive',fmt(bx.can_receive)+' sats','inbound capacity',bx.can_receive<1e6?'warn':'')
+    +kpi('Top inbound peer',ti?(ti.pct*100).toFixed(1)+'%':'\\u2014',ti?esc(ti.alias)+' \\u00b7 '+fmt(ti.sats)+' sats':'no peer channels',ti?(ti.pct>0.8?'bad':ti.pct>0.5?'warn':'good'):'')
+    +'</div>';
+  setPane('bal',boxesHtml+kv([['on-chain confirmed',fmt(b.onchain_confirmed)+' sats'+(b.reserved_anchor?' <span class="dim">('+fmt(b.reserved_anchor)+' reserved for anchors)</span>':''),1],['on-chain unconfirmed',fmt(b.onchain_unconfirmed)+' sats'],['channel local',fmt(b.local)+' sats'+(b.unsettled?' <span class="dim">('+fmt(b.unsettled)+' in flight)</span>':''),1],['channel remote',fmt(b.remote)+' sats'],['pending open local',fmt(b.pending_open_local)+' sats'],
+    ['P1 outbound cover',cov(pr.p1_cover)+'<br><span class="dim">ex-wallet outbound '+fmt(pr.ext_out)+' \\u00f7 wallets\\u2019 spendable '+fmt(pr.wallet_out)+' \\u2014 how many times over the LSP could push out what every wallet holds</span>',1],
+    ['P2 inbound cover',cov(pr.p2_cover)+'<br><span class="dim">ex-wallet inbound '+fmt(pr.ext_in)+' \\u00f7 wallets\\u2019 receive room '+fmt(pr.wallet_in)+' \\u2014 how many times over the network could fill what every wallet can still receive</span>',1],
+    ['counted',fmt(pr.wallet_n)+' wallet channels ('+fmt(pr.wallet_active)+' online now) + '+fmt(pr.ext_n)+' peer channels ('+fmt(pr.ext_active)+' online); all channels count \\u2014 a wallet is offline whenever its phone is closed; wallets\\u2019 spendable = their side of wallet channels, receive room = the LSP\\u2019s side',1]]));
   var ch=d.channels||[];
   setPane('sumnote','<textarea class="note" id="sumnotebox" data-kind="summary" data-key="" data-saved="'+esc(d.summary_note||'')+'" placeholder="summary note (saved when you click away)">'+esc(d.summary_note||'')+'</textarea>');
   var rows='';ch.forEach(function(c){var lbl=c.label||c.alias||c.remote_pubkey.slice(0,12)+'\\u2026';
-    rows+='<tr><td>'+(c.wallet?'<span class="ok">wallet</span> ':'')+esc(lbl)+' '+(c.private?'<span class="dim">private</span> ':'')+'<span class="mono dim">'+esc(c.channel_point.slice(0,10))+'\\u2026:'+esc(c.channel_point.split(':')[1])+'</span></td><td>'+net(c.address)+'</td><td class="n">'+fmt(c.capacity)+'</td><td class="n">'+fmt(c.local_balance)+'</td><td class="n">'+fmt(c.remote_balance)+'</td><td>'+(c.active?'<span class="ok">active</span>':'<span class="bad">inactive</span>')+(c.pending_htlcs?' <span class="warn">'+c.pending_htlcs+' htlc</span>':'')+'</td><td>'+(c.excluded?'<span class="dim">excluded</span>':(c.lease?esc(c.lease):'<span class="dim">\\u2014</span>'))+(c.last_seen_ms?'<br><span class="dim">'+esc(c.last_source||'seen')+' \\u00b7 '+ago(c.last_seen_ms)+'</span>':'')+'</td><td><input class="note" data-kind="channel" data-key="'+esc(c.channel_point)+'" value="'+esc(c.note||'')+'" data-saved="'+esc(c.note||'')+'" placeholder="note"></td><td><button class="lx" data-cp="'+esc(c.channel_point)+'" data-peer="'+esc(c.remote_pubkey)+'" data-x="'+(c.excluded?'1':'0')+'">'+(c.excluded?'include in lease':'exclude from lease')+'</button></td></tr>'});
-  setPane('chan','<div class="tbl"><table><tr><th>peer \\u00b7 channel</th><th>net</th><th class="n">capacity</th><th class="n">local</th><th class="n">remote</th><th>state</th><th>lease</th><th>note</th><th></th></tr>'+rows+'</table></div>'+(ch.length?'':'<div class="dim">no channels</div>'));
+    rows+='<tr><td>'+(c.wallet?'<span class="ok">wallet</span> ':'')+esc(lbl)+' '+(c.private?'<span class="dim">private</span> ':'')+'<span class="mono dim">'+esc(c.channel_point.slice(0,10))+'\\u2026:'+esc(c.channel_point.split(':')[1])+'</span></td><td>'+(c.opened_ms?esc(new Date(c.opened_ms).toLocaleString([],{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'})):(c.opened_block?'<span class="dim">block '+fmt(c.opened_block)+'</span>':'<span class="dim">\\u2014</span>'))+(c.initiator?'':' <span class="dim">by peer</span>')+'</td><td>'+net(c.address)+'</td><td class="n">'+fmt(c.capacity)+'</td><td class="n">'+fmt(c.local_balance)+'</td><td class="n">'+fmt(c.remote_balance)+'</td><td>'+(c.active?'<span class="ok">active</span>':'<span class="bad">inactive</span>')+(c.pending_htlcs?' <span class="warn">'+c.pending_htlcs+' htlc</span>':'')+'</td><td>'+(c.excluded?'<span class="dim">excluded</span>':(c.lease?esc(c.lease):'<span class="dim">\\u2014</span>'))+(c.last_seen_ms?'<br><span class="dim">'+esc(c.last_source||'seen')+' \\u00b7 '+ago(c.last_seen_ms)+'</span>':'')+'</td><td><input class="note" data-kind="channel" data-key="'+esc(c.channel_point)+'" value="'+esc(c.note||'')+'" data-saved="'+esc(c.note||'')+'" placeholder="note"></td><td><button class="lx" data-cp="'+esc(c.channel_point)+'" data-peer="'+esc(c.remote_pubkey)+'" data-x="'+(c.excluded?'1':'0')+'">'+(c.excluded?'include in lease':'exclude from lease')+'</button></td></tr>'});
+  setPane('chan','<div class="tbl"><table><tr><th>peer \\u00b7 channel</th><th>opened on</th><th>net</th><th class="n">capacity</th><th class="n">local</th><th class="n">remote</th><th>state</th><th>lease</th><th>note</th><th></th></tr>'+rows+'</table></div>'+(ch.length?'':'<div class="dim">no channels</div>'));
 
   var w=d.wallets||[];
-  setPane('wal','<div class="tbl"><table><tr><th>wallet</th><th>pay-code name</th><th class="n">holds</th><th class="n">hashes</th><th>first seen</th><th>last heard</th><th>label</th></tr>'+w.map(function(x){return '<tr><td class="mono">'+esc(x.pubkey.slice(0,16))+'\\u2026</td><td>'+esc(x.name||'\\u2014')+'</td><td class="n">'+fmt(x.holds)+'</td><td class="n">'+fmt(x.hashes)+'</td><td>'+(x.first_seen_ms?new Date(x.first_seen_ms).toLocaleDateString():'\\u2014')+'</td><td>'+(x.last_heard_ms?ago(x.last_heard_ms):'<span class="dim">no channel</span>')+'</td><td><input class="note" data-kind="wallet" data-key="'+esc(x.pubkey)+'" value="'+esc(x.label||'')+'" data-saved="'+esc(x.label||'')+'" placeholder="label"></td></tr>'}).join('')+'</table></div>'+(w.length?'':'<div class="dim">no wallets registered a name yet</div>'));
+  setPane('wal','<div class="dim" style="margin-bottom:6px">'+fmt(d.wallet_count||0)+' wallet'+(d.wallet_count===1?'':'s')+' served (distinct by public key; a wallet with several pay codes counts once)</div><div class="tbl"><table><tr><th>wallet</th><th>pay-code name</th><th class="n">holds</th><th class="n">LNURL hashes</th><th>first seen</th><th>last heard</th><th class="n">remote (wallet) balance</th><th>label</th></tr>'+w.map(function(x){return '<tr><td class="mono">'+esc(x.pubkey.slice(0,16))+'\\u2026</td><td>'+esc(x.name||'\\u2014')+'</td><td class="n">'+fmt(x.holds)+'</td><td class="n">'+fmt(x.hashes)+'</td><td>'+(x.first_seen_ms?new Date(x.first_seen_ms).toLocaleDateString():'\\u2014')+'</td><td>'+(x.last_heard_ms?ago(x.last_heard_ms):'<span class="dim">no channel</span>')+'</td><td class="n">'+(x.remote_sats==null?'<span class="dim">\\u2014</span>':fmt(x.remote_sats)+' sats')+'</td><td><input class="note" data-kind="wallet" data-key="'+esc(x.pubkey)+'" value="'+esc(x.label||'')+'" data-saved="'+esc(x.label||'')+'" placeholder="label"></td></tr>'+(((d.registry_records||{})[x.pubkey]||[]).map(function(rr){return '<tr class="sub"><td colspan="8"><span class="dim">registered channel</span> <span class="mono">'+esc(rr.funding)+'</span> \\u00b7 '+fmt(rr.value_sat)+' sats'+(rr.close_height?' \\u00b7 <span class="dim">closed at '+fmt(rr.close_height)+'</span>':'')+'</td></tr>'}).join(''))}).join('')+'</table></div>'+(w.length?'':'<div class="dim">no wallets registered a name yet</div>'));
   var p=d.pending||[];
   setPane('pend',p.length?'<div class="tbl"><table><tr><th>kind</th><th>peer</th><th class="n">capacity</th><th>txid</th></tr>'+p.map(function(x){return '<tr><td>'+esc(x.kind)+'</td><td class="mono">'+esc(x.remote_pubkey.slice(0,12))+'\\u2026</td><td class="n">'+fmt(x.capacity)+'</td><td class="mono">'+esc((x.channel_point||'').slice(0,16))+'\\u2026</td></tr>'}).join('')+'</table></div>':'<div class="dim">nothing pending</div>');
   var u=d.unconfirmed||{};
   setPane('unc',u.error?'<div class="dim">'+esc(u.error)+'</div>':(((u.txs||[]).length||(u.sweeps||[]).length)?'<div class="tbl"><table><tr><th>what</th><th class="n">sats</th><th class="n">fee</th><th>txid</th><th>since</th></tr>'+(u.txs||[]).map(function(t){return '<tr><td>'+esc(t.label||(t.amount>=0?'incoming':'outgoing'))+'</td><td class="n">'+fmt(t.amount)+'</td><td class="n">'+fmt(t.fee)+'</td><td class="mono">'+esc(t.txid.slice(0,16))+'\\u2026</td><td>'+ago(t.time_ms)+'</td></tr>'}).join('')+(u.sweeps||[]).map(function(t){return '<tr><td>sweep pending ('+esc(t.kind)+')</td><td class="n">'+fmt(t.amount)+'</td><td class="n">'+esc(t.fee_rate)+' sat/vB</td><td class="mono">'+esc(t.outpoint.slice(0,16))+'\\u2026</td><td>'+esc(t.tries)+' tries</td></tr>'}).join('')+'</table></div>':'<div class="dim">nothing unconfirmed</div>'));
+  var st=d.settings||[];var lp=d.lnd_policy||{};var groups=[];var byG={};st.forEach(function(x){if(!byG[x.group]){byG[x.group]=[];groups.push(x.group)}byG[x.group].push(x)});
+  var polTxt=lp.error?'<span class="dim">LND policy not readable: '+esc(lp.error)+'</span>':(lp.checked?(lp.mismatches.length?'<span class="bad">LND charges differently on '+lp.mismatches.length+' of '+lp.checked+' wallet channels</span> '+lp.mismatches.map(function(m){return '<span class="dim">'+esc(m.chan_id.slice(-6))+': '+fmt(m.base_msat)+' msat + '+fmt(m.ppm)+' ppm</span>'}).join(', '):'<span class="ok">LND charges the advertised base + ppm on all '+lp.checked+' wallet channels checked</span>'):'<span class="dim">no wallet channel to check</span>');
+  setPane('settings','<div class="dim" style="margin-bottom:8px">A report. Nothing here can be changed from the console \\u2014 every value is set in the box\\u2019s .env (or the adapter\\u2019s default) and applied at restart.</div><div class="tbl"><table><tr><th>setting</th><th>value</th><th>source</th><th>variable</th><th></th></tr>'+groups.map(function(g){return '<tr class="grp"><td colspan="5">'+esc(g)+'</td></tr>'+byG[g].map(function(x){return '<tr><td>'+esc(x.label)+'</td><td class="n">'+esc(String(x.value))+(x.unit?' <span class="dim">'+esc(x.unit)+'</span>':'')+'</td><td><span class="'+(x.source==='.env'?'ok':'dim')+'">'+esc(x.source)+'</span></td><td class="mono dim">'+esc(x.name||'')+'</td><td class="dim">'+esc(x.note||'')+'</td></tr>'}).join('')+(g==='Advertised fees'?'<tr><td colspan="5">'+polTxt+'</td></tr>':'')}).join('')+'</table></div>');
   var r=d.registry||{};
   setPane('reg',kv([['registry',r.url||'<span class="dim">not configured (registry-free)</span>',1],['last registration',r.last_ok?'<span class="ok">ok</span> '+ago(r.last_ok):(r.last_error?'<span class="bad">'+esc(r.last_error)+'</span>':'<span class="dim">never</span>'),1],['next',r.next_ms?ago(r.next_ms).replace(' ago','')+' (every '+r.every_h+' h)':'\\u2014',1],['advertised',(r.https_url||'')+'<br>'+(r.wss_url||''),1]]));
   var k=d.backups||{};
@@ -168,7 +201,27 @@ function login(){
     if(j.ok){location.reload()}else{$('msg').textContent=j.error||'code refused';$('code').value='';$('code').focus()}
   }).catch(function(){$('msg').textContent='no answer'});
 }
+var fullCard=null,fullPh=null;
+function expandCard(card){
+  var r=card.getBoundingClientRect();
+  var ph=card.cloneNode(false);ph.className='card placeholder';ph.style.height=r.height+'px';card.parentNode.insertBefore(ph,card);
+  card.style.top=r.top+'px';card.style.left=r.left+'px';card.style.width=r.width+'px';card.style.height=r.height+'px';
+  card.classList.add('full');void card.offsetWidth;
+  card.style.top='0px';card.style.left='0px';card.style.width=window.innerWidth+'px';card.style.height=window.innerHeight+'px';
+  fullCard=card;fullPh=ph;document.body.style.overflow='hidden';
+}
+function collapseCard(){
+  if(!fullCard)return;var card=fullCard,ph=fullPh;var r=ph.getBoundingClientRect();
+  card.style.top=r.top+'px';card.style.left=r.left+'px';card.style.width=r.width+'px';card.style.height=r.height+'px';
+  var done=function(){card.removeEventListener('transitionend',done);card.classList.remove('full');card.style.top=card.style.left=card.style.width=card.style.height='';if(ph.parentNode)ph.parentNode.removeChild(ph)};
+  card.addEventListener('transitionend',done);setTimeout(done,400);
+  fullCard=null;fullPh=null;document.body.style.overflow='';
+}
+window.addEventListener('resize',function(){if(fullCard){fullCard.style.width=window.innerWidth+'px';fullCard.style.height=window.innerHeight+'px'}});
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&fullCard)collapseCard()});
 document.addEventListener('DOMContentLoaded',function(){
+  document.addEventListener('click',function(e){var th=e.target.closest?e.target.closest('th'):null;if(th&&th.parentNode&&th.parentNode.rowIndex===0){var pane=th.closest('.card > div[id]');if(pane){var col=th.cellIndex;var st=sortState[pane.id];sortState[pane.id]=(st&&st.col===col)?{col:col,dir:-st.dir}:{col:col,dir:1};applySort(pane)}return}
+    var h=e.target.closest?e.target.closest('.card > h2'):null;if(!h)return;var card=h.parentNode;if(fullCard===card){collapseCard()}else if(!fullCard){expandCard(card)}});
   if($('login')){var c=$('code');c.focus();c.addEventListener('input',function(){if(c.value.replace(/\\D/g,'').length===6)login()});$('go').addEventListener('click',login);return}
   $('logout').addEventListener('click',function(){fetch('/console/logout',{method:'POST'}).then(function(){location.reload()})});
   $('chan').addEventListener('click',function(e){var b=e.target.closest?e.target.closest('button.lx'):null;if(!b)return;var cp=b.getAttribute('data-cp'),x=b.getAttribute('data-x')==='1';if(!confirm((x?'Include this channel in the lease again?':'Exclude this channel from the lease?')+'\\n\\n'+cp))return;b.disabled=true;fetch('/console/lease-exclude',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chan_point:cp,excluded:!x,peer:b.getAttribute('data-peer')})}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.error||'refused');lastPane['chan']=null}).catch(function(){alert('no answer');b.disabled=false})});
@@ -195,13 +248,14 @@ function pageConsole() {
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>
 <section class="card"><h2>Node</h2><div id="node" class="dim">\u2026</div></section>
 <section class="card"><h2>Balances</h2><div id="bal" class="dim">\u2026</div></section>
-<section class="card" style="grid-column:1/-1"><h2>Channels</h2><div id="sumnote"></div><div id="chan" class="dim">\u2026</div></section>
+<section class="card"><h2>Channels</h2><div id="sumnote"></div><div id="chan" class="dim">\u2026</div></section>
 <section class="card"><h2>Wallets served</h2><div id="wal" class="dim">\u2026</div></section>
 <section class="card"><h2>Pending channels</h2><div id="pend" class="dim">\u2026</div></section>
 <section class="card"><h2>Unconfirmed on-chain</h2><div id="unc" class="dim">\u2026</div></section>
 <section class="card"><h2>Registry</h2><div id="reg" class="dim">\u2026</div></section>
 <section class="card"><h2>Backups</h2><div id="bak" class="dim">\u2026</div></section>
 <section class="card"><h2>Loops</h2><div id="loops" class="dim">\u2026</div></section>
+<section class="card"><h2>Settings (report)</h2><div id="settings" class="dim">\u2026</div></section>
 </main><script>${JS}</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }

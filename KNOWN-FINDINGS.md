@@ -105,3 +105,16 @@ only as the console's "wallet" label.
 non-wallet channel in the console (the Guardrails row must show "list saved" and
 the right excluded count), read `lease-log.ndjson` for `would_close` (wallet
 channels only), and re-seed if stamps predate 0.72.2.
+
+## 2026-09-10 — the "admin" secret was public, and one admin route sat on the internet
+
+**Seen:** while comparing against Alby Hub's 2026 management-API breach. The adapter's
+`ADAPTER_SECRET` is by design the route token every wallet receives from the registry
+(`route_macaroon`) — a capability token, public. The setup guide (0.71.0) called it
+"admin and route auth", and `GET /admin/registry/channels` (the wallets' channel
+records) was served on the public API behind that token, i.e. to anyone.
+
+**Fix (0.74.0):** the route is retired (410); the records are on the console's
+Wallets pane (loopback + Tailscale, TOTP). Docs corrected: there is no admin secret
+on the public API and nothing must ever be gated by the route token alone. The console
+remains the only management surface and never reaches the internet.

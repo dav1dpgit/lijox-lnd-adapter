@@ -1,6 +1,6 @@
 {
   "name": "lijox-adapter",
-  "version": "0.73.3",
+  "version": "0.74.5",
   "description": "LIJOX Adapter \u2014 open-source, self-hosted software that translates an operator's existing Lightning services into a LIJOX-standard LSP for LiJ-class wallets.",
   "main": "index.js",
   "scripts": {

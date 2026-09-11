@@ -41,7 +41,7 @@ Edit `config.env`. The required lines:
 
 | key | what it is |
 |---|---|
-| `ADAPTER_SECRET` | `openssl rand -hex 32`. Admin and route auth; the registry hands wallets a *route* token, never this. |
+| `ADAPTER_SECRET` | `openssl rand -hex 32`. The route token: the registry hands it to every wallet as `route_macaroon`, so treat it as public. It gates nothing sensitive and must never be relied on to; the console is the only management surface. |
 | `NODE_PUBKEY` | `lncli getinfo` → `identity_pubkey`. |
 | `NODE_HOST` | how peers reach your node: `<onion>:9735` (Tor, §5) or `<vps-ip>:9735` (relay, §6). |
 | `PUBLIC_HTTPS_URL` | `https://lsp.yourdomain.tld` — the tunnel hostname for the API (step 4). |
@@ -87,55 +87,7 @@ Tor-only is enough to operate. Clearnet reachability helps in one place: other n
 
 **a. Get the VPS.** Any provider with a fixed IPv4. Example, Hetzner: hetzner.com → *Cloud* → sign up (e-mail, card; identity check is sometimes asked for) → *New project* → *Add server* → location near you → image *Ubuntu 24.04* → type CX22 (2 vCPU, 4 GB; ~€4/month) → *SSH key*: paste your public key (`cat ~/.ssh/id_ed25519.pub` on the LND host; `ssh-keygen -t ed25519` if you have none) → *Create*. Note the IPv4.
 
-**b. On the VPS** (`ssh root@<vps-ip>`):
-
-```
-apt update && apt install -y wireguard
-umask 077; wg genkey | tee /etc/wireguard/vps.key | wg pubkey > /etc/wireguard/vps.pub
-cat /etc/wireguard/vps.pub        # → VPS_PUB
-```
-
-`/etc/wireguard/wg0.conf`:
-
-```
-[Interface]
-Address = 10.9.0.1/24
-ListenPort = 51820
-PrivateKey = <contents of vps.key>
-# forward Lightning's port to the home node over the tunnel, and let replies return
-PostUp   = sysctl -w net.ipv4.ip_forward=1; iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 9735 -j DNAT --to-destination 10.9.0.2:9735; iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
-PostDown = iptables -t nat -D PREROUTING -i eth0 -p tcp --dport 9735 -j DNAT --to-destination 10.9.0.2:9735; iptables -t nat -D POSTROUTING -o wg0 -j MASQUERADE
-
-[Peer]
-PublicKey = <HOME_PUB, from step c>
-AllowedIPs = 10.9.0.2/32
-```
-
-(`eth0` is the public interface on Hetzner; check with `ip -br a` and adjust.)
-
-**c. On the LND host:**
-
-```
-sudo apt install -y wireguard
-umask 077; wg genkey | sudo tee /etc/wireguard/home.key | wg pubkey | sudo tee /etc/wireguard/home.pub
-cat /etc/wireguard/home.pub       # → HOME_PUB, paste into the VPS [Peer]
-```
-
-`/etc/wireguard/wg0.conf`:
-
-```
-[Interface]
-Address = 10.9.0.2/24
-PrivateKey = <contents of home.key>
-
-[Peer]
-PublicKey = <VPS_PUB>
-Endpoint = <vps-ip>:51820
-AllowedIPs = 10.9.0.1/32
-PersistentKeepalive = 25
-```
-
-Bring both up: `systemctl enable --now wg-quick@wg0` on each. Check from the LND host: `ping 10.9.0.1`.
+**b–c. The tunnel.** Use the kit in `ops/relay/`: `vps-setup.sh` runs once on the rented server and prints its public key; `wg0-node.conf` is the home node's config. The kit's README has the six steps. Everything in it is an example value; nothing in it is specific to any operator.
 
 **d. LND advertises the relay.** In `lnd.conf` add `externalip=<vps-ip>:9735` (keep the Tor lines — both addresses are advertised). Restart LND. From anywhere: `nc -vz <vps-ip> 9735` connects. `NODE_HOST=<vps-ip>:9735` in `config.env` if you want the registry record to show clearnet first.
 

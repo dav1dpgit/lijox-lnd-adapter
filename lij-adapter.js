@@ -4307,6 +4307,67 @@ function consoleNoteSet(kind, key, text) {
   return { ok: true, kind, key, text: t };
 }
 
+// ── 0.74.0 (DP): the SETTINGS REPORT — read-only. Every dial the box runs on, with
+// its value and its source (.env or the adapter's default). Secrets: set/unset only.
+// Nothing here can be changed from the console; changing any of it is a text file
+// and a restart, and the pane says so.
+function settingsReport() {
+  const E = process.env;
+  const src = (name) => (E[name] !== undefined && E[name] !== '') ? '.env' : 'default';
+  const row = (group, label, name, value, unit, note) => ({ group, label, name, value, unit: unit || '', source: src(name), note: note || '' });
+  const L = CONFIG.lsps2, C = CONFIG.channel, N = CONFIG.node, Ls = CONFIG.lease;
+  const rows = [
+    row('Advertised fees', 'routing fee (card)', 'FEE_PPM', N.fee_ppm, 'ppm', 'advertised only — what a payment pays is LND\'s policy on the channel (see LND actual)'),
+    row('Advertised fees', 'LSPS2 base fee', 'LSPS2_BASE_FEE_MSAT', L.base_fee_msat, 'msat', 'per forward, advertised in get_info and route hints'),
+    row('Advertised fees', 'LSPS2 fee', 'LSPS2_FEE_PPM', L.fee_ppm, 'ppm', 'per forward, advertised'),
+    row('Channel-open fee', 'open fee', 'LSPS2_VAR_FEE_PPM', L.open_fee_ppm, 'ppm', 'of the opening payment; the JIT, bolt11 and LNURL rails share it'),
+    row('Channel-open fee', 'open fee floor', 'LSPS2_OPEN_FEE_MIN_MSAT', L.open_fee_min_msat, 'msat', 'the least an open costs the wallet'),
+    row('JIT sizing (inbound liquidity)', 'size rule', '', 'max(2 × payment, payment + buffer)', '', 'computeChannelSizeSats — the inbound room a first receive gets'),
+    row('JIT sizing (inbound liquidity)', 'buffer', 'LSPS2_CHANNEL_BUFFER_SATS', L.channel_buffer_sats, 'sats', 'added above the payment'),
+    row('JIT sizing (inbound liquidity)', 'channel min', 'MIN_CHANNEL_SATS', C.min_sats, 'sats', ''),
+    row('JIT sizing (inbound liquidity)', 'channel default', 'CHANNEL_SIZE_SATS', C.size_sats, 'sats', ''),
+    row('JIT sizing (inbound liquidity)', 'channel max', 'MAX_CHANNEL_SATS', C.max_sats, 'sats', 'JIT opens are not capped by this (intentional, S44)'),
+    row('JIT sizing (inbound liquidity)', 'payment min', 'LSPS2_MIN_PAYMENT_SIZE_MSAT', L.min_payment_size_msat, 'msat', ''),
+    row('JIT sizing (inbound liquidity)', 'payment max', 'LSPS2_MAX_PAYMENT_SIZE_MSAT', L.max_payment_size_msat, 'msat', ''),
+    row('JIT sizing (inbound liquidity)', 'open-amount JIT', 'LSPS2_VAR_ENABLED', L.variable_enabled, '', 'variable-amount receives'),
+    row('JIT sizing (inbound liquidity)', 'quiesce', 'LSPS2_VAR_QUIESCE_MS', L.variable_quiesce_ms, 'ms', 'silence that finalises an open-amount set'),
+    row('Guardrails', 'on-chain reserve floor', 'JIT_MIN_ONCHAIN_RESERVE_SATS', L.jit_min_onchain_reserve_sats, 'sats', 'no JIT open below this confirmed balance'),
+    row('Guardrails', 'scarcity ramp start', 'JIT_SCARCITY_RAMP_START_SATS', L.jit_scarcity_ramp_start_sats, 'sats', 'headroom where the open-fee multiplier starts rising'),
+    row('Guardrails', 'scarcity max', 'JIT_SCARCITY_MAX_PCT', L.jit_scarcity_max_pct, '%', 'multiplier at zero headroom'),
+    row('Guardrails', 'free opens per wallet', 'JIT_FEE_FREE_OPENS', L.jit_fee_free_opens, '', 'per window'),
+    row('Guardrails', 'step after free opens', 'JIT_FEE_STEP_PCT', L.jit_fee_step_pct, '%', 'each further open adds this'),
+    row('Guardrails', 'window', 'LSPS2_JIT_WINDOW_DAYS', Math.round(JIT_WINDOW_MS / 86400000), 'days', ''),
+    row('Guardrails', 'floor opens per day', 'JIT_FLOOR_MAX_OPENS_PER_DAY', JIT_FLOOR_MAX_OPENS_PER_DAY, '', ''),
+    row('Guardrails', 'promise validity', 'LSPS2_PROMISE_VALIDITY_SECS', L.promise_validity_secs, 's', ''),
+    row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
+    row('Lease', 'dry run', 'LEASE_DRY_RUN', Ls.dry_run, '', 'true = logs would_close, never closes'),
+    row('Lease', 'silence before close', 'LEASE_DAYS', Ls.days, 'days', 'per-channel ttl overrides it (lease state)'),
+    row('Lease', 'cycle', 'LEASE_CYCLE_MINUTES', Ls.cycle_minutes, 'min', 'a close lands within one cycle of the ttl'),
+    row('Lease', 'session gap', 'LEASE_SESSION_GAP_MIN', Math.round(LEASE_SESSION_GAP_MS / 60000), 'min', 'contact after this much silence = a new session (one write, one log line)'),
+    row('Lease', 'exclusions', '', Object.values(leaseExclude.chan_points || {}).filter((v) => v && v.excluded).length + ' from console' + (Ls.exclude.length ? ' + ' + Ls.exclude.length + ' from .env' : ''), '', leaseExclude.saved_at ? 'list saved' : 'list NEVER saved — the lease closes nothing'),
+    row('Lease', 'lncli command', 'LEASE_LNCLI', Ls.lncli, '', 'the box\'s admin lncli, used only by the lease close'),
+    row('Registry', 'registry', 'LIJOX_REGISTRY', CONFIG.registry || '(none — registry-free)', '', ''),
+    row('Registry', 're-register every', 'LIJOX_REGISTER_EVERY_HOURS', registryStatus.every_h, 'h', 'the registry marks a record stale after 24 h without one'),
+    row('Registry', 'advertised name', 'NODE_NAME', N.name, '', ''),
+    row('Registry', 'advertised host', 'NODE_HOST', N.host, '', 'Tor or clearnet URI for peers'),
+    row('Front doors', 'API port', 'ADAPTER_PORT', CONFIG.adapter.port, '', ''),
+    row('Front doors', 'WS proxy port', 'WS_PROXY_PORT', CONFIG.adapter.ws_port, '', ''),
+    row('Front doors', 'public HTTPS', 'PUBLIC_HTTPS_URL', CONFIG.public.https_url, '', ''),
+    row('Front doors', 'public WSS', 'PUBLIC_WSS_URL', CONFIG.public.wss_url, '', ''),
+    row('Front doors', 'allowed origins', 'WS_ALLOWED_ORIGINS', E.WS_ALLOWED_ORIGINS || '(default)', '', ''),
+    row('Console', 'port', 'CONSOLE_PORT', E.CONSOLE_PORT || 7004, '', 'loopback + Tailscale only'),
+    row('Console', 'session', 'CONSOLE_SESSION_HOURS', E.CONSOLE_SESSION_HOURS || 12, 'h', ''),
+    row('Console', 'Tailscale bind', 'CONSOLE_TAILSCALE', E.CONSOLE_TAILSCALE || 'true', '', ''),
+    row('Secrets', 'route token (published)', 'ADAPTER_SECRET', E.ADAPTER_SECRET ? 'set' : 'unset', '', 'a capability token every wallet receives via the registry — not an admin secret'),
+    row('Secrets', 'LND macaroon', 'LIJ_ADAPTER_MACAROON_HEX', E.LIJ_ADAPTER_MACAROON_HEX ? 'set' : 'unset', '', 'least-privilege bake (MACAROON.md)'),
+    row('Secrets', 'console TOTP', 'CONSOLE_TOTP_SECRET', E.CONSOLE_TOTP_SECRET ? 'set' : 'unset', '', ''),
+    row('Secrets', 'VAPID (web push)', 'VAPID_PRIVATE_KEY', E.VAPID_PRIVATE_KEY ? 'set' : 'unset', '', ''),
+    row('Paths', 'data dir', 'LIJ_DATA_DIR', DATA_DIR, '', 'registries, tapes, lease state, notes, PL'),
+    row('Paths', 'LND REST', 'LND_ENDPOINT', (CONFIG.lnd && CONFIG.lnd.endpoint) || '', '', ''),
+  ];
+  return rows;
+}
+
 // ── 0.71.0: the console's snapshot — what the panes show, assembled here so the
 // console module knows nothing about the adapter's internals. Balances and
 // channels from LND's REST API; wallets from the LNURL registry; leases, loops,
@@ -4314,19 +4375,72 @@ function consoleNoteSet(kind, key, text) {
 // listpeers' address.
 async function consoleSnapshot() {
   const fs = require('fs');
-  const [info, chans, peers, pending, wb] = await Promise.all([
+  const [info, chans, peers, pending, wb, txsAll] = await Promise.all([
     lndGet('/v1/getinfo').catch(() => ({})),
     lndGet('/v1/channels').catch(() => ({ channels: [] })),
     lndGet('/v1/peers').catch(() => ({ peers: [] })),
     lndGet('/v1/channels/pending').catch(() => ({})),
     lndGet('/v1/balance/blockchain').catch(() => ({})),
+    lndGet('/v1/transactions').catch(() => ({})),
   ]);
+  // 0.73.4 (DP): "opened on" — the funding transaction's timestamp from the wallet's
+  // chain history (needs GetTransactions in the macaroon); otherwise the block the
+  // short channel id points at (an alias scid — zero-conf — carries no block).
+  const txTime = {};
+  for (const t of ((txsAll && txsAll.transactions) || [])) txTime[t.tx_hash] = Number(t.time_stamp) * 1000;
   // 0.71.2: channel balances are summed from ListChannels — ChannelBalance is not in
   // the URI-level macaroon (bake-permissions.json), so 0.71.0/0.71.1 showed 0/0.
   let sumLocal = 0, sumRemote = 0, sumUnsettled = 0;
   for (const c of (chans.channels || [])) { sumLocal += Number(c.local_balance || 0); sumRemote += Number(c.remote_balance || 0); sumUnsettled += Number(c.unsettled_balance || 0); }
+  // 0.73.4/0.73.5: the old console's Principles 1 & 2 (DP, v0.5) — metrics only, no target (DP).
+  // From the LSP's seat: wallet OUTBOUND = the wallets' spendable = remote on wallet
+  // channels; wallet INBOUND = the wallets' receive room = local on wallet channels;
+  // ext OUT = local on non-wallet channels (what the LSP can push to the network);
+  // ext IN = remote on non-wallet channels. P1 cover = ext_out / wallet_out;
+  // P2 cover = ext_in / wallet_in. ALL channels, as the old console did — 0.73.5 counted
+  // active ones only, and wallet channels are inactive whenever the phone is closed,
+  // so the wallet side summed to 0 and both covers read n/a (DP, 2026-09-10).
+  const pr = { wallet_out: 0, wallet_in: 0, ext_out: 0, ext_in: 0, wallet_n: 0, ext_n: 0, wallet_active: 0, ext_active: 0 };
+  for (const c of (chans.channels || [])) {
+    if (c.active) { if (leaseIsWalletPeer(c.remote_pubkey)) pr.wallet_active++; else pr.ext_active++; }
+    if (leaseIsWalletPeer(c.remote_pubkey)) { pr.wallet_out += Number(c.remote_balance || 0); pr.wallet_in += Number(c.local_balance || 0); pr.wallet_n++; }
+    else { pr.ext_out += Number(c.local_balance || 0); pr.ext_in += Number(c.remote_balance || 0); pr.ext_n++; }
+  }
+  pr.p1_cover = pr.wallet_out ? pr.ext_out / pr.wallet_out : null;
+  pr.p2_cover = pr.wallet_in ? pr.ext_in / pr.wallet_in : null;
+  // 0.74.5 (DP): the old console's top boxes — Treasury, On-chain, Can send, Can receive,
+  // Top inbound peer (the routing-fee box is PL's now and was left out on purpose).
+  let localActive = 0, remoteActive = 0, nActive = 0, extInActive = 0, top = null;
+  for (const c of (chans.channels || [])) {
+    if (!c.active) continue;
+    nActive++; localActive += Number(c.local_balance || 0); remoteActive += Number(c.remote_balance || 0);
+    if (!leaseIsWalletPeer(c.remote_pubkey)) { const r = Number(c.remote_balance || 0); extInActive += r; if (!top || r > top.sats) top = { pubkey: c.remote_pubkey, alias: c.peer_alias || '', label: (consoleNotes.wallets[c.remote_pubkey] || {}).label || '', sats: r }; }
+  }
+  const onchainTotal = Number(wb.confirmed_balance || 0) + Number(wb.unconfirmed_balance || 0);
+  const boxes = {
+    treasury: sumLocal + onchainTotal, onchain_total: onchainTotal, anchor_reserve: Number(wb.reserved_balance_anchor_chan || 0),
+    can_send: localActive, can_receive: remoteActive, n_active: nActive,
+    top_inbound: top ? { alias: top.label || top.alias || top.pubkey.slice(0, 12) + '…', sats: top.sats, pct: extInActive ? top.sats / extInActive : 0 } : null,
+  };
   const peerAddr = {};
   for (const p of (peers.peers || [])) peerAddr[p.pub_key] = p.address || '';
+  // 0.74.0: LND's ACTUAL fee policy on wallet channels, read-only (GetChanInfo), so the
+  // advertised numbers on the settings report can be checked against what is charged.
+  const lndPolicy = { checked: 0, matches: 0, mismatches: [], error: '' };
+  try {
+    const own = String(info.identity_pubkey || '').toLowerCase();
+    const walletChans = (chans.channels || []).filter((c) => leaseIsWalletPeer(c.remote_pubkey) && c.chan_id && String(c.chan_id) !== '0').slice(0, 12);
+    for (const c of walletChans) {
+      const ci = await lndGet('/v1/graph/edge/' + c.chan_id).catch(() => null);
+      if (!ci || !ci.node1_policy) continue;
+      const pol = String(ci.node1_pub || '').toLowerCase() === own ? ci.node1_policy : ci.node2_policy;
+      if (!pol) continue;
+      lndPolicy.checked++;
+      const base = Number(pol.fee_base_msat || 0), ppm = Number(pol.fee_rate_milli_msat || 0);
+      if (base === CONFIG.lsps2.base_fee_msat && ppm === CONFIG.lsps2.fee_ppm) lndPolicy.matches++;
+      else lndPolicy.mismatches.push({ chan_id: String(c.chan_id), base_msat: base, ppm });
+    }
+  } catch (e) { lndPolicy.error = String(e && e.message || e).slice(0, 80); }
   const walletPubkeys = new Set(Object.values(lnurlpRegistry).map((r) => r && r.client_pubkey).filter(Boolean));
   const nowMs = Date.now();
   const channels = (chans.channels || []).map((c) => {
@@ -4344,6 +4458,9 @@ async function consoleSnapshot() {
       active: !!c.active, private: !!c.private, pending_htlcs: (c.pending_htlcs || []).length,
       wallet: leaseIsWalletPeer(c.remote_pubkey), lease: leaseTxt, excluded: leaseIsExcluded(c.channel_point), channel_point: c.channel_point,
       last_seen_ms: lease ? (lease.last_seen_ms || 0) : 0, last_source: lease ? (lease.last_source || '') : '',
+      opened_ms: txTime[String(c.channel_point || '').split(':')[0]] || 0,
+      opened_block: (() => { try { const h = Number(BigInt(c.chan_id || '0') >> 40n); return (h > 0 && h < 8000000) ? h : 0; } catch (_) { return 0; } })(),
+      initiator: !!c.initiator,
       note: (consoleNotes.channels[c.channel_point] || {}).text || '', label: (consoleNotes.wallets[c.remote_pubkey] || {}).label || '',
     };
   }).sort((a, b) => {   // 0.73.3 (DP): the LiJ wallet channels together first, then the peer-node/LSP channels; within each group by peer, then by channel — a wallet's channels sit next to each other
@@ -4361,12 +4478,15 @@ async function consoleSnapshot() {
   const heardByPeer = {};
   for (const rec of Object.values((leaseState && leaseState.channels) || {})) if (rec && rec.peer && rec.last_seen_ms) heardByPeer[rec.peer] = Math.max(heardByPeer[rec.peer] || 0, rec.last_seen_ms);
   const wallets = [];
+  const remoteByPeer = {};   // 0.74.3: the wallet's side of its channel(s)
+  for (const c of (chans.channels || [])) remoteByPeer[c.remote_pubkey] = (remoteByPeer[c.remote_pubkey] || 0) + Number(c.remote_balance || 0);
   for (const [name, rec] of Object.entries(lnurlpRegistry)) {
     if (!rec) continue;
     const entries = rec.entries || [];
     let act = 0; for (const e of entries) { if (e && e.accepted_at > act) act = e.accepted_at; if (e && e.settled_at > act) act = e.settled_at; }
-    wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '' });
+    wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '', remote_sats: remoteByPeer[rec.client_pubkey] === undefined ? null : remoteByPeer[rec.client_pubkey] });
   }
+  const walletCount = new Set(wallets.map((w) => w.pubkey).filter(Boolean)).size;   // distinct by pubkey — a wallet with several pay codes counts once
   // 0.71.1: unconfirmed on-chain — the wallet's 0-conf transactions and LND's
   // pending sweeps. Needs GetTransactions / PendingSweeps in the macaroon;
   // without them the pane says so instead of guessing.
@@ -4400,7 +4520,7 @@ async function consoleSnapshot() {
   const pendingOpenLocal = (pending.pending_open_channels || []).reduce((a, x) => a + Number((x.channel || {}).local_balance || 0), 0);
   return {
     node: { alias: info.alias, pubkey: info.identity_pubkey, version: info.version, block_height: info.block_height, synced: !!info.synced_to_chain, synced_to_graph: info.synced_to_graph, num_peers: info.num_peers, num_active: info.num_active_channels, num_inactive: info.num_inactive_channels, num_pending: info.num_pending_channels, uris: info.uris || [] },
-    balances: { onchain_confirmed: Number(wb.confirmed_balance || 0), onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), local: sumLocal, remote: sumRemote, unsettled: sumUnsettled, pending_open_local: pendingOpenLocal, reserved_anchor: Number(wb.reserved_balance_anchor_chan || 0) },
+    balances: { onchain_confirmed: Number(wb.confirmed_balance || 0), onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), local: sumLocal, remote: sumRemote, unsettled: sumUnsettled, pending_open_local: pendingOpenLocal, reserved_anchor: Number(wb.reserved_balance_anchor_chan || 0), principles: pr, boxes },
     // 0.71.2 (DP: "bring in the guardrail multipliers we set for the desktop" — the
     // [JIT] self-protection boot line, live): the scarcity multiplier and its inputs,
     // the per-wallet open ladder, the JIT sizing and the daily floor cap.
@@ -4412,7 +4532,9 @@ async function consoleSnapshot() {
       open_fee_min_sats: Math.round(CONFIG.lsps2.open_fee_min_msat / 1000), fee_ppm: CONFIG.node.fee_ppm, lease_days: CONFIG.lease.days, lease_enabled: !!(CONFIG.lease && CONFIG.lease.enabled), lease_dry_run: !!(CONFIG.lease && CONFIG.lease.dry_run), lease_cycle_min: CONFIG.lease.cycle_minutes,
       lease_list_saved_at: leaseExclude.saved_at || 0, lease_excluded: (chans.channels || []).filter((c) => leaseIsExcluded(c.channel_point)).length, lease_leased: (chans.channels || []).filter((c) => !leaseIsExcluded(c.channel_point) && c.remote_pubkey !== LEASE_WORLD_PEER).length,
     },
-    channels, wallets, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
+    channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
+    settings: settingsReport(), lnd_policy: lndPolicy,
+    registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url },
     backups, loops, watchdog: !!process.env.NOTIFY_SOCKET, uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
   };
@@ -6173,25 +6295,12 @@ const server = http.createServer(async (req, res) => {
     return jsonResponse(res, { ok: true, chan_point: cp, ttl_days: rec.ttl_days, default_ttl_days: CONFIG.lease.days });
   }
 
-  if (path === '/admin/registry/channels' && method === 'GET') {
-    if (isAdminRateLimited(ip)) {
-      return errResponse(res, 'Rate limit exceeded', 429);
-    }
-    try {
-      // v0.18.5: use the store's getAll() interface so this code is backend-
-      // agnostic (works for MemoryChannelStore or SqliteChannelStore).
-      const registry = await registryChannelStore.getAll();
-      return jsonResponse(res, {
-        ok:               true,
-        total_pubkeys:    registryChannelStore.pubkeyCount(),
-        total_channels:   registryChannelStore.size(),
-        pending_nonces:   registryNonceStore.size(),
-        registry,
-      });
-    } catch (e) {
-      console.error(`[Registry Admin] dump failed: ${e.message}`);
-      return errResponse(res, `Registry dump failed: ${e.message}`, 500);
-    }
+  // 0.74.0 (DP): the public /admin/registry/channels route is RETIRED. It answered with the
+  // wallets' channel records to anyone holding the published route token — a
+  // management read on the internet. The same records are on the console's Wallets
+  // pane (loopback + Tailscale, TOTP). No caller ever depended on it (audited 2026-09-10).
+  if (path === '/admin/registry/channels') {
+    return errResponse(res, 'retired: this data is on the operator console (0.74.0)', 410);
   }
 
   return errResponse(res, 'Not found', 404);
