@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.74.5). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with the file hashes in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the file hash to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.74.0). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with the file hashes in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the file hash to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -130,10 +130,6 @@ WHAT YOU NEED BEFORE STARTING
 
 Design documents live in the LiJ repo:
 docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
-
-## Installing on your own node
-
-`docs/adapter-standalone-setup.md` is the recipe from the hosting sign-up to a listed LSP; `ops/relay/` is the optional kit for clearnet reachability through a rented server (Tor-only is enough to operate).
 
 ## The operator console (0.71+)
 
