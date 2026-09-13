@@ -1561,6 +1561,7 @@ async function lnurlpDeliver(name, entry) {
     }
     if (!attempt || attempt.status !== 'SUCCEEDED') {
       const fc = attempt && attempt.failure ? attempt.failure.code : 'unknown';
+      const fsrc = attempt && attempt.failure ? attempt.failure.failure_source_index : undefined;   // 0.76.1: 0 = this node's own link, 1 = the wallet
       if (attempt && attempt.status === 'HARD_TIMEOUT') { entry._inflight_at = Date.now(); console.error(`[LNURLP] ${name}: attempt abandoned at the hard timeout — LND still owns it; probing`); return; }
       if (LNURLP_PERMANENT_CODES.has(fc)) {
         // 0.67.0 (rule 3): a definitive refusal ends the payment — the sender's sats go back now.
@@ -1568,7 +1569,7 @@ async function lnurlpDeliver(name, entry) {
         await lnurlpCancelOuter(name, entry, 'recipient refused: ' + fc);
         return;
       }
-      console.error(`[LNURLP] ${name}: inner leg did not succeed (status=${attempt ? attempt.status : 'none'} code=${fc}) — retry next sweep`);
+      console.error(`[LNURLP] ${name}: inner leg did not succeed (status=${attempt ? attempt.status : 'none'} code=${fc} source=${fsrc === undefined ? '?' : fsrc}) — retry next sweep`);
       return;
     }
     const preB64 = Buffer.isBuffer(attempt.preimage)
@@ -5620,6 +5621,11 @@ const server = http.createServer(async (req, res) => {
               // open) stops the instant it closes. Live = connected AND heard within 25 s.
               const _lv = await walletLiveNow(_owner);   // 0.76.0: one liveness read, shared with the wake gate
               out.owner_live = _lv.live; out.owner_peer = _lv.peer; out.owner_heard_s = _lv.heard_s;
+              // 0.76.1 (S46, DP GO): LND's height rides with the verdict — engine v249 builds an
+              // internal send's HTLC expiry from it when the wallet's own tip is behind (DP's
+              // Android sat six blocks behind and LND refused every internal send: the HTLC's
+              // expiry was under the hold invoice's 144-block floor from LND's height).
+              try { const _gi = await lndGet('/v1/getinfo'); if (_gi && _gi.block_height) out.height = Number(_gi.block_height); } catch (_) {}
               out.hold_cap_s = Math.max(1, Math.round(lnurlpHoldMs(_owner) / 1000));   // 0.75.2: the rail's real window
             }
           } catch (eL) {}
