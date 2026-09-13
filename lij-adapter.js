@@ -920,6 +920,20 @@ function walletRecentlyActive(pubkeyHex) {
   const t = walletLastActiveMs.get(String(pubkeyHex || '').toLowerCase()) || 0;
   return (Date.now() - t) <= ACTIVE_WINDOW_MS;
 }
+// 0.76.0 (S46, DP): ONE read for "is this wallet running right now" — LND's peer list read
+// NOW (not the 4-s cache) AND the wallet's own heartbeat within 25 s: 0.75.1's two signals,
+// lifted out of /v1/outcome so the hold verdict and the wake gate read the same truth.
+async function walletLiveNow(pubkeyHex) {
+  const key = String(pubkeyHex || '').toLowerCase();
+  if (!/^[0-9a-f]{66}$/.test(key)) return { live: false, peer: false, heard_s: null };
+  let peer = false;
+  try {
+    const pl = await lndGet('/v1/peers');
+    peer = (pl.peers || []).some((q) => String(q.pub_key || '').toLowerCase() === key);
+  } catch (eP) { peer = await isPeerConnected(key).catch(() => false); }
+  const heardMs = Date.now() - (walletLastActiveMs.get(key) || 0);
+  return { live: !!(peer && heardMs <= 25000), peer, heard_s: Math.round(heardMs / 1000) };
+}
 
 // Lightning client dedicated to OpenChannelSync (separate proto loader
 // scope from the v0.1 custom-message client). Populated in main().
@@ -1111,6 +1125,31 @@ function clientHoldCapMs(pk) {
   // lengthen anyone's hold. The ceiling caps EXPLICIT wishes only.
   if (!p || typeof p.hold_ms !== 'number') return Math.min(180000, OFFLINE_HOLD_CAP_MS);
   return Math.max(0, Math.min(p.hold_ms, OFFLINE_HOLD_CAP_MS));
+}
+// 0.75.2 (S46, DP): ONE DIAL. The LNURL rail held an accepted payment until LND cancelled
+// it near the hold invoice's CLTV (~a day) while the wake push CLAIMED 70 minutes; the
+// BOLT11 rail honoured the wallet's dial. Both rails now hold for the wallet's stated
+// preference (capped by this LSP's ceiling; "Off" = no hold), trimmed to the blocks the
+// hold invoice actually has (cltv_expiry 144 less the headroom LND needs).
+const LNURLP_HOLD_CLTV_BLOCKS = 144;   // the hold invoice's cltv_expiry (mint body below)
+function lnurlpHoldMs(pubkeyHex) {
+  const dial = clientHoldCapMs(pubkeyHex);
+  const blocksMs = Math.max(0, LNURLP_HOLD_CLTV_BLOCKS - OFFLINE_MIN_HEADROOM_BLOCKS) * 600000;
+  return Math.max(0, Math.min(dial, blocksMs));
+}
+const lnurlpHoldTimers = new Map();   // hashHex -> timeout: cancels an accepted hold at the dial
+function lnurlpArmHoldTimer(name, entry) {
+  const rec = lnurlpRegistry[name]; if (!rec) return;
+  const ms = lnurlpHoldMs(rec.client_pubkey);
+  const t = lnurlpHoldTimers.get(entry.hash); if (t) clearTimeout(t);
+  const fire = async () => {
+    lnurlpHoldTimers.delete(entry.hash);
+    if (entry.status !== 'accepted') return;   // delivered or already gone
+    console.log(`[LNURLP] ${name}: hold window over (${Math.round(ms / 1000)}s) hash=${entry.hash.slice(0,16)} — cancelling, the sender's sats return`);
+    await lnurlpCancelOuter(name, entry, 'hold expired');
+  };
+  if (ms <= 0) { fire().catch(() => {}); return; }   // "Off": nothing is held for this wallet
+  lnurlpHoldTimers.set(entry.hash, setTimeout(() => fire().catch(() => {}), ms));
 }
 function lnurlpPersist() {
   try { require('fs').writeFileSync(LNURLP_PATH, JSON.stringify(lnurlpRegistry)); }
@@ -1546,7 +1585,7 @@ async function lnurlpDeliver(name, entry) {
     lnurlpPersist();
     lnurlpStopWatch(entry.hash);
     console.log(`[LNURLP] ${name}: SETTLED ${innerMsat} msat delivered, fee ${feeMsat} msat kept, hash=${entry.hash.slice(0,16)}…`);
-    plRecord(feeMsat > 0n ? 'open_fee' : 'hold_fee', { msat: Number(feeMsat), wallet: client, name, hash: entry.hash });   // 0.72.0 PL ledger
+    plRecord(feeMsat > 0n ? 'open_fee' : 'hold_fee', { msat: Number(feeMsat), moved_msat: Number(innerMsat), wallet: client, name, hash: entry.hash });   // 0.72.0 PL ledger · 0.76.0: moved_msat = what was delivered
     leaseTouch(client, 'lnurl:delivered');   // 0.73.0
   } finally {
     delete entry._delivering;
@@ -1601,9 +1640,16 @@ function lnurlpWatch(name, entry) {
         lnurlpPersist();
         const rec = lnurlpRegistry[name];
         console.log(`[LNURLP] ${name}: payment ACCEPTED (${entry.amount_msat} msat held) hash=${entry.hash.slice(0,16)}… — waking wallet`);
-        if (rec) sendWakePush(rec.client_pubkey, 4200000).catch(() => {});  /* 0.57.0 (f): LNURLp rail window */
+        if (rec) sendWakePush(rec.client_pubkey, lnurlpHoldMs(rec.client_pubkey)).catch(() => {});  /* 0.75.2: the wallet's dial, one truth */
+        lnurlpArmHoldTimer(name, entry);   /* 0.75.2: the hold ENDS at the dial (it used to run to LND's CLTV cancel) */
         lnurlpDeliver(name, entry).catch((e) => console.error(`[LNURLP] deliver error: ${e.message}`));
       } else if (state === 'ACCEPTED' && entry.status === 'accepted') {
+        if (!lnurlpHoldTimers.has(entry.hash)) {   // 0.75.2: a hold that predates this process gets its clock from accepted_at
+          const rec2 = lnurlpRegistry[name];
+          const left = rec2 ? lnurlpHoldMs(rec2.client_pubkey) - (Date.now() - (entry.accepted_at || Date.now())) : 0;
+          if (left <= 0) { lnurlpCancelOuter(name, entry, 'hold expired').catch(() => {}); }
+          else { lnurlpHoldTimers.set(entry.hash, setTimeout(() => { lnurlpHoldTimers.delete(entry.hash); if (entry.status === 'accepted') lnurlpCancelOuter(name, entry, 'hold expired').catch(() => {}); }, left)); }
+        }
         // v0.28.0 (S30): watcher belt — re-attempt every 4s while accepted;
         // deliverer self-guards (online, in-flight), so this is near-free.
         lnurlpDeliver(name, entry).catch((e) => console.error(`[LNURLP] watcher deliver error: ${e.message}`));
@@ -1645,6 +1691,15 @@ setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
 async function sendWakePush(pubkeyHex, holdMsOverride) {
   if (!PUSH_ENABLED) return;
   const key = (pubkeyHex || '').toLowerCase();
+  // 0.76.0 (S46, DP ruled "B"): NO WAKE FOR A WALLET THAT IS LIVE RIGHT NOW. The push exists
+  // for a wallet that is not running; a running one shows the payment itself, and the OS
+  // banner it was getting ("Payment arriving — A payment is arriving in your open wallet now")
+  // sat on top of Register mode on every sale. Two fresh signals (walletLiveNow); a closed
+  // or asleep phone still gets its wake. Read before the throttle so a skip stamps nothing.
+  try {
+    const lv = await walletLiveNow(key);
+    if (lv.live) { console.log(`[PUSH] wake skipped for ${key.slice(0,16)}… — wallet live (peer + heartbeat ${lv.heard_s}s ago)`); return; }
+  } catch (_) {}
   // v0.43.0 (S31): per-wallet throttle - MPP shards and resume-notify must
   // not machine-gun the device. One wake per wallet per 20s window (was 60s;
   // 60s swallowed a legitimate second notification during rapid testing).
@@ -2084,7 +2139,8 @@ async function handleInterceptedHtlc(req) {
           const fwdTip = (tipInfo && tipInfo.block_height) || 0;
           const fwdAutoFail = parseInt(req.auto_fail_height, 10) || 0;
           const fwdMargin = fwdAutoFail - fwdTip;
-          const fwdHoldCap = clientHoldCapMs(c.remote_pubkey);   // v0.45: per-client dial
+          // 0.75.2: the dial, trimmed to the blocks this HTLC really has (LND fails it at auto_fail_height).
+          const fwdHoldCap = Math.min(clientHoldCapMs(c.remote_pubkey), Math.max(0, fwdMargin - OFFLINE_MIN_HEADROOM_BLOCKS) * 600000);   // v0.45: per-client dial
           const fwdCanHold = OFFLINE_HOLD_ENABLED && fwdHoldCap > 0 && fwdTip > 0 && fwdAutoFail > 0 &&
             fwdMargin >= OFFLINE_MIN_HEADROOM_BLOCKS;
           if (!fwdCanHold) {
@@ -3098,7 +3154,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
 
   trampolineForwardsSucceeded += 1;
   console.log(`[LSPS2] sendToRouteV2 succeeded — preimage received, SETTLING inbound`);
-  plRecord('open_fee', { msat: Number(promise.fee_msat || 0), wallet: promise.client_pubkey, hash: paymentHashHex, scarcity_pct: promise.scarcity_mult_pct || 100 });   // 0.72.0 PL ledger
+  plRecord('open_fee', { msat: Number(promise.fee_msat || 0), moved_msat: Number(forwardAmountMsat), wallet: promise.client_pubkey, hash: paymentHashHex, scarcity_pct: promise.scarcity_mult_pct || 100 });   // 0.72.0 PL ledger · 0.76.0: moved_msat = what was forwarded
   leaseTouch(promise.client_pubkey, 'jit:settled');   // 0.73.0
   // B-16: payment settled — release the hash→promise binding.
   if (promise && promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
@@ -5549,6 +5605,24 @@ const server = http.createServer(async (req, res) => {
             : e.status === 'accepted' ? 'pending'
             : (e.status === 'free' || e.status === 'reserved') ? 'unpaid'
             : 'failed';   // burned: canceled / refunded / expired
+          // 0.75.0 (S46, DP): the sender's hold verdict for a pool hash. An LNURL
+          // invoice is minted by this LSP, so the sender's route ask is internal and
+          // carries no hold signal (route/build never sees it) — the sender waited 30 s
+          // and booked "failed" while the HTLC was held. The engine (v244) asks here
+          // before an internal send: is the hash's owner connected? If not, the send is
+          // a HOLD from the first second, with the owner's own cap. No pubkey leaves.
+          try {
+            const _owner = String(lnurlpRegistry[name].client_pubkey || '').toLowerCase();
+            if (/^[0-9a-f]{66}$/.test(_owner)) {
+              // 0.75.1 (S46, DP's field receipt): two signals, both fresh. LND's peer list
+              // (read now, not the 4-s cache) still counts a wallet whose app closed
+              // seconds ago; the wallet's own heartbeat (every ~15 s while the page is
+              // open) stops the instant it closes. Live = connected AND heard within 25 s.
+              const _lv = await walletLiveNow(_owner);   // 0.76.0: one liveness read, shared with the wake gate
+              out.owner_live = _lv.live; out.owner_peer = _lv.peer; out.owner_heard_s = _lv.heard_s;
+              out.hold_cap_s = Math.max(1, Math.round(lnurlpHoldMs(_owner) / 1000));   // 0.75.2: the rail's real window
+            }
+          } catch (eL) {}
           break;
         }
       }

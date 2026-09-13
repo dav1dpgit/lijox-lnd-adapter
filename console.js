@@ -170,13 +170,29 @@ function renderPL(r){
   var rev=sats(p.routing_fee_msat)+sats(p.open_fee_msat)+sats(p.hold_fee_msat);
   var chain=p.chain_fee_open_sats+p.chain_fee_close_sats+p.chain_fee_sweep_sats+p.chain_fee_other_sats;
   var cost=chain+sats(p.payment_fee_msat);var net=rev-cost;
-  function row(lbl,v,note,cls){return '<tr'+(cls?' class="'+cls+'"':'')+'><td>'+lbl+'</td><td class="n">'+fmt(v)+'</td><td class="n">'+fiat(v,rate)+'</td><td class="dim">'+(note||'')+'</td></tr>'}
-  $('plbody').innerHTML='<div class="tbl"><table><tr><th>'+esc(plPeriod.toUpperCase())+' \\u00b7 '+esc(p.date)+'</th><th class="n">sats</th><th class="n">'+(rate?'USD':'')+'</th><th></th></tr>'
-   +'<tr><td class="h" colspan="4">Revenue</td></tr>'+row('routing fees',sats(p.routing_fee_msat),fmt(p.routing_count)+' forwards')+row('channel-open fees',sats(p.open_fee_msat),fmt(p.open_count)+' opens')+row('hold / LNURL fees',sats(p.hold_fee_msat),fmt(p.hold_count)+' holds')+row('revenue',rev,'','tot')
-   +'<tr><td class="h" colspan="4">Costs</td></tr>'+row('chain fees \\u00b7 opens',p.chain_fee_open_sats)+row('chain fees \\u00b7 closes',p.chain_fee_close_sats)+row('chain fees \\u00b7 sweeps',p.chain_fee_sweep_sats)+row('chain fees \\u00b7 other',p.chain_fee_other_sats,fmt(p.chain_tx_count)+' txs')+row('payment fees',sats(p.payment_fee_msat),fmt(p.payment_count)+' payments, '+fmt(p.delivery_count)+' deliveries')+row('costs',cost,'','tot')
-   +row('<b>net</b>',net,'','tot')+'</table></div>'
+  // 0.76.0 (DP): each line shows the sats that MOVED for it and the rate it earned or cost (fee \\u00f7 moved).
+  // Where only part of a line's fees carry a moved amount (ledger events from before 0.76.0), the rate is
+  // computed over that part and says so; a line with nothing moved shows no rate.
+  function pct(feeSats,movedSats,note){if(!(movedSats>0))return '';var v=feeSats/movedSats*100;return (v<0.0005&&feeSats>0?'<0.001':v.toFixed(v<0.1?3:2))+'%'+(note?' <span class="dim">'+note+'</span>':'')}
+  function row(lbl,v,moved,pc,note,cls){return '<tr'+(cls?' class="'+cls+'"':'')+'><td>'+lbl+'</td><td class="n">'+fmt(v)+'</td><td class="n">'+fiat(v,rate)+'</td><td class="n">'+(moved>0?fmt(moved):'')+'</td><td class="n">'+(pc||'')+'</td><td class="dim">'+(note||'')+'</td></tr>'}
+  var opPart=(p.open_moved_count>0&&p.open_moved_count<p.open_count)?'on '+fmt(p.open_moved_count)+' of '+fmt(p.open_count):'';
+  var hdPart=(p.hold_moved_count>0&&p.hold_moved_count<p.hold_count)?'on '+fmt(p.hold_moved_count)+' of '+fmt(p.hold_count):'';
+  $('plbody').innerHTML='<div class="tbl"><table><tr><th>'+esc(plPeriod.toUpperCase())+' \\u00b7 '+esc(p.date)+'</th><th class="n">sats</th><th class="n">'+(rate?'USD':'')+'</th><th class="n">moved</th><th class="n">rate</th><th></th></tr>'
+   +'<tr><td class="h" colspan="6">Revenue</td></tr>'
+   +row('routing fees',sats(p.routing_fee_msat),sats(p.routing_out_msat),pct(sats(p.routing_fee_msat),sats(p.routing_out_msat)),fmt(p.routing_count)+' forwards')
+   +row('channel-open fees',sats(p.open_fee_msat),sats(p.open_moved_msat),pct(sats(p.open_moved_fee_msat),sats(p.open_moved_msat),opPart),fmt(p.open_count)+' opens')
+   +row('hold / LNURL fees',sats(p.hold_fee_msat),sats(p.hold_moved_msat),pct(sats(p.hold_moved_fee_msat),sats(p.hold_moved_msat),hdPart),fmt(p.hold_count)+' holds')
+   +row('revenue',rev,0,'','','tot')
+   +'<tr><td class="h" colspan="6">Costs</td></tr>'
+   +row('chain fees \\u00b7 opens',p.chain_fee_open_sats,p.chain_moved_open_sats,pct(p.chain_fee_open_sats,p.chain_moved_open_sats))
+   +row('chain fees \\u00b7 closes',p.chain_fee_close_sats,p.chain_moved_close_sats,pct(p.chain_fee_close_sats,p.chain_moved_close_sats))
+   +row('chain fees \\u00b7 sweeps',p.chain_fee_sweep_sats,p.chain_moved_sweep_sats,pct(p.chain_fee_sweep_sats,p.chain_moved_sweep_sats))
+   +row('chain fees \\u00b7 other',p.chain_fee_other_sats,p.chain_moved_other_sats,pct(p.chain_fee_other_sats,p.chain_moved_other_sats),fmt(p.chain_tx_count)+' txs')
+   +row('payment fees',sats(p.payment_fee_msat),sats(p.payment_value_msat),pct(sats(p.payment_fee_msat),sats(p.payment_value_msat)),fmt(p.payment_count)+' payments, '+fmt(p.delivery_count)+' deliveries')
+   +row('costs',cost,0,'','','tot')
+   +row('<b>net</b>',net,0,'','','tot')+'</table></div>'
    +(r.missing.length?'<div class="warn" style="margin-top:6px">partial: '+r.missing.map(esc).join(' \\u00b7 ')+'</div>':'')
-   +'<div class="dim" style="margin-top:6px">first day '+esc(r.first_day)+(rate?' \\u00b7 rate '+fmt(rate)+' USD/BTC':'')+'</div>';
+   +'<div class="dim" style="margin-top:6px">first day '+esc(r.first_day)+(rate?' \\u00b7 rate '+fmt(rate)+' USD/BTC':'')+' \\u00b7 moved = sats forwarded / delivered / paid / funded on that line; rate = fee \\u00f7 moved</div>';
 }
 function loadPL(){
   var d=plDate||$('pldate').value;

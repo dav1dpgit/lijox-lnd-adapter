@@ -17,6 +17,12 @@
 //   - payment fees: LND ListPayments (every payment this node sent; the LNURL
 //     deliveries to wallets we serve carry fee 0 on the direct channel)
 //
+// 0.76.0 (S46, DP): every fee line also carries the sats that MOVED for it, so the console
+// can show the rate the line actually earned or cost (routing fee / amount forwarded,
+// open+hold fee / amount delivered, payment fee / amount paid, chain fee / amount funded
+// or returned). Fee events written before 0.76.0 carry no moved_msat; a rate is computed
+// over the events that do (the count of those rides beside it), never guessed.
+//
 // SNAPSHOTS: DATA_DIR/pl-daily.json holds one finished row per past day; only
 // today is recomputed on each request, so LTD never rescans history. Rows carry
 // per-channel routing attribution (chan_id → fee, count) for the phase-2 screen.
@@ -31,7 +37,10 @@ function nextDay(key) { return dayKey(dayStartMs(key) + 36 * 3600 * 1000); }
 function emptyRow(key) {
   return { date: key, routing_fee_msat: 0, routing_count: 0, routing_by_chan: {}, open_fee_msat: 0, open_count: 0, hold_fee_msat: 0, hold_count: 0,
     chain_fee_open_sats: 0, chain_fee_close_sats: 0, chain_fee_sweep_sats: 0, chain_fee_other_sats: 0, chain_tx_count: 0,
-    payment_fee_msat: 0, payment_count: 0, delivery_count: 0, computed_at: 0, partial: [] };
+    payment_fee_msat: 0, payment_count: 0, delivery_count: 0, computed_at: 0, partial: [],
+    // 0.76.0: the sats that moved for each fee line (msat where the fee is msat)
+    routing_out_msat: 0, open_moved_msat: 0, open_moved_count: 0, open_moved_fee_msat: 0, hold_moved_msat: 0, hold_moved_count: 0, hold_moved_fee_msat: 0,
+    payment_value_msat: 0, chain_moved_open_sats: 0, chain_moved_close_sats: 0, chain_moved_sweep_sats: 0, chain_moved_other_sats: 0 };
 }
 
 function createPL(deps) {
@@ -110,13 +119,14 @@ function createPL(deps) {
       if (t < start || t >= end) continue;
       const fee = Number(ev.fee_msat || 0);
       row.routing_fee_msat += fee; row.routing_count++;
+      row.routing_out_msat += Number(ev.amt_out_msat || 0) || Number(ev.amt_out || 0) * 1000;   // 0.76.0: what was forwarded
       const k = String(ev.chan_id_out || ''); const c = row.routing_by_chan[k] || (row.routing_by_chan[k] = { fee_msat: 0, count: 0, in: String(ev.chan_id_in || '') });
       c.fee_msat += fee; c.count++;
     }
     for (const e of events) {
       if (e.ts < start || e.ts >= end) continue;
-      if (e.kind === 'open_fee') { row.open_fee_msat += Number(e.msat || 0); row.open_count++; }
-      else if (e.kind === 'hold_fee') { row.hold_fee_msat += Number(e.msat || 0); row.hold_count++; }
+      if (e.kind === 'open_fee') { row.open_fee_msat += Number(e.msat || 0); row.open_count++; if (Number(e.moved_msat) > 0) { row.open_moved_msat += Number(e.moved_msat); row.open_moved_count++; row.open_moved_fee_msat += Number(e.msat || 0); } }
+      else if (e.kind === 'hold_fee') { row.hold_fee_msat += Number(e.msat || 0); row.hold_count++; if (Number(e.moved_msat) > 0) { row.hold_moved_msat += Number(e.moved_msat); row.hold_moved_count++; row.hold_moved_fee_msat += Number(e.msat || 0); } }
     }
     for (const p of b.payments) {
       const t = Number(p.creation_time_ns ? p.creation_time_ns / 1e6 : Number(p.creation_date) * 1000);
@@ -125,6 +135,7 @@ function createPL(deps) {
       const dest = (p.htlcs && p.htlcs[0] && p.htlcs[0].route && p.htlcs[0].route.hops && p.htlcs[0].route.hops.slice(-1)[0] || {}).pub_key || '';
       const delivery = dest && deps.isWalletPubkey && deps.isWalletPubkey(dest);
       row.payment_fee_msat += Number(p.fee_msat || 0); row.payment_count++; if (delivery) row.delivery_count++;
+      row.payment_value_msat += Number(p.value_msat || 0) || Number(p.value_sat || 0) * 1000;   // 0.76.0: what was paid
     }
     for (const t of b.txs) {
       const ms = Number(t.time_stamp) * 1000;
@@ -133,10 +144,12 @@ function createPL(deps) {
       if (fee <= 0) continue;                               // only fees WE paid
       row.chain_tx_count++;
       const txid = t.tx_hash, label = String(t.label || '').toLowerCase();
-      if (chanPoints.has(txid) || /openchannel|funding/.test(label)) row.chain_fee_open_sats += fee;
-      else if (b.closes.has(txid) || /closechannel|closing/.test(label)) row.chain_fee_close_sats += fee;
-      else if (/sweep/.test(label)) row.chain_fee_sweep_sats += fee;
-      else row.chain_fee_other_sats += fee;
+      // 0.76.0: the sats the tx moved — LND's amount is our net (fee included on a spend), so |amount| − fee
+      const moved = Math.max(0, Math.abs(Number(t.amount || 0)) - fee);
+      if (chanPoints.has(txid) || /openchannel|funding/.test(label)) { row.chain_fee_open_sats += fee; row.chain_moved_open_sats += moved; }
+      else if (b.closes.has(txid) || /closechannel|closing/.test(label)) { row.chain_fee_close_sats += fee; row.chain_moved_close_sats += moved; }
+      else if (/sweep/.test(label)) { row.chain_fee_sweep_sats += fee; row.chain_moved_sweep_sats += moved; }
+      else { row.chain_fee_other_sats += fee; row.chain_moved_other_sats += moved; }
     }
     row.partial = b.missing.slice();
     row.computed_at = Date.now();
@@ -167,7 +180,7 @@ function createPL(deps) {
     let changed = false;
     for (let k = first; k <= sel; k = nextDay(k)) {
       const finished = k < today;
-      if (!finished || opts.recompute || !daily[k] || (daily[k].partial && daily[k].partial.length && b.missing.length === 0)) {
+      if (!finished || opts.recompute || !daily[k] || !('routing_out_msat' in daily[k]) || (daily[k].partial && daily[k].partial.length && b.missing.length === 0)) {   // 0.76.0: a row snapshotted before the moved fields existed is rebuilt once
         const row = computeRow(k, b, events, chanPoints);
         if (finished) { daily[k] = row; changed = true; }
         else daily[k] = row;
@@ -180,7 +193,8 @@ function createPL(deps) {
       const acc = emptyRow(from); acc.date = from + '…' + to; const byChan = {};
       for (let k = from; k <= to; k = nextDay(k)) {
         const r = daily[k]; if (!r) { if (k === to) break; continue; }
-        for (const f of ['routing_fee_msat', 'routing_count', 'open_fee_msat', 'open_count', 'hold_fee_msat', 'hold_count', 'chain_fee_open_sats', 'chain_fee_close_sats', 'chain_fee_sweep_sats', 'chain_fee_other_sats', 'chain_tx_count', 'payment_fee_msat', 'payment_count', 'delivery_count']) acc[f] += r[f] || 0;
+        for (const f of ['routing_fee_msat', 'routing_count', 'open_fee_msat', 'open_count', 'hold_fee_msat', 'hold_count', 'chain_fee_open_sats', 'chain_fee_close_sats', 'chain_fee_sweep_sats', 'chain_fee_other_sats', 'chain_tx_count', 'payment_fee_msat', 'payment_count', 'delivery_count',
+          'routing_out_msat', 'open_moved_msat', 'open_moved_count', 'open_moved_fee_msat', 'hold_moved_msat', 'hold_moved_count', 'hold_moved_fee_msat', 'payment_value_msat', 'chain_moved_open_sats', 'chain_moved_close_sats', 'chain_moved_sweep_sats', 'chain_moved_other_sats']) acc[f] += r[f] || 0;
         for (const [c, v] of Object.entries(r.routing_by_chan || {})) { const x = byChan[c] || (byChan[c] = { fee_msat: 0, count: 0 }); x.fee_msat += v.fee_msat; x.count += v.count; }
         if (k === to) break;
       }
