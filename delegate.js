@@ -772,4 +772,24 @@ async function handle(req, res, path, method, lndRequest) {
   }
 }
 
-module.exports = { handle, _test: { slipDigest, voidDigest, CFG } };
+// 0.77.0 (S46, DP 2026-09-13): the delegate rail's guardrails for the console — the daily
+// breaker (limit, the rolling-24 h sum it measures, the last spend that moved it) and its
+// siblings (live slips vs MAX_LIVE, the fee limit). Read-only; the same numbers the spend
+// gate uses.
+function report() {
+  const recs = Object.values(storeLoad());
+  const cutoff = Date.now() - 24 * 3600 * 1000;
+  let spent24 = 0, count24 = 0, lastTs = 0, allTime = 0;
+  for (const r of recs) for (const p of (r.payments || [])) {
+    const v = (p.amount_msat || 0) + (p.fee_msat || 0);
+    allTime += v;
+    if (p.ts >= cutoff) { spent24 += v; count24++; }
+    if (p.ts > lastTs) lastTs = p.ts;
+  }
+  return {
+    daily_limit_msat: CFG.DAILY_MSAT(), daily_spent_msat: spent24, daily_count: count24, last_spend_ms: lastTs, all_time_msat: allTime,
+    live: countLive(), max_live: CFG.MAX_LIVE(), fee_limit_msat: CFG.FEE_LIMIT_MSAT(), slips_total: recs.length,
+  };
+}
+
+module.exports = { handle, report, _test: { slipDigest, voidDigest, CFG } };

@@ -4543,7 +4543,23 @@ async function consoleSnapshot() {
     let act = 0; for (const e of entries) { if (e && e.accepted_at > act) act = e.accepted_at; if (e && e.settled_at > act) act = e.settled_at; }
     wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '', remote_sats: remoteByPeer[rec.client_pubkey] === undefined ? null : remoteByPeer[rec.client_pubkey] });
   }
-  const walletCount = new Set(wallets.map((w) => w.pubkey).filter(Boolean)).size;   // distinct by pubkey — a wallet with several pay codes counts once
+  // 0.77.1 (S46, DP 2026-09-14): the count stuck at the pay-code registry. A wallet that has a
+  // channel here (JIT-opened, or registered in the LIJOX channel registry, or remembered by the
+  // lease loop) but no pay code on this box was neither counted nor listed. Now every known
+  // wallet peer gets a row -- pay code or not -- and the count is distinct over all of them.
+  const knownPubkeys = new Set(wallets.map((w) => String(w.pubkey || '').toLowerCase()).filter(Boolean));
+  const walletOnly = new Set();
+  for (const k of leaseWalletPeers) walletOnly.add(k);
+  try { for (const pk of registryChannelStore.byPubkey.keys()) walletOnly.add(String(pk).toLowerCase()); } catch (_) {}
+  for (const c of (chans.channels || [])) if (leaseIsWalletPeer(c.remote_pubkey)) walletOnly.add(String(c.remote_pubkey).toLowerCase());
+  const firstOpen = {};
+  for (const c of channels) { const k = String(c.remote_pubkey || '').toLowerCase(); if (c.opened_ms && (!firstOpen[k] || c.opened_ms < firstOpen[k])) firstOpen[k] = c.opened_ms; }
+  for (const k of walletOnly) {
+    if (!k || knownPubkeys.has(k)) continue;
+    knownPubkeys.add(k);
+    wallets.push({ pubkey: k, name: '', holds: 0, hashes: 0, first_seen_ms: firstOpen[k] || 0, last_heard_ms: heardByPeer[k] || 0, label: (consoleNotes.wallets[k] || {}).label || '', remote_sats: remoteByPeer[k] === undefined ? null : remoteByPeer[k], channel_only: true });
+  }
+  const walletCount = knownPubkeys.size;   // distinct by pubkey -- a wallet with several pay codes counts once; a wallet with only a channel counts too (0.77.1)
   // 0.71.1: unconfirmed on-chain — the wallet's 0-conf transactions and LND's
   // pending sweeps. Needs GetTransactions / PendingSweeps in the macaroon;
   // without them the pane says so instead of guessing.
@@ -4590,6 +4606,7 @@ async function consoleSnapshot() {
       lease_list_saved_at: leaseExclude.saved_at || 0, lease_excluded: (chans.channels || []).filter((c) => leaseIsExcluded(c.channel_point)).length, lease_leased: (chans.channels || []).filter((c) => !leaseIsExcluded(c.channel_point) && c.remote_pubkey !== LEASE_WORLD_PEER).length,
     },
     channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
+    delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url },
@@ -4876,6 +4893,19 @@ async function handleRecoverClose(req, res, ip) {
   } catch (e) {
     return jsonResponse(res, { ok: false, reason: 'lnd_unavailable' }, 503);
   }
+  // 0.77.2 (S46, DP's #20 run): the wallet's FIRST channel height — the lowest real block
+  // encoded in its channel ids (open + closed; zero-conf aliases sit at block 16,000,000
+  // and are skipped). A words-only restore has no birthday; scanning from a year is
+  // hundreds of megabytes of filters. From here it is days.
+  let firstChannelHeight = 0;
+  try {
+    const heights = [];
+    const scidHeight = (id) => { try { const n = BigInt(String(id || '0')); const h = Number(n >> 40n); return (h > 0 && h < 10000000) ? h : 0; } catch (_) { return 0; } };
+    for (const c of open) { const h = scidHeight(c.chan_id); if (h) heights.push(h); }
+    const cl = await lndGet('/v1/channels/closed');
+    for (const c of ((cl && cl.channels) || [])) if (String(c.remote_pubkey || '').toLowerCase() === pk) { const h = scidHeight(c.chan_id); if (h) heights.push(h); }
+    if (heights.length) firstChannelHeight = Math.min(...heights);
+  } catch (_) {}
   try {
     const pr = await lndGet('/v1/channels/pending');
     for (const k of ['pending_open_channels', 'pending_closing_channels', 'pending_force_closing_channels', 'waiting_close_channels']) {
@@ -4887,7 +4917,7 @@ async function handleRecoverClose(req, res, ip) {
   } catch (e) { /* pending list is informational */ }
   if (!open.length) {
     console.log(`[Recover] close-all ${pk.slice(0, 16)}: no open channels (${pending.length} pending)`);
-    return jsonResponse(res, { ok: true, reason: 'no_channels', closed: [], pending });
+    return jsonResponse(res, { ok: true, reason: 'no_channels', closed: [], pending, first_channel_height: firstChannelHeight });   // 0.77.2
   }
   // 4. refuse while a payment is in flight — nothing closes in this case
   const inFlight = open.filter(c => Array.isArray(c.pending_htlcs) && c.pending_htlcs.length > 0)
@@ -4902,15 +4932,18 @@ async function handleRecoverClose(req, res, ip) {
     const parts = String(c.channel_point || '').split(':');
     try {
       const out = await leaseForceClose(parts[0], parts[1]);
-      closed.push({ chan_point: c.channel_point, capacity_sats: Number(c.capacity) || 0, wallet_side_sats: Number(c.remote_balance) || 0, result: out.slice(0, 200) });
+      // 0.77.2: lncli prints {"close_pending":{"txid":..}} first — the closing txid rides with the answer
+      let closingTxid = null;
+      try { const m = String(out).match(/"txid"\s*:\s*"([0-9a-fA-F]{64})"/); if (m) closingTxid = m[1].toLowerCase(); } catch (_) {}
+      closed.push({ chan_point: c.channel_point, capacity_sats: Number(c.capacity) || 0, wallet_side_sats: Number(c.remote_balance) || 0, closing_txid: closingTxid, result: out.slice(0, 200) });
       console.log(`[Recover] close-all ${pk.slice(0, 16)}: force-closed ${c.channel_point}`);
     } catch (e) {
       failed.push({ chan_point: c.channel_point, error: String(e.message || e).slice(0, 200) });
       console.error(`[Recover] close-all ${pk.slice(0, 16)}: close FAILED ${c.channel_point}: ${e.message}`);
     }
   }
-  if (!closed.length) return jsonResponse(res, { ok: false, reason: 'close_failed', failed, pending }, 500);
-  return jsonResponse(res, { ok: true, closed, failed, pending });
+  if (!closed.length) return jsonResponse(res, { ok: false, reason: 'close_failed', failed, pending, first_channel_height: firstChannelHeight }, 500);
+  return jsonResponse(res, { ok: true, closed, failed, pending, first_channel_height: firstChannelHeight });   // 0.77.2
 }
 
 function leaseForceClose(fundingTxid, outputIndex) {
