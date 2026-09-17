@@ -131,6 +131,19 @@ WHAT YOU NEED BEFORE STARTING
 Design documents live in the LiJ repo:
 docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
 
+## The delegate rail and wallets on this LSP (0.78+)
+A delegate spend (a chit) pays the bill from this node's own LND. LND cannot hold its own
+outgoing payment the way the HTLC interceptor holds a forward, so a bill whose route hint names
+this node — a wallet on this LSP — takes the hold rail instead of sendpayment when that wallet is
+not connected with a channel that has room: the chit goes HELD, the wallet gets its wake push,
+and the same delivery every held claim uses (a zero-conf JIT open when there is no channel,
+then one HTLC for the bill's hash and secret) runs when the wallet connects, until the wallet's
+hold window or the bill's expiry runs out. The chit is charged the bill's face; a JIT skim comes
+out of what the merchant receives, as on every rail. A held spend cannot be voided; a spend that
+never lands leaves the chit untouched. Knobs: DELEGATE_HOLD_TICK_MS (3000),
+DELEGATE_HOLD_RETRY_MS (20000), DELEGATE_HOLD_MAX_TRIES (30), DELEGATE_HOLD_MIN_WINDOW_MS (30000),
+DELEGATE_HOLD_EXPIRY_MARGIN_S (60). GET /delegate/slip/<nonce> reports `held` and `last_bill`.
+
 ## The operator console (0.71+)
 
 The adapter serves its own monitor at `/console` on a separate port (`CONSOLE_PORT`, default 7004), bound to loopback and the Tailscale interface only — it has no place on the public tunnel. Login is a six-digit TOTP code and nothing else (`node lij-adapter.js --totp-enroll` prints the secret for `config.env` and the setup key for an authenticator app); a code is accepted once, five wrong codes lock the address for ten minutes, a correct one opens a 12-hour session bound to the caller's address. The page loads nothing from anywhere (CSP `default-src 'none'`, script and style by hash) and the adapter makes no outbound call on its behalf — there is no update check by design.

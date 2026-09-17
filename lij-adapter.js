@@ -361,6 +361,20 @@ const { WebSocketServer } = require('ws');
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
 const lijDelegate = require('./delegate.js'); // v0.23: DELEGATE PAYMENT — S25 side trip; the module's entire adapter footprint is this require + one router branch
+// 0.78.0: the delegate rail's same-LSP hold reaches the adapter's own machinery through these hooks
+// (set at load; every function is read at call time, so the clients they use may be made later).
+lijDelegate.setHooks({
+  ourPubkey: () => String(CONFIG.node.pubkey || '').toLowerCase(),
+  isPeerConnected: (pk) => isPeerConnected(pk),
+  walletChannel: (pk) => lnurlpClientChannel(pk),
+  deliverToWallet: (a) => deliverToWallet(a),
+  sendWakePush: (pk, ms) => sendWakePush(pk, ms),
+  holdCapMs: (pk) => clientHoldCapMs(pk),
+  promiseForScid: (scidHex) => pendingJitBuys.get(scidHex) || null,
+  permanentCodes: () => LNURLP_PERMANENT_CODES,
+  plRecord: (kind, fields) => plRecord(kind, fields),
+  leaseTouch: (pk, src) => leaseTouch(pk, src),
+});
 
 // ── OPEN-INTENT v1 (v0.35.0, S30) — docs/openintent-v1.md ─────────────────
 // Trustless Mode B: the CLIENT funds its own channel; this box only stores
@@ -1477,6 +1491,91 @@ async function lnurlpProbeInflight(name, entry) {
     }
   }
 }
+// 0.78.0 (S47, DP: the same-LSP delegate fix — "one check, then the standard hold and JIT"): ONE
+// delivery for every rail that pays a wallet on this LSP. The LNURLP held claim and the delegate
+// rail's held spend both come here: find the wallet's channel; open one (zero-conf JIT, the fee
+// law) if there is none with room; then ONE HTLC over it for the given hash + payment secret.
+//   feeMsat (optional): a FIXED skim the wallet already agreed to (an LSPS2 promise's fee). When
+//   absent, the fee is channelOpenFeeMsat when a JIT open is needed and 0 otherwise.
+// Returns one of:
+//   { kind: 'attempt', attempt, innerMsat, feeMsat, chan }   — LND ran the HTLC; read attempt.status
+//   { kind: 'refuse', reason }   — permanent for this amount (fee ≥ amount; the reserve floor)
+//   { kind: 'retry', reason }    — try again on the next sweep (open failed, no tip, channel unlisted)
+//   { kind: 'rejected', error }  — SendToRoute rejected before an attempt existed
+async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat: fixedFeeMsat, finalCltvDelta, tag, jitTag }) {
+  const amt = BigInt(amountMsat);
+  const T = tag || 'deliver';
+  let chan = await lnurlpClientChannel(client);
+  let feeMsat = 0n;
+  if (!chan || chan.local_msat < amt + 50000n) {
+    // JIT path: same fee law as every channel-opening receive (or the fee the wallet was promised).
+    feeMsat = (fixedFeeMsat !== undefined && fixedFeeMsat !== null) ? BigInt(fixedFeeMsat) : lnurlpFeeMsat(amt, client);
+    if (amt <= feeMsat) {
+      console.warn(`[${T}]: ${amt} msat <= opening fee ${feeMsat} — refusing`);
+      return { kind: 'refuse', reason: 'amount under opening fee' };
+    }
+    const sizeSats = computeChannelSizeSats(String(amt));
+    if (!(await jitReserveOk(sizeSats, jitTag || T))) {
+      return { kind: 'refuse', reason: 'LSP on-chain reserve floor' };
+    }
+    console.log(`[${T}]: no usable channel — zero-conf JIT open ${sizeSats} sats to ${client.slice(0,16)}…`);
+    try {
+      leaseRememberWalletPeer(client);   // 0.72.3: a JIT open marks the peer as a wallet for the lease
+      await openChannelSync(lightningOpenChannelClient, {
+        node_pubkey_string: client,
+        local_funding_amount: sizeSats,
+        push_sat: 0,
+        sat_per_byte: 1,
+        private: true,
+        min_confs: 0,
+        zero_conf: true,
+        scid_alias: true,
+        remote_chan_reserve_sat: jitReserveForOpen(sizeSats),   // v0.56.0 (O5): floor-or-percent, governor-gated
+        commitment_type: process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS',
+        ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
+      }, CONFIG.lsps2.openchannel_timeout_ms);
+    } catch (e) {
+      console.error(`[${T}]: open failed (${e.message}) — will retry`);
+      return { kind: 'retry', reason: 'open failed: ' + e.message };
+    }
+    for (let i = 0; i < 24 && !chan; i++) {
+      await new Promise((r2) => setTimeout(r2, 500));
+      chan = await lnurlpClientChannel(client);
+    }
+    if (!chan) { console.error(`[${T}]: opened channel never listed — retry`); return { kind: 'retry', reason: 'opened channel never listed' }; }
+    jitRecordOpen(client);   // v0.32.0: per-wallet open counter
+  }
+  const innerMsat = (amt - feeMsat).toString();
+  const info = await lndGet('/v1/getinfo').catch(() => null);
+  const tip = (info && info.block_height) || 0;
+  if (!tip) { console.warn(`[${T}] no live tip — retry`); return { kind: 'retry', reason: 'no live tip' }; }
+  const expiry = tip + Math.max(80, Number(finalCltvDelta) || 0);
+  const route = {
+    total_time_lock: expiry,
+    total_amt_msat: innerMsat,
+    hops: [{
+      chan_id: chan.scid,   // v0.27.0 (S30): alias dialect — see H1
+      expiry: expiry,
+      amt_to_forward_msat: innerMsat,
+      fee_msat: '0',
+      pub_key: client,
+      tlv_payload: true,
+      mpp_record: {
+        payment_addr: Buffer.from(secretHex, 'hex').toString('base64'),
+        total_amt_msat: innerMsat,
+      },
+    }],
+  };
+  console.log(`[${T}]: delivering ${innerMsat} msat (fee ${feeMsat}) via scid=${chan.scid} (chan_id=${chan.chan_id}, active=${chan.active}) hash=${hashHex.slice(0,16)}…`);
+  let attempt;
+  try {
+    attempt = await sendToRouteV2Hard(routerClient, Buffer.from(hashHex, 'hex'), route, CONFIG.lsps2.sendtoroute_timeout_ms, T);  /* F3 v0.37.0 */
+  } catch (e) {
+    return { kind: 'rejected', error: String(e.message || e) };
+  }
+  return { kind: 'attempt', attempt, innerMsat, feeMsat, chan };
+}
+
 async function lnurlpDeliver(name, entry) {
   if (entry.status !== 'accepted' || entry._delivering) return;
   if (entry._inflight_at) { await lnurlpProbeInflight(name, entry); return; }
@@ -1487,78 +1586,16 @@ async function lnurlpDeliver(name, entry) {
   entry._delivering = true;
   try {
     const amt = BigInt(entry.amount_msat);
-    let chan = await lnurlpClientChannel(client);
-    let feeMsat = 0n;
-    if (!chan || chan.local_msat < amt + 50000n) {
-      // JIT path: same fee law as every channel-opening receive.
-      feeMsat = lnurlpFeeMsat(amt, client);
-      if (amt <= feeMsat) {
-        console.warn(`[LNURLP] ${name}: paid ${amt} msat <= fee ${feeMsat} — REFUNDING (cancel outer)`);
-        await lnurlpCancelOuter(name, entry, 'amount under opening fee');
-        return;
-      }
-      const sizeSats = computeChannelSizeSats(String(amt));
-      if (!(await jitReserveOk(sizeSats, 'lnurlp:' + name))) {
-        await lnurlpCancelOuter(name, entry, 'LSP on-chain reserve floor');
-        return;
-      }
-      console.log(`[LNURLP] ${name}: no usable channel — zero-conf JIT open ${sizeSats} sats to ${client.slice(0,16)}…`);
-      try {
-        leaseRememberWalletPeer(client);   // 0.72.3: a JIT open marks the peer as a wallet for the lease
-        await openChannelSync(lightningOpenChannelClient, {
-          node_pubkey_string: client,
-          local_funding_amount: sizeSats,
-          push_sat: 0,
-          sat_per_byte: 1,
-          private: true,
-          min_confs: 0,
-          zero_conf: true,
-          scid_alias: true,
-          remote_chan_reserve_sat: jitReserveForOpen(sizeSats),   // v0.56.0 (O5): floor-or-percent, governor-gated
-          commitment_type: process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS',
-          ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
-        }, CONFIG.lsps2.openchannel_timeout_ms);
-      } catch (e) {
-        console.error(`[LNURLP] ${name}: open failed (${e.message}) — will retry on next sweep`);
-        return;
-      }
-      for (let i = 0; i < 24 && !chan; i++) {
-        await new Promise((r2) => setTimeout(r2, 500));
-        chan = await lnurlpClientChannel(client);
-      }
-      if (!chan) { console.error(`[LNURLP] ${name}: opened channel never listed — retry next sweep`); return; }
-      jitRecordOpen(client);   // v0.32.0: per-wallet open counter
-    }
-    const innerMsat = (amt - feeMsat).toString();
-    const info = await lndGet('/v1/getinfo').catch(() => null);
-    const tip = (info && info.block_height) || 0;
-    if (!tip) { console.warn('[LNURLP] no live tip — retry next sweep'); return; }
-    const expiry = tip + 80;
-    const route = {
-      total_time_lock: expiry,
-      total_amt_msat: innerMsat,
-      hops: [{
-        chan_id: chan.scid,   // v0.27.0 (S30): alias dialect — see H1
-        expiry: expiry,
-        amt_to_forward_msat: innerMsat,
-        fee_msat: '0',
-        pub_key: client,
-        tlv_payload: true,
-        mpp_record: {
-          payment_addr: Buffer.from(entry.secret, 'hex').toString('base64'),
-          total_amt_msat: innerMsat,
-        },
-      }],
-    };
-    console.log(`[LNURLP] ${name}: delivering ${innerMsat} msat (fee ${feeMsat}) via scid=${chan.scid} (chan_id=${chan.chan_id}, active=${chan.active}) hash=${entry.hash.slice(0,16)}…`);
-    let attempt;
-    try {
-      attempt = await sendToRouteV2Hard(routerClient, Buffer.from(entry.hash, 'hex'), route, CONFIG.lsps2.sendtoroute_timeout_ms, 'lnurlp');  /* F3 v0.37.0 */
-    } catch (e) {
-      console.error(`[LNURLP] ${name}: sendToRouteV2 rejected: ${e.message}`);
-      if (/attempted value exceeds|DEADLINE_EXCEEDED|payment in flight|already/i.test(e.message)) entry._inflight_at = Date.now();   // 0.67.0: LND still owns an attempt — probe, don't re-send
+    // 0.78.0: ONE delivery for every rail that pays a wallet on this LSP (see deliverToWallet)
+    const out = await deliverToWallet({ client, hashHex: entry.hash, secretHex: entry.secret, amountMsat: amt, tag: `LNURLP ${name}`, jitTag: 'lnurlp:' + name });
+    if (out.kind === 'refuse') { await lnurlpCancelOuter(name, entry, out.reason); return; }
+    if (out.kind === 'retry') return;   // logged inside; the next sweep retries
+    if (out.kind === 'rejected') {
+      console.error(`[LNURLP] ${name}: sendToRouteV2 rejected: ${out.error}`);
+      if (/attempted value exceeds|DEADLINE_EXCEEDED|payment in flight|already/i.test(out.error)) entry._inflight_at = Date.now();   // 0.67.0: LND still owns an attempt — probe, don't re-send
       return;
     }
+    const attempt = out.attempt, innerMsat = out.innerMsat, feeMsat = out.feeMsat;
     if (!attempt || attempt.status !== 'SUCCEEDED') {
       const fc = attempt && attempt.failure ? attempt.failure.code : 'unknown';
       const fsrc = attempt && attempt.failure ? attempt.failure.failure_source_index : undefined;   // 0.76.1: 0 = this node's own link, 1 = the wallet
@@ -4932,11 +4969,13 @@ async function handleRecoverClose(req, res, ip) {
     const parts = String(c.channel_point || '').split(':');
     try {
       const out = await leaseForceClose(parts[0], parts[1]);
-      // 0.77.2: lncli prints {"close_pending":{"txid":..}} first — the closing txid rides with the answer
+      // 0.77.3 (S47, DP's #20 re-run): lncli (LND cmd/commands closeChannel, 0.20.1) prints ONLY
+      // {"closing_txid": "<hex>"} on stdout (the broadcast note goes to stderr). 0.77.2 matched a
+      // bare "txid" key and never found it — every answer carried closing_txid null. Both keys match now.
       let closingTxid = null;
-      try { const m = String(out).match(/"txid"\s*:\s*"([0-9a-fA-F]{64})"/); if (m) closingTxid = m[1].toLowerCase(); } catch (_) {}
+      try { const m = String(out).match(/"(?:closing_)?txid"\s*:\s*"([0-9a-fA-F]{64})"/); if (m) closingTxid = m[1].toLowerCase(); } catch (_) {}
       closed.push({ chan_point: c.channel_point, capacity_sats: Number(c.capacity) || 0, wallet_side_sats: Number(c.remote_balance) || 0, closing_txid: closingTxid, result: out.slice(0, 200) });
-      console.log(`[Recover] close-all ${pk.slice(0, 16)}: force-closed ${c.channel_point}`);
+      console.log(`[Recover] close-all ${pk.slice(0, 16)}: force-closed ${c.channel_point} · closing txid ${closingTxid || 'NOT FOUND in lncli output: ' + String(out).replace(/\s+/g, ' ').slice(0, 120)}`);
     } catch (e) {
       failed.push({ chan_point: c.channel_point, error: String(e.message || e).slice(0, 200) });
       console.error(`[Recover] close-all ${pk.slice(0, 16)}: close FAILED ${c.channel_point}: ${e.message}`);

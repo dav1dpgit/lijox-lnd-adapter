@@ -52,6 +52,22 @@ const CFG = {
     || require('path').join(process.env.LIJ_DATA_DIR || __dirname, 'delegate-slips.json'),  // v0.47 (D1 seed): data-dir root, no operator path
 };
 
+// 0.78.0 (S47, DP): the SAME-LSP HOLD. A bill whose route hint names this node is a wallet on
+// this LSP. LND cannot hold its own outgoing payment the way the interceptor holds a forward, so
+// such a bill takes the hold rail instead of sendpayment: the chit goes HELD, the wallet is woken,
+// and the adapter's one delivery (deliverToWallet — JIT open when there is no channel) runs when the
+// wallet connects, until the wallet's own hold window (or the invoice's expiry) runs out. The chit
+// is charged the bill's face; a JIT skim comes out of what the merchant receives, as on every rail.
+let H = null;   // hooks from lij-adapter.js (setHooks)
+function setHooks(h) { H = h || null; }
+const HOLD = {
+  TICK_MS: () => Number(process.env.DELEGATE_HOLD_TICK_MS || 3000),
+  RETRY_MS: () => Number(process.env.DELEGATE_HOLD_RETRY_MS || 20000),
+  MAX_TRIES: () => Number(process.env.DELEGATE_HOLD_MAX_TRIES || 30),
+  MIN_WINDOW_MS: () => Number(process.env.DELEGATE_HOLD_MIN_WINDOW_MS || 30000),
+  EXPIRY_MARGIN_S: () => Number(process.env.DELEGATE_HOLD_EXPIRY_MARGIN_S || 60),
+};
+
 // ── store: flat-file nonce ledger, flush on every transition ─────────
 let MEM = null;
 function storeLoad() {
@@ -75,7 +91,7 @@ function recGet(nonce) {
 function recPut(nonce, rec) { storeLoad()[nonce] = rec; storeFlush(); }
 function countLive() {
   return Object.values(storeLoad())
-    .filter(r => r.state === 'LIVE' || r.state === 'IN_FLIGHT').length;
+    .filter(r => r.state === 'LIVE' || r.state === 'IN_FLIGHT' || r.state === 'HELD').length;   // 0.78.0: a held spend is live
 }
 function dailySpentMsat() {
   const cutoff = Date.now() - 24 * 3600 * 1000;
@@ -181,6 +197,21 @@ async function resolveBill(lndRequest, bill, amountMsatFromBody) {
     desc: String((decoded && decoded.description) || '').slice(0, 80),
     payee_pubkey: String((decoded && decoded.destination) || '').toLowerCase(),
   };
+  // 0.78.0: what the same-LSP hold needs from the decode — the first route hint (a wallet on this
+  // LSP hints through this node; the hint's scid is real or a JIT intercept scid), the payment
+  // secret, the final CLTV the invoice asks for, and when the invoice expires.
+  try {
+    const hh = decoded && Array.isArray(decoded.route_hints) && decoded.route_hints[0]
+      && Array.isArray(decoded.route_hints[0].hop_hints) && decoded.route_hints[0].hop_hints[0];
+    meta.hint_node = hh ? String(hh.node_id || '').toLowerCase() : '';
+    meta.hint_scid = hh ? String(hh.chan_id || '') : '';
+    meta.secret_hex = decoded && decoded.payment_addr ? Buffer.from(String(decoded.payment_addr), 'base64').toString('hex') : '';
+    meta.cltv_expiry = Number(decoded && decoded.cltv_expiry) || 0;
+    const ts = Number(decoded && decoded.timestamp) || 0, ex = Number(decoded && decoded.expiry) || 3600;
+    meta.expires_at_s = ts ? ts + ex : 0;
+    const our = H && typeof H.ourPubkey === 'function' ? H.ourPubkey() : '';
+    meta.same_lsp = !!(our && meta.hint_node && meta.hint_node === our);
+  } catch (e) { meta.same_lsp = false; }
   if (invMsat > 0) return Object.assign({ bolt11: low, amount_msat: invMsat, from_invoice: true }, meta);
   const bodyMsat = Number(amountMsatFromBody || 0);
   if (bodyMsat > 0) return Object.assign({ bolt11: low, amount_msat: bodyMsat, from_invoice: false }, meta);
@@ -322,10 +353,21 @@ async function epSpend(req, res, lndRequest) {
         payeeName = String((nd && nd.node && nd.node.alias) || '').slice(0, 80);
       } catch (e) { payeeName = ''; }
     }
+    // 0.78.0: ONE CHECK — a bill for a wallet on this LSP. Pay now only when the wallet is
+    // connected AND has a channel with room; otherwise HOLD (wake, deliver on connect, JIT if needed).
+    if (bill.same_lsp && H) {
+      let online = false, chan = null;
+      try { online = await H.isPeerConnected(bill.payee_pubkey); } catch (e) {}
+      try { chan = await H.walletChannel(bill.payee_pubkey); } catch (e) {}
+      const room = !!(chan && chan.local_msat >= BigInt(bill.amount_msat) + 50000n);
+      if (!(online && room)) {
+        return holdSpend(res, nonce, rec, bill, feeLimit, payeeName, { online, hasChannel: !!chan });
+      }
+    }
     // janitor precondition: the hash must be durable BEFORE the RPC, or a
     // crash mid-payment leaves a wedge nothing can reconcile.
     rec.inflight = { payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat,
-      payee: payeeName, ts: Date.now() };
+      payee: payeeName, ts: Date.now(), bolt11: bill.bolt11 };
     rec.state = 'IN_FLIGHT'; recPut(nonce, rec); // persist BEFORE pay
     let pay;
     try {
@@ -369,6 +411,7 @@ async function epSpend(req, res, lndRequest) {
         status: 'OWED', ts: Date.now() });
       delete rec.inflight;
       rec.state = (rec.count_used >= rec.slip.count) ? 'SPENT' : 'LIVE';
+      rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'SETTLED', preimage: pre, updated_ms: Date.now() };   // 0.78.0
       recPut(nonce, rec);
       console.log('[delegate] SPEND ok nonce=' + nonce.slice(0, 12) + '… amt=' + bill.amount_msat + ' fee=' + feeMsat + ' → ' + rec.state);
       return j(res, 200, { ok: true, preimage: pre, spent_msat: rec.spent_msat, state: rec.state });
@@ -380,7 +423,9 @@ async function epSpend(req, res, lndRequest) {
       : (pay && pay.payment_error) ? String(pay.payment_error) : null;
     if (verdict) {
       // DEFINITIVE verdict from LND's own JSON: terminal. Revert.
-      rec.state = 'LIVE'; delete rec.inflight; recPut(nonce, rec); // close-on-preimage
+      rec.state = 'LIVE'; delete rec.inflight;
+      rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'FAILED', error: verdict.slice(0, 160), updated_ms: Date.now() };   // 0.78.0
+      recPut(nonce, rec); // close-on-preimage
       console.log('[delegate] SPEND FAILED nonce=' + nonce.slice(0, 12) + '…: ' + verdict);
       return j(res, 502, { ok: false, code: 'PAY_FAILED', error: verdict.slice(0, 160) });
     }
@@ -411,6 +456,7 @@ async function epVoid(req, res, lndRequest) {
     }
     if (rec.state === 'LIVE' || rec.state === 'EXPIRED') { rec.state = 'VOID'; recPut(nonce, rec); }
     else if (rec.state === 'IN_FLIGHT') return j(res, 409, { ok: false, code: 'IN_FLIGHT' });
+    else if (rec.state === 'HELD') return j(res, 409, { ok: false, code: 'HELD', held_until_ms: rec.hold ? rec.hold.held_until_ms : undefined });   // 0.78.0: a delivery is on its way — wait for it or its deadline
     console.log('[delegate] VOID nonce=' + nonce.slice(0, 12) + '… → ' + rec.state);
     return j(res, 200, { ok: true, state: rec.state }); // idempotent for VOID/SPENT
   });
@@ -440,7 +486,150 @@ async function epSlip(res, nonce, lndRequest) {
     not_after: rec.slip.not_after, state: rec.state,
     funding_bolt11: (rec.state === 'AWAITING_FUNDING' && rec.funding) ? rec.funding.bolt11 : undefined,
     refund_owed_msat: refundOwedMsat(rec),
+    // 0.78.0: the same-LSP hold, for the runner's page and the issuer's wallet
+    held: (rec.state === 'HELD' && rec.hold) ? { amount_msat: rec.hold.amount_msat, held_since_ms: rec.hold.held_since_ms, held_until_ms: rec.hold.held_until_ms, tries: rec.hold.tries || 0, payee: rec.hold.payee || '' } : undefined,
+    last_bill: rec.last_bill || undefined,
   });
+}
+
+// ── 0.78.0: the same-LSP hold rail ───────────────────────────────────
+function holdSpend(res, nonce, rec, bill, feeLimit, payeeName, why) {
+  const now = Date.now();
+  let windowMs = 0;
+  try { windowMs = Number(H.holdCapMs(bill.payee_pubkey)) || 0; } catch (e) { windowMs = 0; }
+  if (bill.expires_at_s) windowMs = Math.min(windowMs, bill.expires_at_s * 1000 - now - HOLD.EXPIRY_MARGIN_S() * 1000);
+  if (windowMs < HOLD.MIN_WINDOW_MS()) {
+    const err = bill.expires_at_s && (bill.expires_at_s * 1000 - now) < HOLD.MIN_WINDOW_MS() + HOLD.EXPIRY_MARGIN_S() * 1000
+      ? 'BILL_EXPIRING' : 'NO_HOLD_WINDOW';
+    rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'FAILED', error: err, updated_ms: now };
+    recPut(nonce, rec);
+    console.log('[delegate] HOLD refused nonce=' + nonce.slice(0, 12) + '…: ' + err + ' (window ' + Math.round(windowMs / 1000) + 's)');
+    return j(res, 502, { ok: false, code: 'PAY_FAILED', error: err === 'BILL_EXPIRING' ? 'the bill expires too soon to wait for the shop\u2019s wallet \u2014 ask for a fresh one' : 'the shop\u2019s wallet allows no waiting window' });
+  }
+  if (!bill.secret_hex || !bill.payment_hash) {
+    rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'FAILED', error: 'NO_SECRET', updated_ms: now };
+    recPut(nonce, rec);
+    return j(res, 502, { ok: false, code: 'PAY_FAILED', error: 'the bill carries no payment secret' });
+  }
+  rec.hold = {
+    bolt11: bill.bolt11, payment_hash: bill.payment_hash, secret_hex: bill.secret_hex,
+    payee_pubkey: bill.payee_pubkey, payee: payeeName, amount_msat: bill.amount_msat,
+    hint_scid: bill.hint_scid || '', cltv_expiry: bill.cltv_expiry || 0, expires_at_s: bill.expires_at_s || 0,
+    held_since_ms: now, held_until_ms: now + windowMs, tries: 0, next_try_ms: 0, last_error: null,
+  };
+  rec.state = 'HELD';
+  rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash, amount_msat: bill.amount_msat, state: 'HELD', held_until_ms: rec.hold.held_until_ms, updated_ms: now };
+  recPut(nonce, rec); // persist BEFORE the wake
+  console.log('[delegate] HELD nonce=' + nonce.slice(0, 12) + '… amt=' + bill.amount_msat + ' → wallet ' + bill.payee_pubkey.slice(0, 16) + '… (' + (why.online ? 'online' : 'offline') + ', ' + (why.hasChannel ? 'channel without room' : 'no channel') + ') window ' + Math.round(windowMs / 1000) + 's');
+  try { Promise.resolve(H.sendWakePush(bill.payee_pubkey, windowMs)).catch(() => {}); } catch (e) {}
+  holdLoopArm();
+  return j(res, 202, { ok: false, code: 'HELD', held_until_ms: rec.hold.held_until_ms, amount_msat: bill.amount_msat,
+    error: 'the shop\u2019s wallet is being woken \u2014 the bill is paid when it connects, within ' + Math.max(1, Math.round(windowMs / 60000)) + ' min' });
+}
+
+function holdSettle(nonce, rec, preimage, feeKeptMsat, innerMsat) {
+  const h = rec.hold;
+  const amt = Number(h.amount_msat);
+  rec.spent_msat += Math.ceil(amt / 1000) * 1000;   // the chit pays the bill's face; the JIT skim is the merchant's
+  rec.count_used += 1;
+  rec.payments.push({ ts: Date.now(), amount_msat: amt, fee_msat: 0, preimage, payee: h.payee || '', payment_hash: h.payment_hash, held: true });
+  rec.claims = rec.claims || [];
+  rec.claims.push({ claim_id: claimId(), amount_msat: amt, payee: h.payee || '', spend_preimage: preimage, bolt11: null, invoice_hash: null, status: 'OWED', ts: Date.now() });
+  rec.state = (rec.count_used >= rec.slip.count) ? 'SPENT' : 'LIVE';
+  rec.last_bill = { bolt11: h.bolt11, payment_hash: h.payment_hash, amount_msat: amt, state: 'SETTLED', preimage, updated_ms: Date.now() };
+  delete rec.hold;
+  recPut(nonce, rec);
+  console.log('[delegate] HELD delivered nonce=' + nonce.slice(0, 12) + '… amt=' + amt + ' (merchant got ' + innerMsat + ', open fee ' + feeKeptMsat + ') → ' + rec.state);
+  try { if (H && H.plRecord) H.plRecord(Number(feeKeptMsat) > 0 ? 'open_fee' : 'hold_fee', { msat: Number(feeKeptMsat), moved_msat: Number(innerMsat), wallet: h.payee_pubkey, hash: h.payment_hash }); } catch (e) {}
+  try { if (H && H.leaseTouch) H.leaseTouch(h.payee_pubkey, 'delegate:delivered'); } catch (e) {}
+}
+
+function holdFail(nonce, rec, error) {
+  const h = rec.hold || {};
+  rec.state = 'LIVE';   // nothing was spent; the chit is untouched
+  rec.last_bill = { bolt11: h.bolt11 || '', payment_hash: h.payment_hash || '', amount_msat: h.amount_msat || 0, state: 'FAILED', error: String(error).slice(0, 160), updated_ms: Date.now() };
+  delete rec.hold;
+  recPut(nonce, rec);
+  console.log('[delegate] HELD failed nonce=' + nonce.slice(0, 12) + '…: ' + error + ' → LIVE');
+}
+
+async function holdTick(nowOverrideMs) {   // nowOverrideMs: tests only
+  if (!H) return;
+  const store = storeLoad();
+  for (const nonce of Object.keys(store)) {
+    const r0 = store[nonce];
+    if (!r0 || r0.state !== 'HELD' || !r0.hold) continue;
+    await withNonceLock(nonce, async () => {
+      const rec = recGet(nonce);
+      if (!rec || rec.state !== 'HELD' || !rec.hold) return;
+      const h = rec.hold, now = Number(nowOverrideMs) || Date.now();
+      if (now >= h.held_until_ms) { holdFail(nonce, rec, 'the shop\u2019s wallet did not come online within ' + Math.max(1, Math.round((h.held_until_ms - h.held_since_ms) / 60000)) + ' min'); return; }
+      if (h.expires_at_s && now > h.expires_at_s * 1000 - 10000) { holdFail(nonce, rec, 'the bill expired before the shop\u2019s wallet came online'); return; }
+      if (now < (h.next_try_ms || 0)) return;
+      let online = false;
+      try { online = await H.isPeerConnected(h.payee_pubkey); } catch (e) { online = false; }
+      if (!online) return;
+      // A JIT hint: the fee the wallet was promised when it minted the bill. No promise and no
+      // channel = the promise lapsed; the wallet would refuse the skim — a fresh bill is needed.
+      let fixedFee;
+      try {
+        const pr = h.hint_scid ? H.promiseForScid(scidDecToHex(h.hint_scid)) : null;
+        if (pr && pr.fee_msat !== undefined) fixedFee = String(pr.fee_msat);
+      } catch (e) {}
+      let chan = null;
+      try { chan = await H.walletChannel(h.payee_pubkey); } catch (e) {}
+      if (!chan && fixedFee === undefined) { holdFail(nonce, rec, 'the shop\u2019s payment code has lapsed \u2014 ask for a fresh one'); return; }
+      h.tries = (h.tries || 0) + 1; h.next_try_ms = now + HOLD.RETRY_MS(); recPut(nonce, rec);
+      let out;
+      try {
+        out = await H.deliverToWallet({ client: h.payee_pubkey, hashHex: h.payment_hash, secretHex: h.secret_hex, amountMsat: String(h.amount_msat),
+          feeMsat: fixedFee, finalCltvDelta: Math.max(80, (Number(h.cltv_expiry) || 0) + 3), tag: 'delegate ' + nonce.slice(0, 8), jitTag: 'delegate:' + nonce.slice(0, 8) });
+      } catch (e) { out = { kind: 'retry', reason: 'deliver threw: ' + (e && e.message || e) }; }
+      const rec2 = recGet(nonce); if (!rec2 || rec2.state !== 'HELD' || !rec2.hold) return;   // changed under us
+      if (out.kind === 'refuse') { holdFail(nonce, rec2, out.reason); return; }
+      if (out.kind === 'retry') { rec2.hold.last_error = out.reason; recPut(nonce, rec2); if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.reason); return; }
+      if (out.kind === 'rejected') {
+        rec2.hold.last_error = out.error; recPut(nonce, rec2);
+        if (/attempted value exceeds|DEADLINE_EXCEEDED|payment in flight|already/i.test(out.error)) { holdToInflight(nonce, rec2, 'LND owns an attempt: ' + out.error); return; }
+        if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.error);
+        return;
+      }
+      const a = out.attempt;
+      if (!a || a.status !== 'SUCCEEDED') {
+        if (a && a.status === 'HARD_TIMEOUT') { holdToInflight(nonce, rec2, 'hard timeout — LND still owns the attempt'); return; }
+        const fc = a && a.failure ? String(a.failure.code || 'unknown') : 'unknown';
+        try { if (H.permanentCodes && H.permanentCodes().has(fc)) { holdFail(nonce, rec2, 'the shop\u2019s wallet refused the payment (' + fc + ')'); return; } } catch (e) {}
+        rec2.hold.last_error = fc; recPut(nonce, rec2);
+        console.log('[delegate] HELD attempt ' + rec2.hold.tries + ' did not land (' + fc + ') nonce=' + nonce.slice(0, 12) + '… — retrying while the window lasts');
+        if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + fc);
+        return;
+      }
+      const pre = Buffer.isBuffer(a.preimage) ? a.preimage.toString('hex')
+        : (/^[0-9a-f]{64}$/i.test(String(a.preimage)) ? String(a.preimage).toLowerCase() : Buffer.from(String(a.preimage), 'base64').toString('hex'));
+      holdSettle(nonce, rec2, pre, out.feeMsat, out.innerMsat);
+    });
+  }
+}
+// A held delivery LND now owns becomes an ordinary IN_FLIGHT wedge: the janitor's ListPayments
+// resolver settles or reverts it with the same bookkeeping as any spend.
+function holdToInflight(nonce, rec, why) {
+  const h = rec.hold;
+  rec.inflight = { payment_hash: h.payment_hash, amount_msat: Number(h.amount_msat), payee: h.payee || '', ts: Date.now(), bolt11: h.bolt11 };
+  rec.state = 'IN_FLIGHT';
+  rec.last_bill = { bolt11: h.bolt11, payment_hash: h.payment_hash, amount_msat: Number(h.amount_msat), state: 'IN_FLIGHT', updated_ms: Date.now() };
+  delete rec.hold;
+  recPut(nonce, rec);
+  console.log('[delegate] HELD → IN_FLIGHT nonce=' + nonce.slice(0, 12) + '…: ' + why);
+}
+function scidDecToHex(dec) {
+  try { const n = BigInt(String(dec)); return n.toString(16).padStart(16, '0'); } catch (e) { return String(dec); }
+}
+let _holdTimer = null;
+function holdLoopArm() {
+  if (_holdTimer) return;
+  _holdTimer = setInterval(() => { holdTick().catch((e) => console.log('[delegate] HOLD tick error:', (e && e.message) || e)); }, HOLD.TICK_MS());
+  setTimeout(() => { holdTick().catch(() => {}); }, 1000);
+  console.log('[delegate] hold rail armed (' + HOLD.TICK_MS() + ' ms tick)');
 }
 
 // ── v0.2.0 PREPAY: funding, expiry, and the refund rail ──────────────
@@ -648,11 +837,14 @@ async function janitorSweep(lndRequest) {
             rec.claims.push({ claim_id: claimId(), amount_msat: amt + feeMsat, payee: (f && f.payee) || '',
               spend_preimage: pre, bolt11: null, invoice_hash: null, status: 'OWED', ts: Date.now() });
             rec.state = (rec.count_used >= rec.slip.count) ? 'SPENT' : 'LIVE';
+            rec.last_bill = { bolt11: (f && f.bolt11) || (rec.last_bill && rec.last_bill.payment_hash === h ? rec.last_bill.bolt11 : ''), payment_hash: h, amount_msat: amt, state: 'SETTLED', preimage: pre, updated_ms: Date.now() };   // 0.78.0
             delete rec.inflight;
             recPut(n, rec);
             console.log('[delegate] JANITOR reconciled SUCCEEDED nonce=' + n.slice(0, 12) + '… → ' + rec.state);
           } else if (p && p.status === 'FAILED') {
-            rec.state = 'LIVE'; delete rec.inflight; recPut(n, rec);
+            rec.state = 'LIVE';
+            rec.last_bill = { bolt11: (f && f.bolt11) || (rec.last_bill && rec.last_bill.payment_hash === h ? rec.last_bill.bolt11 : ''), payment_hash: h, amount_msat: Number((f && f.amount_msat) || 0), state: 'FAILED', error: String(p.failure_reason || 'FAILED'), updated_ms: Date.now() };   // 0.78.0
+            delete rec.inflight; recPut(n, rec);
             console.log('[delegate] JANITOR reconciled FAILED nonce=' + n.slice(0, 12) + '… → LIVE');
           } else if (!p) {
             // LND has no record: the pay RPC never landed (crash before the
@@ -758,6 +950,7 @@ async function handle(req, res, path, method, lndRequest) {
     // (DELEGATE_ENABLED=0) instead of failing later on a missing permission.
     if (!CFG.ENABLED()) return j(res, 404, { ok: false, code: 'DELEGATE_NOT_OFFERED', error: 'This LSP does not offer delegate payments' });
     janitorArm(lndRequest); // S26: self-arming on the first request after a restart
+    holdLoopArm();          // 0.78.0: held deliveries resume after a restart on the first request
     if (path === '/delegate/claims' && method === 'GET') return await epClaims(req, res, lndRequest);
     if (path === '/delegate/register' && method === 'POST') return await epRegister(req, res, lndRequest);
     if (path === '/delegate/spend' && method === 'POST') return await epSpend(req, res, lndRequest);
@@ -789,7 +982,8 @@ function report() {
   return {
     daily_limit_msat: CFG.DAILY_MSAT(), daily_spent_msat: spent24, daily_count: count24, last_spend_ms: lastTs, all_time_msat: allTime,
     live: countLive(), max_live: CFG.MAX_LIVE(), fee_limit_msat: CFG.FEE_LIMIT_MSAT(), slips_total: recs.length,
+    held: recs.filter((r) => r.state === 'HELD').length,   // 0.78.0: same-LSP spends waiting for the merchant's wallet
   };
 }
 
-module.exports = { handle, report, _test: { slipDigest, voidDigest, CFG } };
+module.exports = { handle, report, setHooks, holdLoopArm, _test: { slipDigest, voidDigest, CFG, resolveBill, holdTick } };
