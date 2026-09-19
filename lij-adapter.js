@@ -4591,6 +4591,21 @@ async function consoleSnapshot() {
   for (const c of (chans.channels || [])) if (leaseIsWalletPeer(c.remote_pubkey)) walletOnly.add(String(c.remote_pubkey).toLowerCase());
   const firstOpen = {};
   for (const c of channels) { const k = String(c.remote_pubkey || '').toLowerCase(); if (c.opened_ms && (!firstOpen[k] || c.opened_ms < firstOpen[k])) firstOpen[k] = c.opened_ms; }
+  // 0.78.1 (DP, console screenshot): a wallet with two pay codes listed twice, each copy
+  // repeating its recovery sub-row — one row per wallet now; the names share the cell.
+  {
+    const byPk = new Map();
+    for (const w of wallets) {
+      const k = String(w.pubkey || '').toLowerCase();
+      const g = byPk.get(k);
+      if (!g) { byPk.set(k, Object.assign({}, w, { pubkey: k })); continue; }
+      g.name = [g.name, w.name].filter(Boolean).join(' \u00b7 ');
+      g.holds += w.holds; g.hashes += w.hashes;
+      g.first_seen_ms = Math.min(g.first_seen_ms || Infinity, w.first_seen_ms || Infinity); if (!isFinite(g.first_seen_ms)) g.first_seen_ms = 0;
+      g.last_heard_ms = Math.max(g.last_heard_ms || 0, w.last_heard_ms || 0);
+    }
+    wallets.length = 0; for (const g of byPk.values()) wallets.push(g);
+  }
   for (const k of walletOnly) {
     if (!k || knownPubkeys.has(k)) continue;
     knownPubkeys.add(k);
@@ -4603,7 +4618,17 @@ async function consoleSnapshot() {
   const unconfirmed = {};
   try {
     const tx = await lndGet('/v1/transactions');
-    if (tx && tx.transactions) unconfirmed.txs = tx.transactions.filter((t) => Number(t.num_confirmations) === 0).map((t) => ({ txid: t.tx_hash, amount: Number(t.amount), fee: Number(t.total_fees), label: t.label || '', time_ms: Number(t.time_stamp) * 1000 }));
+    if (tx && tx.transactions) {
+      const zero = tx.transactions.filter((t) => Number(t.num_confirmations) === 0);
+      // 0.78.1 (DP): LND's wallet keeps every transaction it PUBLISHES — a wallet's own tx
+      // broadcast through this node (lij-broadcast:*), a force close whose LSP share the sweeper
+      // owns — and never marks the ones with none of its outputs mined. They sit at 0 conf in its
+      // list for good though they confirmed long ago. Only transactions that move this node's
+      // funds are listed; the rest are counted.
+      const mine = zero.filter((t) => Number(t.amount) !== 0 || Number(t.total_fees) > 0);
+      unconfirmed.txs = mine.map((t) => ({ txid: t.tx_hash, amount: Number(t.amount), fee: Number(t.total_fees), label: t.label || '', time_ms: Number(t.time_stamp) * 1000 }));
+      unconfirmed.published_for_others = zero.length - mine.length;
+    }
     else unconfirmed.error = 'GetTransactions: ' + JSON.stringify(tx).slice(0, 120);
   } catch (e) { unconfirmed.error = 'GetTransactions: ' + e.message; }
   try {
