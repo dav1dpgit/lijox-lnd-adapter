@@ -360,6 +360,7 @@ const { WebSocketServer } = require('ws');
 // v0.6: gRPC client for streaming + custom message send
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
+const { createKitHolder } = require('./kits.js'); // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
 const lijDelegate = require('./delegate.js'); // v0.23: DELEGATE PAYMENT — S25 side trip; the module's entire adapter footprint is this require + one router branch
 // 0.78.0: the delegate rail's same-LSP hold reaches the adapter's own machinery through these hooks
 // (set at load; every function is read at call time, so the clients they use may be made later).
@@ -517,6 +518,8 @@ function oiRateLimited(ip) {
 // Possession-gated (uploader pubkey must be a live peer), 256KB cap,
 // 20/hour per IP. Written to tapes/ beside the adapter + a journal digest.
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
+// 0.79.0: the kit holder's store, DATA_DIR/kits/<npub>.json (ciphertext the box cannot read)
+const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 // 0.72.0 (S45 #10): the PL engine — fee ledger + daily snapshots (pl.js). Created
 // at boot next to the console; the fee-realization points below write through
 // plRecord, which is a no-op until then.
@@ -5168,6 +5171,7 @@ const server = http.createServer(async (req, res) => {
 
   // v0.9: CORS headers on every response, plus OPTIONS preflight short-circuit
   setCorsHeaders(req, res);
+  if (path === '/v1/kit') kitHolder.openCors(res);   // 0.79.1: the kit holder answers every wallet origin (signature-gated, no credentials)
   if (method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -5240,6 +5244,7 @@ const server = http.createServer(async (req, res) => {
         interceptor:     HEALTH_DETAIL ? interceptor_status
                                        : { enabled: !!htlcInterceptor,
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
+        kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
       };
       if (HEALTH_DETAIL) base.lnd_version = info.version;
       return jsonResponse(res, base);
@@ -5276,6 +5281,13 @@ const server = http.createServer(async (req, res) => {
       console.error('[PUSH] subscribe handler threw:', e);
       return errResponse(res, 'Internal error', 500);
     }
+  }
+
+  // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the KIT HOLDER is PUBLIC — a wallet PUTs its
+  // sealed escape kit under its own signature (verified with Node's crypto; newest seq wins);
+  // anyone may GET a kit by npub (ciphertext; the words alone open it). See kits.js.
+  if (path === '/v1/kit') {
+    if (await kitHolder.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
   }
 
   // v0.21: LEASE POLICY is a PUBLIC read (static JSON, zero I/O) — the

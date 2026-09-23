@@ -144,6 +144,19 @@ never lands leaves the chit untouched. Knobs: DELEGATE_HOLD_TICK_MS (3000),
 DELEGATE_HOLD_RETRY_MS (20000), DELEGATE_HOLD_MAX_TRIES (30), DELEGATE_HOLD_MIN_WINDOW_MS (30000),
 DELEGATE_HOLD_EXPIRY_MARGIN_S (60). GET /delegate/slip/<nonce> reports `held` and `last_bill`.
 
+## The kit holder — LIJOX Black start (0.79+)
+Every LIJOX adapter keeps, for any wallet that asks, one sealed ESCAPE KIT per wallet identity:
+the wallet's own fully signed latest force-close and its pre-signed sweep, encrypted under a key
+only the wallet's 12 words can make. The box cannot read it. A wallet whose device, backup and
+LSP are all gone recovers with the words alone by asking every listed adapter for its kit.
+`POST /v1/kit` takes `{ pubkey, seq, kit, sig }` — the signature (ECDSA over secp256k1, verified
+with Node's own crypto, no third-party code) binds the kit and its sequence number to the
+wallet's NIP-06 key; the newest sequence wins, an older one is refused (409). `GET /v1/kit?npub=`
+returns the record (ciphertext) or 404. Records live in `DATA_DIR/kits/<npub>.json`, at most
+KIT_MAX_BYTES (65,536) each; the store evicts the oldest untouched record beyond 20,000, never one
+touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the LiJ repo's
+docs/black-start-standard.md.
+
 ## The operator console (0.71+)
 
 The adapter serves its own monitor at `/console` on a separate port (`CONSOLE_PORT`, default 7004), bound to loopback and the Tailscale interface only — it has no place on the public tunnel. Login is a six-digit TOTP code and nothing else (`node lij-adapter.js --totp-enroll` prints the secret for `config.env` and the setup key for an authenticator app); a code is accepted once, five wrong codes lock the address for ten minutes, a correct one opens a 12-hour session bound to the caller's address. The page loads nothing from anywhere (CSP `default-src 'none'`, script and style by hash) and the adapter makes no outbound call on its behalf — there is no update check by design.
