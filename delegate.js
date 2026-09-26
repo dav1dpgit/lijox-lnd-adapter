@@ -359,7 +359,7 @@ async function epSpend(req, res, lndRequest) {
       let online = false, chan = null;
       try { online = await H.isPeerConnected(bill.payee_pubkey); } catch (e) {}
       try { chan = await H.walletChannel(bill.payee_pubkey); } catch (e) {}
-      const room = !!(chan && chan.local_msat >= BigInt(bill.amount_msat) + 50000n);
+      const room = !!(chan && (chan.room_msat !== undefined ? chan.room_msat : chan.local_msat - 50000n) >= BigInt(bill.amount_msat));   // 0.84.0: the room LND will send
       if (!(online && room)) {
         return holdSpend(res, nonce, rec, bill, feeLimit, payeeName, { online, hasChannel: !!chan });
       }

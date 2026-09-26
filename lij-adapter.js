@@ -360,7 +360,8 @@ const { WebSocketServer } = require('ws');
 // v0.6: gRPC client for streaming + custom message send
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
-const { createKitHolder } = require('./kits.js'); // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
+const { createKitHolder } = require('./kits.js');
+const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
 const lijDelegate = require('./delegate.js'); // v0.23: DELEGATE PAYMENT — S25 side trip; the module's entire adapter footprint is this require + one router branch
 // 0.78.0: the delegate rail's same-LSP hold reaches the adapter's own machinery through these hooks
 // (set at load; every function is read at call time, so the clients they use may be made later).
@@ -520,6 +521,18 @@ function oiRateLimited(ip) {
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 // 0.79.0: the kit holder's store, DATA_DIR/kits/<npub>.json (ciphertext the box cannot read)
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+// 0.82.0: the Push Key rail. Every dependency is handed over lazily — lndGet/lndPost are consts defined
+// further down the file, and the function declarations are hoisted anyway.
+const pushRail = createPushRail({
+  dataDir: DATA_DIR,
+  lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
+  deliverToWallet: (args) => deliverToWallet(args), isPeerConnected: (pk) => isPeerConnected(pk),
+  sendWakePush: (pk) => sendWakePush(pk), authOk: (req) => authOk(req),
+  buildPublicHints: (amt) => lnurlpBuildPublicHints(amt),
+  plRecord: (k, f) => plRecord(k, f), leaseTouch: (pk, s) => leaseTouch(pk, s), touchWalletActive: (pk) => touchWalletActive(pk),
+  localPubkey: () => LOCAL_PUBKEY, log: (m) => console.log(m),
+  walletReceivable: (pk, msat) => walletReceivable(pk, msat),   // 0.83.0: receivability first
+});
 // 0.72.0 (S45 #10): the PL engine — fee ledger + daily snapshots (pl.js). Created
 // at boot next to the console; the fee-realization points below write through
 // plRecord, which is a no-op until then.
@@ -928,10 +941,35 @@ const resolvedHtlcHashes = new Set();
 // HTTP request that carries its pubkey: buy, register_secret, prefs,
 // pending poll, lnurl register). A live WebSocket is NOT awake.
 const walletLastActiveMs = new Map();
+// 0.81.0 (S49, DP): "LAST HEARD" that cannot go blind. Every pubkey-bearing request and every peer message
+// stamps the wallet here; persisted once per session gap (the lease rule), read by the console's Wallets
+// pane beside the lease stamps. A wallet without a lease record — no channel, or a channel the lease never
+// seeded — used to show nothing or a stale hour.
+const WALLET_CONTACT_PATH = require('path').join(DATA_DIR, 'wallet-contact.json');
+let walletContact = {};
+try { walletContact = JSON.parse(require('fs').readFileSync(WALLET_CONTACT_PATH, 'utf8')) || {}; } catch (e) { walletContact = {}; }
+function walletContactTouch(pubkeyHex, source) {
+  try {
+    const k = String(pubkeyHex || '').toLowerCase();
+    if (!/^0[23][0-9a-f]{64}$/.test(k)) return;
+    const now = Date.now();
+    const cur = walletContact[k];
+    const gap = (typeof LEASE_SESSION_GAP_MS === 'number') ? LEASE_SESSION_GAP_MS : 600000;
+    const fresh = !cur || !cur.last_ms || (now - cur.last_ms) > gap;
+    walletContact[k] = { last_ms: now, source: fresh ? String(source || 'contact') : (cur.source || String(source || 'contact')), first_ms: (cur && cur.first_ms) || now };
+    if (fresh) { try { require('fs').writeFileSync(WALLET_CONTACT_PATH, JSON.stringify(walletContact)); } catch (_) {} }
+  } catch (_) {}
+}
+function walletContactMs(pubkeyHex) {
+  const c = walletContact[String(pubkeyHex || '').toLowerCase()];
+  return (c && Number(c.last_ms)) || 0;
+}
 const ACTIVE_WINDOW_MS = Math.max(5000, parseInt(process.env.LSPS2_ACTIVE_WINDOW_MS || '75000', 10) || 75000);  /* v0.55.5: the wallet's health cadence is ~60s; a 25s window starved 35s of every minute even with the heartbeat flowing */
 function touchWalletActive(pubkeyHex) {
-  if (pubkeyHex && /^[0-9a-f]{66}$/.test(String(pubkeyHex).toLowerCase()))
+  if (pubkeyHex && /^[0-9a-f]{66}$/.test(String(pubkeyHex).toLowerCase())) {
     walletLastActiveMs.set(String(pubkeyHex).toLowerCase(), Date.now());
+    walletContactTouch(pubkeyHex, 'http');   // 0.81.0: the durable stamp too
+  }
 }
 function walletRecentlyActive(pubkeyHex) {
   const t = walletLastActiveMs.get(String(pubkeyHex || '').toLowerCase()) || 0;
@@ -1020,7 +1058,10 @@ async function sendToRouteV2Hard(client, hash, route, timeoutMs, tag) {
   } finally { clearTimeout(timer); }
 }
 
-const OFFLINE_HOLD_ENABLED = process.env.LSPS2_OFFLINE_HOLD_ENABLED === 'true';
+// 0.80.0 (S49, DP): ON unless the operator writes false. The wallet's Privacy dial is the switch — it
+// picks its own window, "Off" included — and an operator's silence must not fail every offline send at
+// once (LSP-2 ran that way from its first day to 2026-09-24 without anyone able to see it).
+const OFFLINE_HOLD_ENABLED = process.env.LSPS2_OFFLINE_HOLD_ENABLED !== 'false';
 const OFFLINE_HOLD_CAP_MS = parseInt(process.env.LSPS2_OFFLINE_HOLD_CAP_MS || '180000', 10);
 const OFFLINE_MIN_HEADROOM_BLOCKS = parseInt(process.env.LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS || '18', 10);
 
@@ -1135,6 +1176,16 @@ function clientPrefsPersist() {
   try { require('fs').writeFileSync(CLIENT_PREFS_PATH, JSON.stringify(clientPrefs)); }
   catch (e) { console.error(`[prefs] persist failed: ${e.message}`); }
 }
+// 0.79.2 (S49): WHICH PEERS ARE WALLETS. The hold/wake rail exists for client wallets — phones behind a
+// private (unannounced) channel this LSP can wake. A public channel's peer is a routing node or another
+// provider: it is never held for and never woken; LND forwards to it or fails it the ordinary way. The
+// operator's world conduit (LEASE_WORLD_PEER) is private but not a client either. Same predicate as
+// enforceChannelPolicy, factored.
+function isClientChannel(c) {
+  if (!c || !c.private) return false;
+  if (LEASE_WORLD_PEER && String(c.remote_pubkey || '').toLowerCase() === LEASE_WORLD_PEER.toLowerCase()) return false;
+  return true;
+}
 function clientHoldCapMs(pk) {
   const p = clientPrefs[(pk || '').toLowerCase()];
   // v0.55.1 R1: a wallet that never stated a preference gets the 3-minute
@@ -1168,7 +1219,35 @@ function lnurlpArmHoldTimer(name, entry) {
   if (ms <= 0) { fire().catch(() => {}); return; }   // "Off": nothing is held for this wallet
   lnurlpHoldTimers.set(entry.hash, setTimeout(() => fire().catch(() => {}), ms));
 }
+// 0.81.0 (S49, DP): LUD-12 — the payer's note to the payee. Advertised on the payRequest, kept on the hash
+// entry when the callback mints, handed to the owning wallet by /lnurl/note, gone after a week. The text is
+// cleaned once here and never logged: NFC, control and invisible characters out (C0/C1, zero-width, bidi
+// overrides), whitespace collapsed, at most LNURLP_COMMENT_MAX code points.
+const LNURLP_COMMENT_MAX = 120;
+const LNURLP_NOTE_TTL_MS = 7 * 24 * 3600 * 1000;
+function lnurlpCleanNote(raw) {
+  try {
+    let s = String(raw == null ? '' : raw);
+    if (!s) return '';
+    try { s = s.normalize('NFC'); } catch (_) {}
+    s = s.replace(/[\t\n\r\f\v]/g, ' ');   // tabs and newlines are whitespace first (they are also C0 controls)
+    s = s.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g, '');
+    s = s.replace(/\s+/g, ' ').trim();
+    const cps = Array.from(s);
+    if (cps.length > LNURLP_COMMENT_MAX) s = cps.slice(0, LNURLP_COMMENT_MAX).join('').trim();
+    return s;
+  } catch (_) { return ''; }
+}
+function lnurlpPruneNotes() {
+  const cutoff = Date.now() - LNURLP_NOTE_TTL_MS;
+  for (const rec of Object.values(lnurlpRegistry)) {
+    for (const e of ((rec && rec.entries) || [])) {
+      if (e && e.note != null && Number(e.note_ts || 0) < cutoff) { delete e.note; delete e.note_ts; }
+    }
+  }
+}
 function lnurlpPersist() {
+  try { lnurlpPruneNotes(); } catch (_) {}
   try { require('fs').writeFileSync(LNURLP_PATH, JSON.stringify(lnurlpRegistry)); }
   catch (e) { console.error(`[LNURLP] persist failed: ${e.message}`); }
 }
@@ -1274,7 +1353,7 @@ function lnurlpMintLimited(ip) {
 }
 
 function lnurlpMinMsat(chan, clientPubkey) {
-  return (chan && chan.local_msat > 51000n)
+  return (chan && chan.room_msat > 1000n)   // 0.84.0: room, not balance
     ? 1000
     : (Math.ceil(CONFIG.lsps2.open_fee_min_msat * jitFeeMultPct(clientPubkey) * scarcityMultPct() / 10000) + 1000000);   // v0.32.0×v0.33.0: quote and charge agree
 }
@@ -1430,6 +1509,26 @@ function channelOpenFeeMsat(amountMsat, clientPubkey, scarcityPct) {
 }
 function lnurlpFeeMsat(amountMsat, clientPubkey) { return channelOpenFeeMsat(amountMsat, clientPubkey); }
 
+// 0.84.0 (S49, DP's journals — the third Push Key field finding): THE ROOM. What LND will actually send on our
+// side of a channel is not local_balance: the channel reserve stays put, and the initiator (this LSP, on every
+// JIT channel) must keep the commitment fee with one more HTLC plus LND's fee buffer (twice that, since 0.17).
+// Reading local_balance sent a 1,000-sat push into a channel LND refused (TEMPORARY_CHANNEL_FAILURE on our own
+// link) — the residue DP named on the LNURL rail. One function, every rail. Conservative by 1,000 sats.
+const ROOM_MARGIN_SATS = 1000;
+function channelRoomMsat(c) {
+  const local = BigInt(c.local_balance || '0');
+  const reserve = BigInt((c.local_constraints && c.local_constraints.chan_reserve_sat) || c.local_chan_reserve_sat || '0');
+  let fees = 0n;
+  if (c.initiator !== false) {   // absent = assume we opened it (every LiJ wallet channel is ours)
+    const commitFee = BigInt(c.commit_fee || '0');
+    const feePerKw = BigInt(c.fee_per_kw || '0');
+    const htlcFee = (172n * feePerKw + 999n) / 1000n;   // one more HTLC output, 172 weight units
+    fees = 2n * (commitFee + htlcFee);
+  }
+  const room = local - reserve - fees - BigInt(ROOM_MARGIN_SATS);
+  return room > 0n ? room * 1000n : 0n;
+}
+
 async function lnurlpClientChannel(clientPubkey) {
   // v0.27.0 (S30): best channel toward the client with LSP-side liquidity.
   // The ACTIVE gate is gone — a sleeping wallet's channel reads inactive,
@@ -1445,10 +1544,11 @@ async function lnurlpClientChannel(clientPubkey) {
     for (const c of (r.channels || [])) {
       if ((c.remote_pubkey || '').toLowerCase() !== clientPubkey.toLowerCase()) continue;
       const localMsat = BigInt(c.local_balance || '0') * 1000n;
+      const roomMsat = channelRoomMsat(c);   // 0.84.0: what LND will send, not what it holds
       const scid = (Array.isArray(c.alias_scids) && c.alias_scids.length)
         ? String(c.alias_scids[0]) : String(c.chan_id);
-      if (!best || localMsat > best.local_msat) {
-        best = { chan_id: String(c.chan_id), scid: scid, local_msat: localMsat, active: !!c.active };
+      if (!best || roomMsat > best.room_msat || (roomMsat === best.room_msat && localMsat > best.local_msat)) {
+        best = { chan_id: String(c.chan_id), scid: scid, local_msat: localMsat, room_msat: roomMsat, active: !!c.active };
       }
     }
     return best;
@@ -1510,7 +1610,7 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
   const T = tag || 'deliver';
   let chan = await lnurlpClientChannel(client);
   let feeMsat = 0n;
-  if (!chan || chan.local_msat < amt + 50000n) {
+  if (!chan || chan.room_msat < amt) {   // 0.84.0: the room LND will send (reserve, commit fee, fee buffer, margin already off)
     // JIT path: same fee law as every channel-opening receive (or the fee the wallet was promised).
     feeMsat = (fixedFeeMsat !== undefined && fixedFeeMsat !== null) ? BigInt(fixedFeeMsat) : lnurlpFeeMsat(amt, client);
     if (amt <= feeMsat) {
@@ -1569,7 +1669,7 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       },
     }],
   };
-  console.log(`[${T}]: delivering ${innerMsat} msat (fee ${feeMsat}) via scid=${chan.scid} (chan_id=${chan.chan_id}, active=${chan.active}) hash=${hashHex.slice(0,16)}…`);
+  console.log(`[${T}]: delivering ${innerMsat} msat (fee ${feeMsat}) via scid=${chan.scid} (chan_id=${chan.chan_id}, active=${chan.active}, room=${chan.room_msat} msat) hash=${hashHex.slice(0,16)}…`);
   let attempt;
   try {
     attempt = await sendToRouteV2Hard(routerClient, Buffer.from(hashHex, 'hex'), route, CONFIG.lsps2.sendtoroute_timeout_ms, T);  /* F3 v0.37.0 */
@@ -1577,6 +1677,25 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
     return { kind: 'rejected', error: String(e.message || e) };
   }
   return { kind: 'attempt', attempt, innerMsat, feeMsat, chan };
+}
+
+// 0.83.0 (S49, DP GO — PUSH KEY, the first field finding): the ONE answer to "can this wallet take N msat
+// from this provider right now, and at what fee?" — deliverToWallet's law, read without acting: room in
+// the wallet's channel (the same 50-sat margin) → in full, fee 0; no room → a JIT open at THE ONE
+// opening fee (channelOpenFeeMsat) with the fee out of the amount, unless the amount is under that fee
+// or the on-chain reserve floor forbids the open. min_msat is lnurlpMinMsat's floor: the smallest a
+// payer can send to this wallet today (quote and charge agree — v0.32.0×v0.33.0).
+async function walletReceivable(client, amountMsat) {
+  const amt = BigInt(amountMsat);
+  const chan = await lnurlpClientChannel(client);
+  const room = chan ? chan.room_msat : 0n;   // 0.84.0: the room LND will send
+  const minMsat = String(lnurlpMinMsat(chan, client));
+  if (chan && room >= amt) return { ok: true, mode: 'channel', fee_msat: '0', receivable_msat: String(room), min_msat: minMsat };
+  const fee = channelOpenFeeMsat(amt, client);
+  if (amt <= fee) return { ok: false, reason: 'under_open_fee', fee_msat: String(fee), receivable_msat: String(room), min_msat: minMsat };
+  const sizeSats = computeChannelSizeSats(String(amt));
+  if (!(await jitReserveOk(sizeSats, 'receivable-check ' + client.slice(0, 16) + '…'))) return { ok: false, reason: 'provider_reserve', fee_msat: String(fee), receivable_msat: String(room), min_msat: minMsat };
+  return { ok: true, mode: 'open', fee_msat: String(fee), receivable_msat: String(room), min_msat: minMsat, delivered_msat: String(amt - fee) };
 }
 
 async function lnurlpDeliver(name, entry) {
@@ -1726,6 +1845,7 @@ function lnurlpBootResume() {
   if (resumed) console.log(`[LNURLP] boot: resumed ${resumed} in-flight watcher(s)`);
 }
 setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
+setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PUSH-KEY] boot resume failed: ${e.message}`); } }, 9000);   // 0.82.0
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
@@ -2162,18 +2282,26 @@ async function handleInterceptedHtlc(req) {
           // Test A (a919c37b) rode one with zero evidence. Behavior
           // identical; every verdict now logs with its source.
           const _dtHash = req.payment_hash ? Buffer.from(req.payment_hash).toString('hex').slice(0, 16) : '????';
+          // 0.79.2 (S49): a public channel's peer is a routing node or another provider — not a wallet.
+          // No hold, no wake: LND forwards to it, or fails it the ordinary way and the sender routes on.
+          if (!isClientChannel(c)) {
+            console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} in=${req.incoming_amount_msat}msat -> RESUME (public channel; peer ${c.remote_pubkey.slice(0,16)}... is a routing node or a provider, not a wallet; no hold, no wake)`);
+            return RESUME;
+          }
           if (c.active) {
             console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} in=${req.incoming_amount_msat}msat -> RESUME (channel ACTIVE per LND; wallet ${c.remote_pubkey.slice(0,16)}...; a half-open tunnel keeps this true until LND ping-timeout)`);
             sendWakePush(c.remote_pubkey).catch(() => {});  /* v0.41.0: notify-on-uncertain-resume */
             return RESUME;
           }
-          const fwdOnline = await isPeerConnected(c.remote_pubkey);
-          if (fwdOnline) {
-            console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} in=${req.incoming_amount_msat}msat -> RESUME (channel inactive but peer LISTED by LND; peers-cache age ${Date.now() - _peersCache.ts}ms)`);
-            sendWakePush(c.remote_pubkey).catch(() => {});  /* v0.41.0: notify-on-uncertain-resume */
-            return RESUME;
-          }
-          console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} -> wallet OFFLINE by LND (channel inactive + peer not listed) - evaluating B-1 hold gates`);
+          // 0.79.2 (S49, UM890 journal 2026-09-24 00:09:48): the "channel inactive but peer LISTED — RESUME"
+          // branch is gone. LND fails a forward into an inactive channel at once — no link, or a link not
+          // yet EligibleToForward → unknown_next_peer, a permanent-class error the sender cannot retry past.
+          // The 4-s peers cache said "listed" 1.4 s after the wallet's socket closed and a real payment died
+          // as "Send failed" with the recipient one tap from opening. INACTIVE MEANS HOLD: the same rail as
+          // offline — wake push, replay on channel-back or B-10 — a few seconds for an app-switch, the
+          // wallet's dial for a wallet that is gone. The peers list is kept as log flavour only.
+          const fwdListed = await isPeerConnected(c.remote_pubkey);
+          console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} in=${req.incoming_amount_msat}msat -> channel INACTIVE by LND (peer ${fwdListed ? 'listed — an app-switch or a socket LND has not yet dropped' : 'not listed'}) - evaluating B-1 hold gates`);
           const pHash = req.payment_hash ? Buffer.from(req.payment_hash).toString('hex') : null;
           if (!pHash) return RESUME;
           const tipInfo = await lndGet('/v1/getinfo').catch(() => null);
@@ -2185,7 +2313,7 @@ async function handleInterceptedHtlc(req) {
           const fwdCanHold = OFFLINE_HOLD_ENABLED && fwdHoldCap > 0 && fwdTip > 0 && fwdAutoFail > 0 &&
             fwdMargin >= OFFLINE_MIN_HEADROOM_BLOCKS;
           if (!fwdCanHold) {
-            console.log(`[B-1] forward to offline client ${c.remote_pubkey.slice(0,16)}... -- cannot hold (enabled=${OFFLINE_HOLD_ENABLED}, margin=${fwdMargin}) -- RESUME (LND will fail it)`);
+            console.log(`[B-1] forward to offline client ${c.remote_pubkey.slice(0,16)}... -- cannot hold (enabled=${OFFLINE_HOLD_ENABLED}, wallet dial=${Math.round(clientHoldCapMs(c.remote_pubkey) / 1000)}s, margin=${fwdMargin}) -- RESUME (LND will fail it)`);
             return RESUME;
           }
           console.log(`[B-1] forward to offline client ${c.remote_pubkey.slice(0,16)}... -- HOLDING (cap ${Math.round(fwdHoldCap/1000)}s, margin=${fwdMargin}) payment_hash=${pHash}`);
@@ -3972,16 +4100,19 @@ async function trampolineForwardHeld(held, paymentHashHex, invSec) {
   };
   const paymentHash = Buffer.from(paymentHashHex, 'hex');
   console.log(`[B-10] trampoline: forwarding ${amtMsat}msat to ${held.client_pubkey.slice(0,16)}... via scid=${scidDec} (held forward)`);
+  try { SM.emit('trampoline', { hash: paymentHashHex, phase: 'start' }); } catch (_) {}   // 0.80.0: the census follows the delivery
   let htlcAttempt;
   try {
     htlcAttempt = await sendToRouteV2Hard(routerClient, paymentHash, route, CONFIG.lsps2.sendtoroute_timeout_ms, 'jit-or-trampoline');  /* F3 v0.37.0 */
   } catch (e) {
     console.error(`[B-10] sendToRouteV2 rejected: ${e.message}`);
+    try { SM.emit('trampoline', { hash: paymentHashHex, ok: false }); } catch (_) {}
     return false;
   }
   if (!htlcAttempt || htlcAttempt.status !== 'SUCCEEDED') {
     const failCode = htlcAttempt && htlcAttempt.failure ? htlcAttempt.failure.code : 'unknown';
     console.error(`[B-10] trampoline did not succeed: status=${htlcAttempt ? htlcAttempt.status : 'none'} failure_code=${failCode}`);
+    try { SM.emit('trampoline', { hash: paymentHashHex, ok: false }); } catch (_) {}
     /* v0.55.0 A2 (trampoline site): same final-node latch. */
     try {
       if (['INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS','FINAL_INCORRECT_CLTV_EXPIRY','FINAL_INCORRECT_HTLC_AMOUNT'].includes(String(failCode))) {
@@ -4003,6 +4134,7 @@ async function trampolineForwardHeld(held, paymentHashHex, invSec) {
     preimage: htlcAttempt.preimage,
   });
   resolvedHtlcHashes.add(paymentHashHex);
+  try { SM.emit('trampoline', { hash: paymentHashHex, ok: true }); } catch (_) {}   // 0.80.0: SETTLED, not a HOLDING ghost
   return true;
 }
 
@@ -4436,6 +4568,14 @@ function settingsReport() {
     row('Guardrails', 'window', 'LSPS2_JIT_WINDOW_DAYS', Math.round(JIT_WINDOW_MS / 86400000), 'days', ''),
     row('Guardrails', 'floor opens per day', 'JIT_FLOOR_MAX_OPENS_PER_DAY', JIT_FLOOR_MAX_OPENS_PER_DAY, '', ''),
     row('Guardrails', 'promise validity', 'LSPS2_PROMISE_VALIDITY_SECS', L.promise_validity_secs, 's', ''),
+    row('Offline hold', 'hold for offline wallets', 'LSPS2_OFFLINE_HOLD_ENABLED', OFFLINE_HOLD_ENABLED, '', 'on by default (0.80.0) — the wallet\'s Privacy dial picks its window, Off included; false here fails every offline send at once'),
+    row('Offline hold', 'ceiling', 'LSPS2_OFFLINE_HOLD_CAP_MS', OFFLINE_HOLD_CAP_MS, 'ms', Math.round(OFFLINE_HOLD_CAP_MS / 60000) + ' min — the most a wallet\'s dial can ask for'),
+    row('Offline hold', 'CLTV headroom', 'LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS', OFFLINE_MIN_HEADROOM_BLOCKS, 'blocks', 'the least room an HTLC must have left to be held at all'),
+    row('Push Key', 'delivery fee base', 'PUSH_DELIVERY_FEE_BASE_MSAT', pushRail.settings().fee_base_msat, 'msat', 'the sender pays it on top of the amount; kept whether or not a route costs it (0.82.0)'),
+    row('Push Key', 'delivery fee', 'PUSH_DELIVERY_FEE_PPM', pushRail.settings().fee_ppm, 'ppm', 'of the amount — the ceiling a cross-provider delivery may spend'),
+    row('Push Key', 'timelock margin', 'PUSH_CLTV_MARGIN_BLOCKS', pushRail.settings().cltv_margin_blocks, 'blocks', 'added to the window\'s blocks on the lock invoice'),
+    row('Push Key', 'amount floor', 'PUSH_MIN_SATS', pushRail.settings().min_sats, 'sats', ''),
+    row('Push Key', 'amount ceiling', 'PUSH_MAX_SATS', pushRail.settings().max_sats, 'sats', ''),
     row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
     row('Lease', 'dry run', 'LEASE_DRY_RUN', Ls.dry_run, '', 'true = logs would_close, never closes'),
     row('Lease', 'silence before close', 'LEASE_DAYS', Ls.days, 'days', 'per-channel ttl overrides it (lease state)'),
@@ -4581,7 +4721,7 @@ async function consoleSnapshot() {
     if (!rec) continue;
     const entries = rec.entries || [];
     let act = 0; for (const e of entries) { if (e && e.accepted_at > act) act = e.accepted_at; if (e && e.settled_at > act) act = e.settled_at; }
-    wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '', remote_sats: remoteByPeer[rec.client_pubkey] === undefined ? null : remoteByPeer[rec.client_pubkey] });
+    wallets.push({ pubkey: rec.client_pubkey || '', name, holds: entries.filter((e) => e && e.status === 'accepted').length, hashes: entries.length, first_seen_ms: rec.created || 0, last_heard_ms: Math.max(heardByPeer[rec.client_pubkey] || 0, act, walletContactMs(rec.client_pubkey)), label: (consoleNotes.wallets[rec.client_pubkey] || {}).label || '', remote_sats: remoteByPeer[rec.client_pubkey] === undefined ? null : remoteByPeer[rec.client_pubkey] });
   }
   // 0.77.1 (S46, DP 2026-09-14): the count stuck at the pay-code registry. A wallet that has a
   // channel here (JIT-opened, or registered in the LIJOX channel registry, or remembered by the
@@ -4612,7 +4752,7 @@ async function consoleSnapshot() {
   for (const k of walletOnly) {
     if (!k || knownPubkeys.has(k)) continue;
     knownPubkeys.add(k);
-    wallets.push({ pubkey: k, name: '', holds: 0, hashes: 0, first_seen_ms: firstOpen[k] || 0, last_heard_ms: heardByPeer[k] || 0, label: (consoleNotes.wallets[k] || {}).label || '', remote_sats: remoteByPeer[k] === undefined ? null : remoteByPeer[k], channel_only: true });
+    wallets.push({ pubkey: k, name: '', holds: 0, hashes: 0, first_seen_ms: firstOpen[k] || 0, last_heard_ms: Math.max(heardByPeer[k] || 0, walletContactMs(k)), label: (consoleNotes.wallets[k] || {}).label || '', remote_sats: remoteByPeer[k] === undefined ? null : remoteByPeer[k], channel_only: true });
   }
   const walletCount = knownPubkeys.size;   // distinct by pubkey -- a wallet with several pay codes counts once; a wallet with only a channel counts too (0.77.1)
   // 0.71.1: unconfirmed on-chain — the wallet's 0-conf transactions and LND's
@@ -4828,6 +4968,7 @@ const LEASE_SESSION_GAP_MS = Math.max(1, parseFloat(process.env.LEASE_SESSION_GA
 function leaseTouch(pubkey, source) {
   try {
     const k = String(pubkey || '').toLowerCase();
+    walletContactTouch(k, source);   // 0.81.0: the wallet is heard whether or not a lease record exists for it
     if (!/^0[23][0-9a-f]{64}$/.test(k) || !leaseState || !leaseState.channels) return;
     const now = Date.now();
     let newSession = false, hit = false;
@@ -5245,6 +5386,7 @@ const server = http.createServer(async (req, res) => {
                                        : { enabled: !!htlcInterceptor,
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
+        push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
       };
       if (HEALTH_DETAIL) base.lnd_version = info.version;
       return jsonResponse(res, base);
@@ -5288,6 +5430,11 @@ const server = http.createServer(async (req, res) => {
   // anyone may GET a kit by npub (ciphertext; the words alone open it). See kits.js.
   if (path === '/v1/kit') {
     if (await kitHolder.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
+  }
+  // 0.82.0 (S49, DP GO — PUSH KEY step B): /push/quote and /push/status/<hash> are public reads; lock, claim
+  // and deliver carry the route token; void carries the sender's node-key signature. See push.js.
+  if (path.startsWith('/push/')) {
+    if (await pushRail.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
   }
 
   // v0.21: LEASE POLICY is a PUBLIC read (static JSON, zero I/O) — the
@@ -5364,7 +5511,7 @@ const server = http.createServer(async (req, res) => {
       minSendable: lnurlpMinMsat(chan, rec.client_pubkey),   // v0.31.0 honest / v0.32.0 escalated
       maxSendable: CONFIG.lsps2.variable_ceiling_msat,
       metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec)),   // 0.68.0: the address host, not necessarily this host
-      commentAllowed: 0,
+      commentAllowed: LNURLP_COMMENT_MAX,   // 0.81.0 (S49, DP): the payer may write to the payee (LUD-12)
     });
   }
   if (method === 'GET' && path.startsWith('/lnurl/cb/')) {
@@ -5396,6 +5543,9 @@ const server = http.createServer(async (req, res) => {
     entry.status = 'reserved';
     entry.amount_msat = amt.toString();
     entry.reserved_at = Date.now();
+    // 0.81.0: the payer's note rides the callback (LUD-12 `comment`); cleaned, kept on the entry, never logged
+    const _note = lnurlpCleanNote(parsed.searchParams.get('comment'));
+    if (_note) { entry.note = _note; entry.note_ts = Date.now(); } else { delete entry.note; delete entry.note_ts; }
     lnurlpPersist();
     let hodl;
     try {
@@ -5439,8 +5589,24 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, { status: 'ERROR', reason: 'could not mint invoice' }, 500);
     }
     lnurlpWatch(name, entry);
-    console.log(`[LNURLP] ${name}: minted hold invoice ${amt} msat hash=${entry.hash.slice(0,16)}…`);
+    console.log(`[LNURLP] ${name}: minted hold invoice ${amt} msat hash=${entry.hash.slice(0,16)}…${entry.note ? ' note=' + Array.from(entry.note).length + ' chars' : ''}`);
     return jsonResponse(res, { pr: hodl.payment_request, routes: [] });
+  }
+  // 0.81.0 (S49, DP): the payee reads the payer's note — token-gated, and only the hash's owner.
+  if (method === 'GET' && path.startsWith('/lnurl/note/')) {
+    if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
+    const hash = path.slice('/lnurl/note/'.length).toLowerCase();
+    const who = String(parsed.searchParams.get('client_pubkey') || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(hash) || !/^[0-9a-f]{66}$/.test(who)) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
+    let hit = null, owner = null;
+    for (const rec of Object.values(lnurlpRegistry)) {
+      const e = ((rec && rec.entries) || []).find((x) => x && x.hash === hash);
+      if (e) { hit = e; owner = String(rec.client_pubkey || '').toLowerCase(); break; }
+    }
+    if (!hit) return jsonResponse(res, { ok: false, error: 'unknown hash' }, 404);
+    if (owner !== who) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
+    touchWalletActive(who);
+    return jsonResponse(res, { ok: true, note: hit.note || null, ts: hit.note_ts || null, status: hit.status || null });
   }
   if (method === 'GET' && path === '/quorum/defaults') {
     // v0.46 (S33, DP design): the LSP declares the default quorum endpoint
@@ -5476,7 +5642,7 @@ const server = http.createServer(async (req, res) => {
     const eff = clientHoldCapMs(pk);
     touchWalletActive(String((body && body.client_pubkey) || '').toLowerCase());  /* v0.54.4 (d): prefs = awake proof */
     console.log(`[prefs] ${pk.slice(0, 16)}… hold_ms=${body.hold_ms} effective=${eff} (lsp cap ${OFFLINE_HOLD_CAP_MS})`);
-    return jsonResponse(res, { ok: true, hold_ms_effective: eff, lsp_cap_ms: OFFLINE_HOLD_CAP_MS });
+    return jsonResponse(res, { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED });   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
   }
   if (method === 'POST' && path === '/lnurl/register') {
     if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
@@ -5784,6 +5950,11 @@ const server = http.createServer(async (req, res) => {
       channel_open_fee_sats: openFeeBaselineSats(),   // 0.61.0: derived — same number the registry advertises
       open_fee_quote:        openFeeQuote(_client),    // 0.61.0: THIS wallet's next open, multipliers applied — an amount, not a formula
       channel_model:         c.channel_model,
+      // 0.80.0 (S49, DP): whether THIS provider holds for offline wallets, and how long at most — the
+      // wallet's dial and its provider card read it and say so plainly.
+      offline_hold:          { enabled: OFFLINE_HOLD_ENABLED, cap_ms: OFFLINE_HOLD_CAP_MS, headroom_blocks: OFFLINE_MIN_HEADROOM_BLOCKS },
+      // 0.82.0 (S49): this provider locks and delivers Push Keys — the wallet's Push tab reads the fee terms here
+      push_key:              pushRail.capability,
       // v0.56.0 (O5 full balance availability): the payer-funds-the-floor
       // prefund and the live reserve policy — a manifest-era shopping fact
       // (Dm3 reserve_policy) advertised at the source. prefund_msat is the

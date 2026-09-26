@@ -175,6 +175,23 @@ const handlers = {
 
   replay_started() { /* per-pubkey; intents transition on their own events */ },
 
+  // 0.80.0 (S49): the B-10 trampoline — the adapter pays the recipient itself and settles the inbound
+  // with the preimage. The machine had never heard of it, so every hold delivered that way stayed
+  // HOLDING in the census for the life of the process (2026-09-24: "HOLDING@21668s" for holds that
+  // settled at 07:33). start: HOLDING → FORWARDING; ok: → SETTLING → SETTLED; not ok: back to HOLDING
+  // (the replay path takes over, and RESUME or the watchdog ends it).
+  trampoline(p) {
+    const it = p.hash ? intents.get(p.hash) : null;
+    if (!it) return;
+    if (p.phase === 'start') { if (it.state === 'HOLDING') transition(it, 'FORWARDING', 'B-10 trampoline'); return; }
+    if (p.ok) {
+      if (it.state !== 'SETTLING') transition(it, 'SETTLING', 'trampoline paid — preimage received');
+      transition(it, 'SETTLED', 'inbound settled with the preimage');
+    } else if (it.state === 'FORWARDING') {
+      transition(it, 'HOLDING', 'trampoline did not complete — replay path');
+    }
+  },
+
   open_started(p) {
     const it = getIntent(p.hash);
     if (!it) return;
