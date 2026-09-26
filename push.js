@@ -19,6 +19,10 @@
 // 0.84.0: a delivery our own LND refuses (TEMPORARY_CHANNEL_FAILURE from our link — no room after all) is retried
 // three times, then burned as no_room so the wallet reads it in words; the room itself is now computed right
 // (lij-adapter.js channelRoomMsat), so this is the rare race, not the rule.
+// 0.85.0 (DP GO — "sealed"): THE NOTE. The sender's wallet seals its note with a key derived from the preimage and
+// hands this provider the ciphertext plus a lookup token derived the same way; this provider keeps a blob it
+// cannot read, and GET /push/note/<hash>?token= hands it to whoever holds the Push Key. Kept 7 days past the
+// push's end, like the address note. No route token — the recipient may be on another provider; the token is the proof.
 //
 // A Push Key sets sats aside with one condition: whoever brings the key before the deadline gets
 // them; if nobody does, they are the sender's again. The provider's part, true to the byte:
@@ -61,6 +65,10 @@ function createPushRail(deps) {
   const LOCK_INVOICE_LIFE_S = 1200;          // the sender pays within seconds; an unpaid lock dies in 20 min
   const CLAIM_HOLD_MS = int(env.PUSH_CLAIM_HOLD_MS, 15 * 60 * 1000);   // the recipient is claiming now
   const DELIVER_TIMEOUT_S = int(env.PUSH_DELIVER_TIMEOUT_S, 90);
+  const NOTE_CT_MAX = 2048;                    // 0.85.0: the sealed note's ciphertext, base64url
+  const NOTE_KEEP_MS = 7 * 24 * 3600 * 1000;   // 0.85.0: kept this long past the push's end
+  const NOTE_HITS_MAX = 60;                    // 0.85.0: note reads per address per minute
+  const noteHits = new Map();
   const PATH = path.join(dataDir, 'push-registry.json');
 
   let reg = { out: {}, in: {} };
@@ -81,6 +89,17 @@ function createPushRail(deps) {
   // 0.83.0: LND's failure_reason on a cross-provider delivery → a code the wallet can act on
   const deliverCode = (fr) => /INCORRECT_PAYMENT_DETAILS/.test(fr) ? 'recipient_refused' : /NO_ROUTE/.test(fr) ? 'no_route' : /TIMEOUT/.test(fr) ? 'timeout' : /INSUFFICIENT_BALANCE/.test(fr) ? 'holder_balance' : 'error';
   const rxFields = (rx) => ({ reason: rx.reason, fee_msat: rx.fee_msat, receivable_msat: rx.receivable_msat, min_msat: rx.min_msat });
+  // 0.85.0: the note's end — a record that ended keeps its sealed note NOTE_KEEP_MS, then it is gone
+  const noteEnd = (rec) => { if (rec.note_ct) rec.note_prune_at = now() + NOTE_KEEP_MS; };
+  function pruneNotes() {
+    let n = 0;
+    for (const rec of Object.values(reg.out)) if (rec.note_ct && rec.note_prune_at && rec.note_prune_at <= now()) { delete rec.note_ct; delete rec.note_token; delete rec.note_prune_at; n++; }
+    if (n) { persist(); log(`[PUSH-KEY] ${n} sealed note(s) past their keep — gone`); }
+    return n;
+  }
+  const noteLimited = (ip) => { const t = now(); const arr = (noteHits.get(ip) || []).filter((x) => t - x < 60000); if (arr.length >= NOTE_HITS_MAX) { noteHits.set(ip, arr); return true; } arr.push(t); noteHits.set(ip, arr); if (noteHits.size > 5000) noteHits.clear(); return false; };
+  timers.set(function noteSweep() { pruneNotes(); timers.set(noteSweep, 3600 * 1000); }, 3600 * 1000);   // 0.85.0: the hourly sweep, from creation
+  const tokenEq = (a, b) => { const A = Buffer.from(String(a || ''), 'utf8'), B = Buffer.from(String(b || ''), 'utf8'); return A.length === B.length && crypto.timingSafeEqual(A, B); };
   // 0.83.1: LND's REST answers a permission failure as a JSON body {code:2, message:"permission denied"} — lndRequest
   // resolves it like any answer, so every reader must look.
   const msgOf = (r) => r ? String(r.message || (r.error && r.error.message) || '') : '';   // streaming routes wrap errors as {error:{message}}
@@ -112,7 +131,7 @@ function createPushRail(deps) {
     if (sha256(preimageHex) !== rec.hash) { log(`[PUSH-KEY] ${short(rec.hash)}: a preimage that does not open the hash — refusing to settle (${how})`); return false; }
     try { await lndPost('/v2/invoices/settle', { preimage: b64(preimageHex) }); }
     catch (e) { log(`[PUSH-KEY] ${short(rec.hash)}: OUTER SETTLE FAILED after ${how} (${e.message}) — MANUAL ATTENTION`); return false; }
-    rec.status = 'taken'; rec.taken_at = now(); rec.preimage = preimageHex; delete rec.deliver_inflight_at;
+    rec.status = 'taken'; rec.taken_at = now(); rec.preimage = preimageHex; delete rec.deliver_inflight_at; noteEnd(rec);   // 0.85.0
     persist(); stopWatch(rec.hash);
     const t = expiryTimers.get(rec.hash); if (t) { timers.clear(t); expiryTimers.delete(rec.hash); }
     const kept = Math.max(0, Number(rec.fee_msat) - Number(rec.fee_spent_msat || 0));
@@ -124,7 +143,7 @@ function createPushRail(deps) {
   async function cancelOuter(rec, why, status) {
     try { await lndPost('/v2/invoices/cancel', { payment_hash: b64(rec.hash) }); }
     catch (e) { log(`[PUSH-KEY] ${short(rec.hash)}: cancel failed (${e.message})`); }
-    rec.status = status; rec.ended_at = now(); rec.end_reason = why;
+    rec.status = status; rec.ended_at = now(); rec.end_reason = why; noteEnd(rec);   // 0.85.0
     persist(); stopWatch(rec.hash);
     const t = expiryTimers.get(rec.hash); if (t) { timers.clear(t); expiryTimers.delete(rec.hash); }
     log(`[PUSH-KEY] ${short(rec.hash)}: ${status.toUpperCase()} — ${why}`);
@@ -332,6 +351,19 @@ function createPushRail(deps) {
       if (!rec) return j({ ok: false, error: 'unknown' }, 404);
       return j({ ok: true, status: rec.status, amount_sats: Math.floor(Number(rec.amount_msat) / 1000), fee_sats: Math.ceil(Number(rec.fee_msat) / 1000), expiry: rec.expiry, holder: localPubkey(), locked_at: rec.locked_at || null, taken_at: rec.taken_at || null, ended_at: rec.ended_at || null, end_reason: rec.end_reason || null, last_deliver_code: rec.last_deliver_code || null, last_deliver_error: rec.last_deliver_error || null });
     }
+    // 0.85.0: the sealed note — a blob this provider cannot read, handed to whoever holds the key (the token is
+    // derived from the preimage; routing nodes know only the hash). Public: the recipient may be on another provider.
+    if (method === 'GET' && pathname.startsWith('/push/note/')) {
+      if (noteLimited(ip)) return j({ ok: false, error: 'slow down' }, 429);
+      const hash = pathname.slice('/push/note/'.length).split('?')[0].toLowerCase();
+      if (!isHex(hash, 64)) return j({ ok: false, error: 'bad hash' }, 400);
+      const q = new URL(req.url || '', 'http://lsp.local').searchParams;
+      const token = String(q.get('token') || '').toLowerCase();
+      const rec = reg.out[hash];
+      if (!rec || !rec.note_ct) return j({ ok: false, error: 'no note' }, 404);
+      if (!isHex(token, 32) || !tokenEq(token, rec.note_token)) return j({ ok: false, error: 'not the key' }, 403);
+      return j({ ok: true, note_ct: rec.note_ct });
+    }
     // 0.83.0: can this wallet take N sats from this provider right now, and at what fee? The claim sheet
     // asks before the tap; /push/claim asks again before it mints or delivers. The deliverToWallet law.
     if (method === 'GET' && pathname === '/push/receivable') {
@@ -369,6 +401,14 @@ function createPushRail(deps) {
       if (!Number.isInteger(amountSats) || amountSats < MIN_AMOUNT_SATS || amountSats > MAX_AMOUNT_SATS) return j({ ok: false, error: `amount must be ${MIN_AMOUNT_SATS}–${MAX_AMOUNT_SATS} sats` }, 400);
       if (!Number.isInteger(expiry) || expiry < nowS + WINDOW_MIN_S || expiry > nowS + WINDOW_MAX_S) return j({ ok: false, error: 'the window must end between 10 minutes and 7 days from now' }, 400);
       if (reg.out[hash]) return j({ ok: false, error: 'this hash is already a push here' }, 409);
+      // 0.85.0: the sealed note — both fields or neither; the ciphertext is opaque here (base64url, ≤ NOTE_CT_MAX)
+      const noteCt = body.note_ct === undefined || body.note_ct === null || body.note_ct === '' ? '' : String(body.note_ct);
+      const noteToken = String(body.note_token || '').toLowerCase();
+      if (noteCt || noteToken) {
+        if (!noteCt || !noteToken) return j({ ok: false, error: 'note_ct and note_token go together' }, 400);
+        if (noteCt.length > NOTE_CT_MAX || !/^[A-Za-z0-9_-]+$/.test(noteCt)) return j({ ok: false, error: 'note_ct must be base64url, at most ' + NOTE_CT_MAX + ' chars' }, 400);
+        if (!isHex(noteToken, 32)) return j({ ok: false, error: 'note_token must be 32 hex' }, 400);
+      }
       const amountMsat = amountSats * 1000;
       const fee = feeMsat(amountMsat);
       const total = amountMsat + fee;
@@ -377,8 +417,9 @@ function createPushRail(deps) {
       try { bolt11 = await mintHold({ hashHex: hash, valueMsat: total, cltvExpiry: cltv, memo: 'Lightning in a Jar · Push Key', hints: [] }); }
       catch (e) { log(`[PUSH-KEY] lock mint failed for ${short(hash)}: ${e.message}`); return j({ ok: false, error: 'could not mint the lock' }, 500); }
       reg.out[hash] = { hash, client_pubkey: pk, amount_msat: String(amountMsat), fee_msat: String(fee), total_msat: String(total), expiry, cltv_expiry: cltv, created: now(), status: 'minted' };
+      if (noteCt) { reg.out[hash].note_ct = noteCt; reg.out[hash].note_token = noteToken; reg.out[hash].note_at = now(); }   // 0.85.0
       persist(); watchOut(hash); touchWalletActive(pk);
-      log(`[PUSH-KEY] ${short(hash)}: lock minted for ${pk.slice(0, 16)}… — ${amountMsat} + fee ${fee} = ${total} msat, cltv ${cltv}, until ${new Date(expiry * 1000).toISOString()}`);
+      log(`[PUSH-KEY] ${short(hash)}: lock minted for ${pk.slice(0, 16)}… — ${amountMsat} + fee ${fee} = ${total} msat, cltv ${cltv}, until ${new Date(expiry * 1000).toISOString()}${noteCt ? ', a sealed note (' + noteCt.length + ' chars)' : ''}`);
       return j({ ok: true, bolt11, hash, amount_msat: String(amountMsat), fee_msat: String(fee), total_msat: String(total), expiry, cltv_expiry: cltv, holder: localPubkey(), cross_provider: capability.cross_provider !== false });   // 0.83.1
     }
 
@@ -488,9 +529,9 @@ function createPushRail(deps) {
     return { locked: o.filter((r) => r.status === 'locked').length, taken: o.filter((r) => r.status === 'taken').length, returned: o.filter((r) => r.status === 'returned' || r.status === 'void').length, claims_open: i.filter((r) => r.status === 'reserved' || r.status === 'accepted').length };
   }
   const settings = () => ({ fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, cltv_margin_blocks: CLTV_MARGIN_BLOCKS, min_sats: MIN_AMOUNT_SATS, max_sats: MAX_AMOUNT_SATS, window_max_s: WINDOW_MAX_S });
-  const capability = { holder: true, claim: true, window_max_s: WINDOW_MAX_S, fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, cross_provider: true, missing_rpcs: [] };   // 0.83.1: cross_provider set by probeKey at boot
+  const capability = { holder: true, claim: true, window_max_s: WINDOW_MAX_S, fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, cross_provider: true, missing_rpcs: [], sealed_note: true };   // 0.83.1: cross_provider set by probeKey at boot; 0.85.0: sealed_note
 
-  return { handle, bootResume, summary, settings, capability, feeMsat, blocksFor, probeKey, _reg: () => reg, _tickOut: watchOut, _tickIn: watchIn };
+  return { handle, bootResume, summary, settings, capability, feeMsat, blocksFor, probeKey, pruneNotes, _reg: () => reg, _tickOut: watchOut, _tickIn: watchIn };
 }
 
 module.exports = { createPushRail, VOID_DOMAIN };

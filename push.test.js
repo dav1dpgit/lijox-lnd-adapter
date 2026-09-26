@@ -336,6 +336,37 @@ const nowS = () => Math.floor(clock / 1000);
   r = await call('GET', '/push/claim-status/' + U.hash + '?client_pubkey=' + RECIP);
   check(r.data.end_code === 'no_room' && /refused the HTLC 3 times/.test(r.data.end_reason), 'claim-status carries no_room');
 
+  // ── 7f. 0.85.0: the sealed note — a blob the holder cannot read, handed to whoever holds the key ──
+  const V = pair('V');
+  const CT = 'AbCd_-' + 'x'.repeat(60), TOK = 'ab'.repeat(16);
+  r = await call('POST', '/push/lock', { client_pubkey: SENDER, hash: V.hash, amount_sats: 5000, expiry: nowS() + 72 * 3600, note_ct: CT, note_token: TOK });
+  check(r.status === 200 && rail._reg().out[V.hash].note_ct === CT && rail._reg().out[V.hash].note_token === TOK, 'lock with a sealed note: stored as given (ciphertext + token)');
+  r = await call('POST', '/push/lock', { client_pubkey: SENDER, hash: pair('V2').hash, amount_sats: 5000, expiry: nowS() + 72 * 3600, note_ct: CT });
+  check(r.status === 400 && /go together/.test(r.data.error), 'a ciphertext without its token is refused');
+  r = await call('POST', '/push/lock', { client_pubkey: SENDER, hash: pair('V3').hash, amount_sats: 5000, expiry: nowS() + 72 * 3600, note_ct: 'not base64url!', note_token: TOK });
+  check(r.status === 400 && /base64url/.test(r.data.error), 'a ciphertext that is not base64url is refused');
+  r = await call('GET', '/push/note/' + V.hash + '?token=' + TOK, null, false);
+  check(r.status === 200 && r.data.ok && r.data.note_ct === CT, 'GET /push/note with the key\'s token (no route token needed): the blob');
+  r = await call('GET', '/push/note/' + V.hash + '?token=' + 'cd'.repeat(16), null, false);
+  check(r.status === 403, 'the wrong token: refused');
+  r = await call('GET', '/push/note/' + V.hash, null, false);
+  check(r.status === 403, 'no token: refused');
+  r = await call('GET', '/push/note/' + H.hash + '?token=' + TOK, null, false);
+  check(r.status === 404, 'a push without a note: 404');
+  r = await call('GET', '/push/status/' + V.hash);
+  check(r.data.ok && r.data.note_ct === undefined && r.data.note_token === undefined, 'the public status carries neither the blob nor the token');
+  invoices[V.hash].state = 'ACCEPTED'; await advance(4000);
+  await call('POST', '/push/void', { client_pubkey: SENDER, hash: V.hash, ts: nowS(), signature: 'sig:' + SENDER });
+  check(rail._reg().out[V.hash].status === 'void' && rail._reg().out[V.hash].note_prune_at > clock && rail._reg().out[V.hash].note_ct === CT, 'the push ended: the note stays, with its keep set');
+  r = await call('GET', '/push/note/' + V.hash + '?token=' + TOK, null, false);
+  check(r.status === 200 && r.data.note_ct === CT, 'still readable after the end (a restored wallet may ask again)');
+  check(Math.abs(rail._reg().out[V.hash].note_prune_at - (clock + 7 * 24 * 3600 * 1000)) < 5000, 'the keep is 7 days from the end');
+  rail._reg().out[V.hash].note_prune_at = clock - 1; await advance(3600 * 1000 + 1000);   // the hourly sweep passes
+  check(rail._reg().out[V.hash].note_ct === undefined && rail._reg().out[V.hash].note_token === undefined, 'past its keep: the hourly sweep pruned it');
+  r = await call('GET', '/push/note/' + V.hash + '?token=' + TOK, null, false);
+  check(r.status === 404, 'and the read says no note');
+  check(rail.capability.sealed_note === true, 'capability: sealed_note');
+
   // ── 8. boot resume ──
   const I = pair('I');
   await call('POST', '/push/lock', { client_pubkey: SENDER, hash: I.hash, amount_sats: 4000, expiry: nowS() + 72 * 3600 });
@@ -344,7 +375,7 @@ const nowS = () => Math.floor(clock / 1000);
   const n = rail2.bootResume();
   check(n === 4 && rail2._reg().out[I.hash].status === 'locked' && rail2._reg().out[H.hash].status === 'locked' && rail2._reg().out[K.hash].status === 'locked' && rail2._reg().out[M.hash].status === 'locked', 'a fresh process resumes the four open locks, H, I, K and M (settled, void, returned, unpaid, burned, taken ones stay put) — got ' + n);
   const s = rail.summary();
-  check(s.locked === 4 && s.taken === 3 && s.returned === 2 && s.claims_open === 0, 'summary: 4 locked (H, I, K, M), 3 taken (A, F, N), 2 returned/void (B, C), no open claims — got ' + JSON.stringify(s));
+  check(s.locked === 4 && s.taken === 3 && s.returned === 3 && s.claims_open === 0, 'summary: 4 locked (H, I, K, M), 3 taken (A, F, N), 3 returned/void (B, C, V), no open claims — got ' + JSON.stringify(s));
   check(rail.capability.holder === true && rail.settings().fee_ppm === 2000, 'capability and settings exposed');
 
   console.log(`\n${passed} passed, ${failed} failed`);
