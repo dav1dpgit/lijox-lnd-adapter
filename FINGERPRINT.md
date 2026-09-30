@@ -17,6 +17,9 @@ HEALTH_DETAIL=on (operator's choice, off by default).
 | /.well-known/lnurlp/* | per-name pay metadata | KEEP — the point of hosting addresses |
 | /attempts | payment forensics, HASH-SCOPED (must know the payment hash) | KEEP — scoping is the guard |
 | /lsps/registry/*, /lsps2/push-subscribe | signed-challenge only | KEEP — already authenticated by design |
+| /health → nwc, /lsps2/get_info → nwc (0.86.0) | enabled, the relay's wss address, ttl ceiling, caps; on /health the counts (connections, waiting, wakes today) | KEEP — the wallet's Dials → NWC reads enabled + relay; counts are the same order of detail push_key already gives; never a key |
+| /v1/nwc/register, /v1/nwc/unregister (0.86.0) | route token + the wallet's node-key signature | KEEP — authenticated by design; a stranger learns only 401 |
+| /nwc (websocket, 0.86.0) | NIP-01 relay: a REQ must name a key; requests only to the authenticated service key; replies by client key; info by author | KEEP — no listing of keys; an unauthenticated stranger gets EOSE and nothing else |
 
 Not exposed anywhere unauthenticated: onchain balance, total/inactive
 channel list, peer list, macaroon scope, data paths, version of this

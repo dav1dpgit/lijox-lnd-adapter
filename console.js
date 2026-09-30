@@ -136,6 +136,15 @@ function render(d){
       ['fee limit',fmt(Math.round(Number(dg.fee_limit_msat||0)/1000))+' sats <span class="dim">the refund path\\u2019s ceiling and the reserve\\u2019s sanity cap \\u00b7 DELEGATE_FEE_LIMIT_MSAT</span>',1],
       ['all time',fmt(Math.round(Number(dg.all_time_msat||0)/1000))+' sats paid by delegation',1]
     ]))}
+  // 0.86.0: NWC — the switch, the relay, connections registered, requests waiting now, wakes sent today (report only)
+  var nw=d.nwc;
+  if(!nw){setPane('nwc','<span class="dim">no NWC report (module not loaded)</span>')}else if(!nw.enabled){setPane('nwc','<span class="dim">off \u2014 NWC_ENABLED is not true; this provider offers no NWC</span>')}else{
+    setPane('nwc',kv([
+      ['relay','<span class="mono">'+esc(nw.relay||'')+'</span> <span class="dim">the API tunnel, path /nwc</span>',1],
+      ['connections',fmt(nw.connections)+' registered by '+fmt(nw.wallets)+' wallet(s) <span class="dim">at most '+fmt(nw.max_connections)+' per wallet</span>',1],
+      ['waiting now',fmt(nw.waiting)+' request(s) <span class="dim">kept at most '+fmt(nw.request_ttl_ceiling_s)+' s; '+fmt(nw.max_waiting)+' per connection</span> \u00b7 '+fmt(nw.replies_kept)+' repl'+(nw.replies_kept===1?'y':'ies')+' kept',1],
+      ['wakes today',fmt(nw.wakes_today)+' <span class="dim">one per wallet per '+fmt(nw.wake_min_interval_s)+' s at most</span> \u00b7 '+fmt(nw.sockets)+' open socket(s)',1]
+    ]))}
   var b=d.balances||{};
   var pr=b.principles||{};function cov(x){return x==null?'<span class="dim">n/a</span>':x.toFixed(1)+'\\u00d7'}
   var bx=b.boxes||{};function kpi(t,v,sub,cls){return '<div class="kpi '+(cls||'')+'"><div class="t">'+t+'</div><div class="v">'+v+'</div><div class="s">'+(sub||'')+'</div></div>'}
@@ -277,6 +286,7 @@ function pageConsole() {
 <main>
 <section class="card"><h2>Guardrails</h2><div id="guard" class="dim">\u2026</div></section>
 <section class="card"><h2>Delegate rail</h2><div id="delegate" class="dim">\u2026</div></section>
+<section class="card"><h2>NWC</h2><div id="nwc" class="dim">\u2026</div></section>
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>
 <section class="card"><h2>Node</h2><div id="node" class="dim">\u2026</div></section>
 <section class="card"><h2>Balances</h2><div id="bal" class="dim">\u2026</div></section>

@@ -361,6 +361,7 @@ const { WebSocketServer } = require('ws');
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
 const { createKitHolder } = require('./kits.js');
+const { createNwc } = require('./nwc.js');   // 0.86.0 (S50, DP GO — NWC): the provider's half — registration, the relay at /nwc, the wake; see nwc.js
 const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
 const lijDelegate = require('./delegate.js'); // v0.23: DELEGATE PAYMENT — S25 side trip; the module's entire adapter footprint is this require + one router branch
 // 0.78.0: the delegate rail's same-LSP hold reaches the adapter's own machinery through these hooks
@@ -523,6 +524,20 @@ const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 // 0.82.0: the Push Key rail. Every dependency is handed over lazily — lndGet/lndPost are consts defined
 // further down the file, and the function declarations are hoisted anyway.
+// 0.86.0 (S50, DP GO — NWC): the wallet registers each connection's (service key, client key) pair, signed with its
+// node key; the relay keeps the encrypted requests for a sleeping phone and wakes it; nothing here reads a request.
+const nwc = createNwc({
+  dataDir: DATA_DIR, log: (m) => console.log(m),
+  sendWakePush: (pk, kind) => sendWakePush(pk, undefined, kind),
+  authOk: (req) => authOk(req),
+  publicHttpsUrl: () => CONFIG.public.https_url,   // a function: CONFIG is built further down
+  verifyWalletSig: async (msg, sig) => {
+    const r = await lndPost('/v1/verifymessage', { msg: Buffer.from(msg, 'utf8').toString('base64'), signature: sig });
+    const m = r ? String(r.message || (r.error && r.error.message) || '') : '';
+    if (/permission denied|macaroon|unauthorized/i.test(m)) throw new Error('the key lacks /lnrpc.Lightning/VerifyMessage');
+    return String((r && r.pubkey) || '').toLowerCase();
+  },
+});
 const pushRail = createPushRail({
   dataDir: DATA_DIR,
   lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
@@ -1849,7 +1864,7 @@ setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PU
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
-async function sendWakePush(pubkeyHex, holdMsOverride) {
+async function sendWakePush(pubkeyHex, holdMsOverride, kind) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting"
   if (!PUSH_ENABLED) return;
   const key = (pubkeyHex || '').toLowerCase();
   // 0.76.0 (S46, DP ruled "B"): NO WAKE FOR A WALLET THAT IS LIVE RIGHT NOW. The push exists
@@ -1889,7 +1904,7 @@ async function sendWakePush(pubkeyHex, holdMsOverride) {
     // LNURLp rail holds for over an hour.
     const holdMs = (typeof holdMsOverride === 'number' && holdMsOverride > 0) ? holdMsOverride : clientHoldCapMs(key);
     const holdS = Math.max(1, Math.round(holdMs / 1000));
-    await webpush.sendNotification(sub, JSON.stringify({ t: 'wake', hold_s: holdS }), { TTL: Math.max(60, holdS) });
+    await webpush.sendNotification(sub, JSON.stringify({ t: kind || 'wake', hold_s: holdS }), { TTL: Math.max(60, holdS) });   // 0.86.0: t = 'nwc' for an NWC request
     console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (hold_s=${holdS})`);
   } catch (e) {
     const status = e && e.statusCode;
@@ -4576,6 +4591,9 @@ function settingsReport() {
     row('Push Key', 'timelock margin', 'PUSH_CLTV_MARGIN_BLOCKS', pushRail.settings().cltv_margin_blocks, 'blocks', 'added to the window\'s blocks on the lock invoice'),
     row('Push Key', 'amount floor', 'PUSH_MIN_SATS', pushRail.settings().min_sats, 'sats', ''),
     row('Push Key', 'amount ceiling', 'PUSH_MAX_SATS', pushRail.settings().max_sats, 'sats', ''),
+    row('NWC', 'switch', 'NWC_ENABLED', nwc.settings().enabled ? 'on' : 'off', '', 'off by default; on = this provider keeps and relays NWC requests for its wallets (never pays, never reads one) — 0.86.0'),
+    row('NWC', 'request ttl ceiling', 'NWC_REQUEST_TTL_CEILING_S', nwc.settings().request_ttl_ceiling_s, 's', 'the longest a waiting request is kept; the wallet\'s own dial governs within it'),
+    row('NWC', 'relay', '', nwc.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /nwc'),
     row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
     row('Lease', 'dry run', 'LEASE_DRY_RUN', Ls.dry_run, '', 'true = logs would_close, never closes'),
     row('Lease', 'silence before close', 'LEASE_DAYS', Ls.days, 'days', 'per-channel ttl overrides it (lease state)'),
@@ -4812,6 +4830,7 @@ async function consoleSnapshot() {
     },
     channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
     delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
+    nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url },
@@ -5387,6 +5406,7 @@ const server = http.createServer(async (req, res) => {
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
+        nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
       };
       if (HEALTH_DETAIL) base.lnd_version = info.version;
       return jsonResponse(res, base);
@@ -5435,6 +5455,11 @@ const server = http.createServer(async (req, res) => {
   // and deliver carry the route token; void carries the sender's node-key signature. See push.js.
   if (path.startsWith('/push/')) {
     if (await pushRail.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
+  }
+  // 0.86.1 (DP's field test, step 2): the NWC routes dispatch on THEIR OWN prefix — 0.86.0 had this line inside the
+  // /push/ block above, so /v1/nwc/register fell through to the generic 404 ("Not found") and no [NWC] line was logged.
+  if (path.startsWith('/v1/nwc/')) {
+    if (await nwc.handle(req, res, path, method, ip, readBody, jsonResponse)) return;   // /v1/nwc/register | /v1/nwc/unregister
   }
 
   // v0.21: LEASE POLICY is a PUBLIC read (static JSON, zero I/O) — the
@@ -5955,6 +5980,8 @@ const server = http.createServer(async (req, res) => {
       offline_hold:          { enabled: OFFLINE_HOLD_ENABLED, cap_ms: OFFLINE_HOLD_CAP_MS, headroom_blocks: OFFLINE_MIN_HEADROOM_BLOCKS },
       // 0.82.0 (S49): this provider locks and delivers Push Keys — the wallet's Push tab reads the fee terms here
       push_key:              pushRail.capability,
+      // 0.86.0 (S50): NWC — offered here or not (the wallet's Dials → NWC greys when not), the relay's wss address, the ceiling
+      nwc:                   nwc.capability,
       // v0.56.0 (O5 full balance availability): the payer-funds-the-floor
       // prefund and the live reserve policy — a manifest-era shopping fact
       // (Dm3 reserve_policy) advertised at the source. prefund_msat is the
@@ -6931,6 +6958,8 @@ async function main() {
     try { require('child_process').execFile('systemd-notify', ['WATCHDOG=1'], () => {}); } catch (e) {}
   }, 30000);
 
+  nwc.attach(server);   // 0.86.0: the NWC relay rides the API server — an Upgrade at /nwc (refused when NWC_ENABLED is not true)
+  setInterval(() => { try { nwc.sweep(); } catch (e) { console.error(`[NWC] sweep failed: ${e.message}`); } }, 5 * 60 * 1000);
   server.listen(CONFIG.adapter.port, () => {
     console.log(`[Startup] HTTP API listening on port ${CONFIG.adapter.port}`);
     console.log(`[Startup] Health: http://localhost:${CONFIG.adapter.port}/health`);

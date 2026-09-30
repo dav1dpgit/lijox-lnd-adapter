@@ -157,6 +157,34 @@ KIT_MAX_BYTES (65,536) each; the store evicts the oldest untouched record beyond
 touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the LiJ repo's
 docs/black-start-standard.md.
 
+## NWC — the provider's half (0.86+)
+A Nostr app (Nostur, Damus, Primal, Amethyst …) asks the LiJ wallet to pay a zap. The request is a
+NIP-47 event with encrypted content (NIP-44, or the older NIP-04 most apps still send — the
+wallet reads both; the adapter reads neither), addressed to the wallet's per-app service key and
+signed by the app's client key. Nostr relays keep no such events (ephemeral kinds), so a sleeping
+phone would miss them — this adapter keeps them, encrypted as they came, and wakes the phone
+(`{t:"nwc"}`, content-free). LiJ opens, fetches, decrypts and — inside the wallet's own limits —
+pays at once with its own keys (a repeat of a recent payee waits for the user's tap; over the
+limits it refuses), then replies through the same relay. **The adapter never pays, never holds a key
+that reads a request, never sees the invoice, the amount or the payee.**
+
+`NWC_ENABLED=true` turns it on (off by default — an operator's choice; the wallet's Dials → NWC
+greys where a provider does not offer it). `POST /v1/nwc/register` and `/unregister` take the
+route token plus the wallet's node-key signature (LND VerifyMessage on
+`lij-nwc-register:v1|service_pk|client_pk|expires_at|ttl_s|ts`), at most 10 connections per
+wallet, kept in `DATA_DIR/nwc/registry.json`; the adapter drops one at its expiry itself. The
+relay is a websocket at `/nwc` on the API server (the same tunnel): NIP-01 EVENT/REQ/CLOSE +
+NIP-42 AUTH; it accepts 13194 (info) from a registered service key, 23194 (request) to a registered
+service key from that connection's client key (created_at within ±10 min, kept until the earliest
+of the wallet's ttl, the `expiration` tag and `NWC_REQUEST_TTL_CEILING_S`; 20 waiting per
+connection), 23195 (reply) from a registered service key; anything else is refused unstored. A
+request is served only to the NIP-42-authenticated service key it is addressed to; a reply to a
+subscriber naming the client key. Stored events persist in `DATA_DIR/nwc/events.json` — a restart
+drops nothing. Signatures are verified by `schnorr.js`, a vendored BIP-340 implementation gated by
+the BIP's test vectors (`node schnorr.test.js`) — locked; changed only with the operator's word.
+`get_info` and `/health` advertise `nwc`; the console reports the switch, the relay, connections,
+waiting requests and wakes. `node nwc.test.js` runs the relay end to end.
+
 ## The operator console (0.71+)
 
 The adapter serves its own monitor at `/console` on a separate port (`CONSOLE_PORT`, default 7004), bound to loopback and the Tailscale interface only — it has no place on the public tunnel. Login is a six-digit TOTP code and nothing else (`node lij-adapter.js --totp-enroll` prints the secret for `config.env` and the setup key for an authenticator app); a code is accepted once, five wrong codes lock the address for ten minutes, a correct one opens a 12-hour session bound to the caller's address. The page loads nothing from anywhere (CSP `default-src 'none'`, script and style by hash) and the adapter makes no outbound call on its behalf — there is no update check by design.
