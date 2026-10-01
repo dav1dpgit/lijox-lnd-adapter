@@ -122,6 +122,76 @@ Then the real test: in a LiJ wallet, Connections → Switch LSP → pick yoursel
 - **What wallets learn about you**: everything in your registry record, plus your node's chain view when they use your bridge. What you learn about wallets: their node pubkeys, their channel balances, the hashes you hold for them — never a preimage, never a key.
 - **Fees and policy are yours**: `FEE_PPM`, the open-fee knobs and the JIT ladder are the only governors the standard expects. LIJOX has no membership; wallets choose by fees and behaviour.
 
+## 10. Optional: your own block-filter server (and the silent-payment index)
+
+A LiJ wallet finds its on-chain coins by reading block filters (BIP-158) from a block-filter server and matching them on the phone: the server sees which blocks a wallet downloads, never its addresses or keys. A wallet reads its own provider's server when the provider offers one (adapter 0.87+, wallet engine v296+) and the project's server otherwise. Running your own puts that load and that view on your box instead of someone else's. Adding the tweak index lets your wallets receive silent payments (`sp1…` addresses): the index holds one public number per eligible transaction, the wallet does the matching on the phone, and the box learns nothing about who was paid.
+
+You need: `bitcoind` 24 or newer on the same host with `blockfilterindex=1` in `bitcoin.conf` (on first start it builds the filter index — hours on a full chain), Python 3.10+, and for the tweak index `pip install coincurve` (the indexer falls back to plain Python without it — correct, about 100 times slower).
+
+**a. Get the two programs** — from the wallet repository, at a release tag (the newest `page-v…-engine-v…` tag; `page-v888-engine-v295` below is an example):
+
+```
+sudo mkdir -p /opt/lij-filters /var/lib/lij-sp-index && sudo chown $USER /opt/lij-filters /var/lib/lij-sp-index
+cd /opt/lij-filters
+curl -fsSLO https://raw.githubusercontent.com/dav1dpgit/lightninginajar/page-v888-engine-v295/ops/lij-tier2-filters.py
+curl -fsSLO https://raw.githubusercontent.com/dav1dpgit/lightninginajar/page-v888-engine-v295/ops/lij-sp-index.py
+```
+
+Both are standard-library Python (plus coincurve for the indexer), read `bitcoind` over RPC with its cookie, take no per-user query and log no request.
+
+**b. Run them under systemd.** The filter server (`lij-filters.service`):
+
+```
+[Unit]
+Description=LiJ block-filter server
+After=bitcoind.service
+
+[Service]
+User=YOUR_USER
+Environment=BITCOIND_COOKIE_FILE=/home/YOUR_USER/.bitcoin/.cookie
+Environment=LISTEN_ADDR=127.0.0.1:7002
+Environment=SP_DB=/var/lib/lij-sp-index/sp.sqlite
+ExecStart=/usr/bin/python3 /opt/lij-filters/lij-tier2-filters.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The tweak index (`lij-sp-index.service`) — `SP_START_HEIGHT` is the first block it indexes; a recent block is enough to start (wallets scan from the later of the index's start and their own birthday), and a lower value later widens the index downward:
+
+```
+[Unit]
+Description=LiJ silent-payment tweak index
+After=bitcoind.service
+
+[Service]
+User=YOUR_USER
+Environment=BITCOIND_COOKIE_FILE=/home/YOUR_USER/.bitcoin/.cookie
+Environment=SP_DB=/var/lib/lij-sp-index/sp.sqlite
+Environment=SP_START_HEIGHT=960000
+ExecStart=/usr/bin/python3 /opt/lij-filters/lij-sp-index.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo cp lij-filters.service lij-sp-index.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now lij-filters lij-sp-index
+curl -s http://127.0.0.1:7002/tip
+curl -s http://127.0.0.1:7002/sp/info
+```
+
+`/sp/info` answers 404 until the index has its first block, then `{"format":"spcommit-v1",…}`. Without the indexer the filter server still serves filters and blocks; your wallets then read silent payments from the default server.
+
+**c. The front door.** In the tunnel's *Public Hostnames* (§4) add `filters.yourdomain.tld` → `http://localhost:7002`. From anywhere: `curl -s https://filters.yourdomain.tld/tip` must answer. The server answers browsers from `https://lightninginajar.xyz` (`CORS_ORIGIN`); set it to your own origin if you host the wallet yourself.
+
+**d. Offer it.** In `config.env`: `LIJOX_FILTER_URL=https://filters.yourdomain.tld`, then `sudo systemctl restart lijox-adapter`. The journal shows `[Registry] filter server https://filters.yourdomain.tld: answers at block …; serves the silent-payment index`, and your registry record (§8) gains `filter_url` and `filter_sp`. The adapter checks the server at every registration (every `LIJOX_REGISTER_EVERY_HOURS`) and leaves it out of any registration it does not answer — wallets are never pointed at a dead server. Wallets on your node use it from their next sync; their health pane names the server they read.
+
+What the server learns: which blocks a wallet downloads and when (from that, roughly when it has on-chain activity), and its address as Cloudflare passes it on — never an address, a balance or a key.
+
 ## Where the standard's LSP-side obligations are
 
-`/lsps/registry/recover-close` (a wallet back with only its words asks you to force-close its channels — all or nothing while any HTLC is in flight), the LNURL-pay rail at your host (`/.well-known/lnurlp/<name>`), the SCB push, the lease. All in `lij-adapter.js`, each with its version note. The obligations still being decided — holding wallets' sealed state blobs, the reciprocal watchtower, the silent-payment tweak index — are in the LIJOX repository's docs as they are ruled.
+`/lsps/registry/recover-close` (a wallet back with only its words asks you to force-close its channels — all or nothing while any HTLC is in flight), the LNURL-pay rail at your host (`/.well-known/lnurlp/<name>`), the SCB push, the lease. All in `lij-adapter.js`, each with its version note. The block-filter server and the silent-payment tweak index are optional (§10). The obligations still being decided — holding wallets' sealed state blobs, the reciprocal watchtower — are in the LIJOX repository's docs as they are ruled.

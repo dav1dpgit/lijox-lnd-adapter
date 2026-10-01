@@ -315,6 +315,7 @@
  *   CHAIN_BRIDGE_ENABLED=true   (v0.5: set false to disable bridge subsystem only)
  *   PUBLIC_HTTPS_URL=https://lsp.example.com   (REQUIRED: public HTTPS front of the adapter HTTP API)
  *   PUBLIC_WSS_URL=wss://ws.example.com         (REQUIRED: public WSS front of the browser peer proxy)
+ *   LIJOX_FILTER_URL=https://filters.example.com (0.87.0, optional: this box's block-filter server, offered to wallets in the LIJOX record)
  *
  * v0.5 changes (from v0.4):
  *   - New cooperative chain-data bridge subsystem
@@ -801,6 +802,9 @@ const CONFIG = {
   public: {
     https_url: process.env.PUBLIC_HTTPS_URL || '',  // v0.47: REQUIRED (checked at startup)
     wss_url:   process.env.PUBLIC_WSS_URL   || '',  // v0.47: REQUIRED (checked at startup)
+    // 0.87.0 (S52, DP): this box's block-filter server (ops/lij-tier2-filters.py), offered to wallets in the signed
+    // LIJOX record when it answers. Unset = none offered; wallets read the default server.
+    filter_url: String(process.env.LIJOX_FILTER_URL || '').trim().replace(/\/+$/, ''),
   },
   // v0.11: critical peers we must stay connected to for outbound routing.
   // Each entry is "pubkey@host:port". Adapter reconnects any that drop out
@@ -4417,6 +4421,8 @@ function httpsPost(endpoint, body) {
 // public-key recovery and refuses anything else. This function is the
 // VERBATIM twin of canonicalRegisterMsg in lij-worker/src/index.js — any
 // change there changes here in the same release, or registration 403s.
+// 0.87.0 (lij-worker 0.8.0): a record that offers a block-filter server is signed as
+// 'lijox-register:v2:' + the v1 fields + filter_url + filter_sp ('1'/'0'); one without is v1, byte for byte.
 function canonicalRegisterMsg(f) {
   const s = (v) => (v === null || v === undefined) ? '' : String(v);
   const n = (v) => String(Number(v) || 0);
@@ -4426,7 +4432,56 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.filter_url) {
+    return 'lijox-register:v2:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')]).map(encodeURIComponent).join(':');
+  }
   return 'lijox-register:v1:' + fields.map(encodeURIComponent).join(':');
+}
+
+// 0.87.0: the address rule — the registry's cleanFilterUrl and the wallet engine's clean_filter_base (v296).
+const FILTER_URL_RE = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
+function filterUrlOk(t) { return !!t && t.length <= 200 && !t.endsWith('/') && FILTER_URL_RE.test(t); }
+
+// 0.87.0: GET a URL, answer { status, json } (json null when the body is not JSON). 10 s limit.
+function httpsGetJson(endpoint) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const req = https.get(endpoint, { timeout: 10000, headers: { 'Accept': 'application/json' } }, (res) => {
+        let data = '';
+        res.on('data', (c) => { data += c; if (data.length > 65536) req.destroy(); });
+        res.on('end', () => { let j = null; try { j = JSON.parse(data); } catch (_) {} finish({ status: res.statusCode, json: j }); });
+        res.on('error', (e) => finish({ status: 0, json: null, error: e.message }));
+      });
+      req.on('timeout', () => { req.destroy(new Error('no answer in 10 s')); });
+      req.on('error', (e) => finish({ status: 0, json: null, error: e.message }));
+    } catch (e) { finish({ status: 0, json: null, error: e.message }); }
+  });
+}
+
+// 0.87.0: this box's filter server as last checked — the registration, /health and the console read it.
+const filterStatus = { url: CONFIG.public.filter_url, ok: false, sp: false, checked_ms: 0, note: CONFIG.public.filter_url ? 'not checked yet' : 'none configured' };
+async function checkFilterServer() {
+  const u = CONFIG.public.filter_url;
+  filterStatus.url = u; filterStatus.checked_ms = Date.now();
+  if (!u) { filterStatus.ok = false; filterStatus.sp = false; filterStatus.note = 'none configured'; return filterStatus; }
+  if (!filterUrlOk(u)) {
+    filterStatus.ok = false; filterStatus.sp = false;
+    filterStatus.note = 'LIJOX_FILTER_URL is not a plain https:// address (a host, an optional :port and path, 200 characters at most) — not offered';
+    return filterStatus;
+  }
+  const tip = await httpsGetJson(u + '/tip');
+  if (tip.status !== 200 || !tip.json || !(Number(tip.json.height) > 0)) {
+    filterStatus.ok = false; filterStatus.sp = false;
+    filterStatus.note = 'the filter server did not answer /tip (' + (tip.error || ('HTTP ' + tip.status)) + ') — not offered in this registration';
+    return filterStatus;
+  }
+  const info = await httpsGetJson(u + '/sp/info');
+  filterStatus.ok = true;
+  filterStatus.sp = info.status === 200 && !!info.json && info.json.format === 'spcommit-v1';
+  filterStatus.note = 'answers at block ' + Number(tip.json.height) + (filterStatus.sp ? '; serves the silent-payment index' : '; no silent-payment index');
+  return filterStatus;
 }
 
 // 0.71.0: verbatim twin of the worker's canonicalUnregisterMsg (lij-worker/src/index.js).
@@ -4497,6 +4552,12 @@ async function registerWithRegistry() {
       supports_jit:   true,
       ts:             Math.floor(Date.now() / 1000),
     };
+    // 0.87.0 (S52, DP): offer this box's block-filter server when it answers (lijox-register:v2)
+    if (CONFIG.public.filter_url) {
+      await checkFilterServer();
+      console.log('[Registry] filter server ' + CONFIG.public.filter_url + ': ' + filterStatus.note);
+      if (filterStatus.ok) { body.filter_url = CONFIG.public.filter_url; body.filter_sp = filterStatus.sp; }
+    }
     const canonical = canonicalRegisterMsg(body);
     const signed = await lndPost('/v1/signmessage', {
       msg: Buffer.from(canonical, 'utf8').toString('base64'),
@@ -4605,6 +4666,7 @@ function settingsReport() {
     row('Registry', 're-register every', 'LIJOX_REGISTER_EVERY_HOURS', registryStatus.every_h, 'h', 'the registry marks a record stale after 24 h without one'),
     row('Registry', 'advertised name', 'NODE_NAME', N.name, '', ''),
     row('Registry', 'advertised host', 'NODE_HOST', N.host, '', 'Tor or clearnet URI for peers'),
+    row('Registry', 'filter server', 'LIJOX_FILTER_URL', CONFIG.public.filter_url || '(none — wallets read the default)', '', filterStatus.note),   // 0.87.0
     row('Front doors', 'API port', 'ADAPTER_PORT', CONFIG.adapter.port, '', ''),
     row('Front doors', 'WS proxy port', 'WS_PROXY_PORT', CONFIG.adapter.ws_port, '', ''),
     row('Front doors', 'public HTTPS', 'PUBLIC_HTTPS_URL', CONFIG.public.https_url, '', ''),
@@ -4833,7 +4895,7 @@ async function consoleSnapshot() {
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
-    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url },
+    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus) },   // 0.87.0: the filter server as last checked
     backups, loops, watchdog: !!process.env.NOTIFY_SOCKET, uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
   };
 }
@@ -5407,6 +5469,7 @@ const server = http.createServer(async (req, res) => {
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
         nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
+        filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it
       };
       if (HEALTH_DETAIL) base.lnd_version = info.version;
       return jsonResponse(res, base);

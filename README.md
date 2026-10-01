@@ -185,6 +185,19 @@ the BIP's test vectors (`node schnorr.test.js`) — locked; changed only with th
 `get_info` and `/health` advertise `nwc`; the console reports the switch, the relay, connections,
 waiting requests and wakes. `node nwc.test.js` runs the relay end to end.
 
+## Your own block-filter server (0.87+)
+
+A provider may offer its wallets its own block-filter server — the server a Lightning in a Jar wallet reads to
+find its on-chain coins privately (BIP-158 filters: the server sees which blocks a wallet downloads, never its
+addresses) and, when it carries the tweak index, its silent payments. Set `LIJOX_FILTER_URL` to the server's
+public https address (`docs/adapter-standalone-setup.md` §10 sets up the server and the index). At every
+registration the adapter asks the server for `/tip` (it must answer) and `/sp/info` (`spcommit-v1` = it serves the
+silent-payment index), and only then puts `filter_url` and `filter_sp` into the signed LIJOX record
+(`lijox-register:v2`; registry 0.8.0+). A server that does not answer is left out of that registration with a
+plain sentence in the journal — wallets are never pointed at a dead server. Unset = nothing offered; the record is
+v1 as before and wallets read the default server. `/health` carries `filter_server`; the console shows it.
+`node registry-filter.test.js` checks the record and the check.
+
 ## The operator console (0.71+)
 
 The adapter serves its own monitor at `/console` on a separate port (`CONSOLE_PORT`, default 7004), bound to loopback and the Tailscale interface only — it has no place on the public tunnel. Login is a six-digit TOTP code and nothing else (`node lij-adapter.js --totp-enroll` prints the secret for `config.env` and the setup key for an authenticator app); a code is accepted once, five wrong codes lock the address for ten minutes, a correct one opens a 12-hour session bound to the caller's address. The page loads nothing from anywhere (CSP `default-src 'none'`, script and style by hash) and the adapter makes no outbound call on its behalf — there is no update check by design.
