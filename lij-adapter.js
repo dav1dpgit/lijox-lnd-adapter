@@ -543,7 +543,7 @@ const pushRail = createPushRail({
   dataDir: DATA_DIR,
   lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
   deliverToWallet: (args) => deliverToWallet(args), isPeerConnected: (pk) => isPeerConnected(pk),
-  sendWakePush: (pk) => sendWakePush(pk), authOk: (req) => authOk(req),
+  sendWakePush: (pk, ms) => sendWakePush(pk, ms), authOk: (req) => authOk(req),   // 0.88.1: the claim window travels
   buildPublicHints: (amt) => lnurlpBuildPublicHints(amt),
   plRecord: (k, f) => plRecord(k, f), leaseTouch: (pk, s) => leaseTouch(pk, s), touchWalletActive: (pk) => touchWalletActive(pk),
   localPubkey: () => LOCAL_PUBKEY, log: (m) => console.log(m),
@@ -1819,7 +1819,7 @@ function lnurlpWatch(name, entry) {
         lnurlpPersist();
         const rec = lnurlpRegistry[name];
         console.log(`[LNURLP] ${name}: payment ACCEPTED (${entry.amount_msat} msat held) hash=${entry.hash.slice(0,16)}… — waking wallet`);
-        if (rec) sendWakePush(rec.client_pubkey, lnurlpHoldMs(rec.client_pubkey)).catch(() => {});  /* 0.75.2: the wallet's dial, one truth */
+        if (rec) { const _lh = lnurlpHoldMs(rec.client_pubkey); if (_lh > 0) sendWakePush(rec.client_pubkey, _lh).catch(() => {}); }  /* 0.75.2: the wallet's dial, one truth · 0.88.1: Off = returned at once, no wake */
         lnurlpArmHoldTimer(name, entry);   /* 0.75.2: the hold ENDS at the dial (it used to run to LND's CLTV cancel) */
         lnurlpDeliver(name, entry).catch((e) => console.error(`[LNURLP] deliver error: ${e.message}`));
       } else if (state === 'ACCEPTED' && entry.status === 'accepted') {
@@ -1869,6 +1869,7 @@ setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PU
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
 async function sendWakePush(pubkeyHex, holdMsOverride, kind) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting"
+  const _wakeT0 = Date.now();   // 0.88.1: the hold's end is counted from here (the caller has just armed it)
   if (!PUSH_ENABLED) return;
   const key = (pubkeyHex || '').toLowerCase();
   // 0.76.0 (S46, DP ruled "B"): NO WAKE FOR A WALLET THAT IS LIVE RIGHT NOW. The push exists
@@ -1906,10 +1907,16 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind) {   // 0.86.0: `kin
     // (the 70-min watch constant), not the regular rail's clientHoldCapMs;
     // a wallet dialed to 3 min was being told 3 min about a payment the
     // LNURLp rail holds for over an hour.
-    const holdMs = (typeof holdMsOverride === 'number' && holdMsOverride > 0) ? holdMsOverride : clientHoldCapMs(key);
-    const holdS = Math.max(1, Math.round(holdMs / 1000));
-    await webpush.sendNotification(sub, JSON.stringify({ t: kind || 'wake', hold_s: holdS }), { TTL: Math.max(60, holdS) });   // 0.86.0: t = 'nwc' for an NWC request
-    console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (hold_s=${holdS})`);
+    // 0.88.1 (S54, DP 11:17): the wake states the window ACTUALLY held — the caller passes it (the watchdog's own
+    // number, the claim window, the Lightning-address hold, the delegate hold) — or no window at all (a resume with
+    // nothing held; an NWC request). The dial fallback is gone: the dial is not what a payment is held for.
+    // hold_s is rounded DOWN (never more than is held); until_ms is when the hold ends, from the call's start.
+    const holdMs = (typeof holdMsOverride === 'number' && Number.isFinite(holdMsOverride) && holdMsOverride > 0) ? holdMsOverride : 0;
+    const msg = { t: kind || 'wake' };
+    if (holdMs > 0) { msg.hold_s = Math.max(1, Math.floor(holdMs / 1000)); msg.until_ms = _wakeT0 + holdMs; }
+    const ttlS = Math.max(60, Math.round((holdMs > 0 ? holdMs : clientHoldCapMs(key)) / 1000));   // the push service keeps it as long as before
+    await webpush.sendNotification(sub, JSON.stringify(msg), { TTL: ttlS });   // 0.86.0: t = 'nwc' for an NWC request
+    console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (${msg.hold_s ? 'hold_s=' + msg.hold_s : 'no hold stated'})`);
   } catch (e) {
     const status = e && e.statusCode;
     console.error(`[PUSH] wake send failed for ${key.slice(0,16)}…: ${e.message} (status=${status})`);
@@ -2309,7 +2316,7 @@ async function handleInterceptedHtlc(req) {
           }
           if (c.active) {
             console.log(`[DECIDE] ${_dtHash} fwd scid=${outgoingScidDecimal} in=${req.incoming_amount_msat}msat -> RESUME (channel ACTIVE per LND; wallet ${c.remote_pubkey.slice(0,16)}...; a half-open tunnel keeps this true until LND ping-timeout)`);
-            sendWakePush(c.remote_pubkey).catch(() => {});  /* v0.41.0: notify-on-uncertain-resume */
+            sendWakePush(c.remote_pubkey, null).catch(() => {});  /* v0.41.0: notify-on-uncertain-resume · 0.88.1: nothing is held here — no time stated */
             return RESUME;
           }
           // 0.79.2 (S49, UM890 journal 2026-09-24 00:09:48): the "channel inactive but peer LISTED — RESUME"
@@ -2352,8 +2359,8 @@ async function handleInterceptedHtlc(req) {
           });
           offlineHtlcsHeld += 1;
           if (_b18fwdFirst) {
-            scheduleHtlcWatchdog(pHash, fwdAutoFail, clientHoldCapMs(c.remote_pubkey));  /* v0.54.5: per-client */
-            sendWakePush(c.remote_pubkey).catch(() => {});
+            const _holdMs = scheduleHtlcWatchdog(pHash, fwdAutoFail, clientHoldCapMs(c.remote_pubkey));  /* v0.54.5: per-client */
+            sendWakePush(c.remote_pubkey, _holdMs).catch(() => {});   /* 0.88.1: the window actually held */
           }
           return null;  // HOLD -- reconnect-poll RESUMEs it
         } catch (e) {
@@ -2555,8 +2562,8 @@ async function handleInterceptedHtlc(req) {
       });
       offlineHtlcsHeld += 1;
       if (_b18first) {
-        scheduleHtlcWatchdog(paymentHashHex, autoFail, jitHoldCap);  /* v0.54.5: per-client */
-        sendWakePush(promise.client_pubkey).catch(() => {});  // best-effort wake
+        const _holdMs = scheduleHtlcWatchdog(paymentHashHex, autoFail, jitHoldCap);  /* v0.54.5: per-client */
+        sendWakePush(promise.client_pubkey, _holdMs).catch(() => {});  // best-effort wake · 0.88.1: the window actually held
       }
       return null;  // HOLD — wrapper writes nothing; reconnect-poll replays it
     }
@@ -2611,8 +2618,8 @@ async function handleInterceptedHtlc(req) {
       });
       offlineHtlcsHeld += 1;
       if (_dFirst) {
-        scheduleHtlcWatchdog(paymentHashHex, _dAutoFail, _dCap);  /* v0.54.5: per-client */
-        sendWakePush(promise.client_pubkey).catch(() => {});
+        const _holdMs = scheduleHtlcWatchdog(paymentHashHex, _dAutoFail, _dCap);  /* v0.54.5: per-client */
+        sendWakePush(promise.client_pubkey, _holdMs).catch(() => {});   /* 0.88.1: the window actually held */
       }
       return null;  // HOLD — reconnect-poll replays it
     }
@@ -2791,6 +2798,7 @@ function scheduleHtlcWatchdog(paymentHashHex, autoFailHeight, capMs) {
   htlcWatchdogs.set(paymentHashHex, handle);
   console.log(`[LSPS2] watchdog scheduled for ${paymentHashHex.slice(0,16)}…: fires in ~${Math.round(msUntilDeadline/60000)} min${(Number.isFinite(capMs) && capMs > 0 && capMs !== OFFLINE_HOLD_CAP_MS) ? ' (client hold choice)' : ''}`);
   try { SM.emit('watchdog_scheduled', { hash: paymentHashHex, in_ms: msUntilDeadline }); } catch (_) {}
+  return msUntilDeadline;   // 0.88.1: the window actually held — the wake states this number
 }
 
 // v0.18: cancel a watchdog (called when the HTLC is settled or otherwise
@@ -3005,8 +3013,8 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
     }
     offlineHtlcsHeld += varParts.length;
     if (varFirstHold) {
-      scheduleHtlcWatchdog(paymentHashHex, holdAutoFail, clientHoldCapMs(promise.client_pubkey));  /* v0.54.5: per-client */
-      sendWakePush(promise.client_pubkey).catch(() => {});
+      const _holdMs = scheduleHtlcWatchdog(paymentHashHex, holdAutoFail, clientHoldCapMs(promise.client_pubkey));  /* v0.54.5: per-client */
+      sendWakePush(promise.client_pubkey, _holdMs).catch(() => {});   /* 0.88.1: the window actually held */
     }
     promise._shards = null; promise._shard_sum_msat = 0n; promise._var_flushing = false;
     return;
@@ -3225,8 +3233,8 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
         });
         offlineHtlcsHeld += 1;
         if (_b18b13First) {
-          scheduleHtlcWatchdog(paymentHashHex, autoFail, clientHoldCapMs(promise.client_pubkey));  /* v0.54.5: per-client */
-          sendWakePush(promise.client_pubkey).catch(() => {});
+          const _holdMs = scheduleHtlcWatchdog(paymentHashHex, autoFail, clientHoldCapMs(promise.client_pubkey));  /* v0.54.5: per-client */
+          sendWakePush(promise.client_pubkey, _holdMs).catch(() => {});   /* 0.88.1: the window actually held */
         }
         return null;  // HOLD — reconnect-poll replays through openChannelAndForward
       }

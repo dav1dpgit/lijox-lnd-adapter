@@ -251,8 +251,8 @@ function createPushRail(deps) {
         if (state === 'ACCEPTED' && rec.status === 'reserved') {
           rec.status = 'accepted'; rec.accepted_at = now(); persist();
           log(`[PUSH-KEY] claim ${short(hash)}: the holder's payment ACCEPTED (${inv.amt_paid_msat || rec.amount_msat} msat) — delivering to ${rec.client_pubkey.slice(0, 16)}…`);
-          try { sendWakePush(rec.client_pubkey).catch(() => {}); } catch (_) {}
           if (!expiryTimers.has('in:' + hash)) expiryTimers.set('in:' + hash, timers.set(() => { expiryTimers.delete('in:' + hash); const r = reg.in[hash]; if (r && r.status === 'accepted') cancelIn(r, 'claim window over — the wallet did not take it', 'claim_window_over').catch(() => {}); }, CLAIM_HOLD_MS));
+          try { Promise.resolve(sendWakePush(rec.client_pubkey, CLAIM_HOLD_MS)).catch(() => {}); } catch (_) {}   // 0.88.1: the wake states the claim window (it was the wallet's dial)
           deliverIn(rec).catch((e) => log(`[PUSH-KEY] claim deliver error: ${e.message}`));
         } else if (state === 'ACCEPTED' && rec.status === 'accepted') {
           deliverIn(rec).catch((e) => log(`[PUSH-KEY] claim deliver error: ${e.message}`));

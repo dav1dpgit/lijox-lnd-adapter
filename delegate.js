@@ -1,4 +1,4 @@
-// delegate.js — DELEGATE PAYMENT for LiJ/LIJOX (the LSP half). v0.2.4
+// delegate.js — DELEGATE PAYMENT for LiJ/LIJOX (the LSP half). v0.2.4 · adapter 0.88.0 (the janitor by hash; rounding)
 // PREPAY: the issuer funds the slip before it goes LIVE, so the LSP is
 // never owed anything and never has to trust an issuer. Whatever is not
 // spent is owed BACK to the issuer at close. This is custody with the
@@ -100,6 +100,9 @@ function dailySpentMsat() {
     for (const p of (r.payments || [])) {
       if (p.ts >= cutoff) sum += (p.amount_msat + (p.fee_msat || 0));
     }
+    // 0.88.0 (S54): a spend in flight or held is money that may already be gone — the breaker counts it
+    if (r.state === 'IN_FLIGHT' && r.inflight) sum += Number(r.inflight.amount_msat || 0);
+    if (r.state === 'HELD' && r.hold) sum += Number(r.hold.amount_msat || 0);
   }
   return sum;
 }
@@ -130,6 +133,8 @@ function voidDigest(nonce) {
 
 // ── helpers ───────────────────────────────────────────────────────────
 function nowS() { return Math.floor(Date.now() / 1000); }
+// 0.88.0 (S54): the ledger charges whole sats (v0.2.4) — the cap check reserves whole sats too
+function ceilSat(msat) { return Math.ceil(Number(msat) / 1000) * 1000; }
 function j(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, { 'content-type': 'application/json' });
@@ -334,7 +339,7 @@ async function epSpend(req, res, lndRequest) {
     if (bill.amount_msat > rec.slip.per_pay_cap_msat) {
       return j(res, 400, { ok: false, code: 'OVER_PER_PAY', per_pay_cap_msat: rec.slip.per_pay_cap_msat });
     }
-    if (rec.spent_msat + bill.amount_msat + feeLimit > rec.slip.cap_msat) {
+    if (rec.spent_msat + ceilSat(bill.amount_msat + feeLimit) > rec.slip.cap_msat) {   // 0.88.0: whole sats, as the charge
       return j(res, 400, { ok: false, code: 'OVER_CAP', remaining_msat: Math.max(0, rec.slip.cap_msat - rec.spent_msat), fee_reserve_msat: feeLimit });
     }
     if (rec.count_used >= rec.slip.count) return j(res, 410, { ok: false, code: 'COUNT_EXHAUSTED' });
@@ -367,7 +372,7 @@ async function epSpend(req, res, lndRequest) {
     // janitor precondition: the hash must be durable BEFORE the RPC, or a
     // crash mid-payment leaves a wedge nothing can reconcile.
     rec.inflight = { payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat,
-      payee: payeeName, ts: Date.now(), bolt11: bill.bolt11 };
+      payee: payeeName, ts: Date.now(), since_ms: Date.now(), bolt11: bill.bolt11 };   // 0.88.0: since_ms — the janitor's walk stops before it
     rec.state = 'IN_FLIGHT'; recPut(nonce, rec); // persist BEFORE pay
     let pay;
     try {
@@ -614,7 +619,7 @@ async function holdTick(nowOverrideMs) {   // nowOverrideMs: tests only
 // resolver settles or reverts it with the same bookkeeping as any spend.
 function holdToInflight(nonce, rec, why) {
   const h = rec.hold;
-  rec.inflight = { payment_hash: h.payment_hash, amount_msat: Number(h.amount_msat), payee: h.payee || '', ts: Date.now(), bolt11: h.bolt11 };
+  rec.inflight = { payment_hash: h.payment_hash, amount_msat: Number(h.amount_msat), payee: h.payee || '', ts: Date.now(), since_ms: Number(h.held_since_ms) || 0, bolt11: h.bolt11 };   // 0.88.0: the delivery's LND payment began after the hold did
   rec.state = 'IN_FLIGHT';
   rec.last_bill = { bolt11: h.bolt11, payment_hash: h.payment_hash, amount_msat: Number(h.amount_msat), state: 'IN_FLIGHT', updated_ms: Date.now() };
   delete rec.hold;
@@ -784,6 +789,47 @@ function claimsDigest(pk, ts) {
   return 'LIJOX-delegate-claims-v1\nissuer_pubkey=' + pk + '\nts=' + ts;
 }
 
+// 0.88.0 (S54, DP GO): ONE payment's fate, by its hash. Walks LND's payment list backwards (ListPayments, reversed,
+// include_incomplete) page by page until the hash is found or every payment from sinceS on has been seen.
+//   { found: <payment> }  — LND has it (read .status)
+//   { absent: true }      — the complete walk: LND made no payment with this hash since sinceS
+//   { unknown: why }      — an error, an unreadable page or the page ceiling: decide nothing
+// sinceS = 0 walks the whole list. creation_date_start lets an LND that knows it (0.18+) filter on its side; the walk
+// stops on the entries' own dates either way, so an LND that ignores it is read correctly.
+const LOOKUP_PAGE = 500, LOOKUP_MAX_PAGES = 200;
+async function lookupPaymentByHash(lndRequest, hashHex, sinceS) {
+  const want = String(hashHex || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(want)) return { unknown: 'no payment hash' };
+  const since = Math.max(0, Math.floor(Number(sinceS) || 0));
+  let offset = '0';
+  for (let page = 0; page < LOOKUP_MAX_PAGES; page++) {
+    let r;
+    try {
+      r = await lndRequest('GET', '/v1/payments?include_incomplete=true&reversed=true&max_payments=' + LOOKUP_PAGE
+        + '&index_offset=' + offset + (since > 0 ? '&creation_date_start=' + since : ''), null);
+    } catch (e) { return { unknown: 'ListPayments: ' + String((e && e.message) || e).slice(0, 120) }; }
+    if (!r || typeof r !== 'object' || r.code !== undefined || r.message || r.error) {
+      return { unknown: 'ListPayments answered ' + String((r && (r.message || r.error)) || 'nothing').slice(0, 120) };
+    }
+    const list = r.payments === undefined ? [] : r.payments;
+    if (!Array.isArray(list)) return { unknown: 'ListPayments: no payment list' };
+    let oldest = Infinity;
+    for (const p of list) {
+      if (String(p.payment_hash || '').toLowerCase() === want) return { found: p };
+      const cd = Number(p.creation_date || 0);
+      if (cd > 0 && cd < oldest) oldest = cd;
+    }
+    if (list.length < LOOKUP_PAGE) return { absent: true };          // the list's start reached
+    if (since > 0 && oldest < since) return { absent: true };        // walked past the moment the spend began
+    const next = String(r.first_index_offset || '');
+    if (!/^[0-9]+$/.test(next) || next === '0' || next === offset) return { unknown: 'ListPayments: no page offset' };
+    offset = next;
+  }
+  return { unknown: 'page ceiling (' + (LOOKUP_PAGE * LOOKUP_MAX_PAGES) + ' payments) reached' };
+}
+const WEDGE_MIN_AGE_MS = 45000;   // the spend's own pay call (12 s LND clock, 30 s backstop) may still own a younger wedge
+const LOOKUP_MARGIN_S = 600;
+
 // janitor v1.1 — the restart survivor. A crash between "persist IN_FLIGHT"
 // and "payment resolved" leaves a slip wedged: void refuses (409) and the
 // cap stays consumed while LND alone knows what really happened. The sweep
@@ -809,22 +855,28 @@ async function janitorSweep(lndRequest) {
       }
     }
 
+    // 0.88.0 (S54, DP GO): each wedge is resolved BY ITS OWN HASH (lookupPaymentByHash), under its chit's lock, once it
+    // is old enough that its own pay call no longer owns it. Until 0.88.0 one read of LND's last 200 payments decided
+    // every wedge, and "not among them" freed the chit — a payment pushed past 200 newer ones was paid again.
     const wedged = nonces.filter((n) => store[n] && store[n].state === 'IN_FLIGHT');
-    if (wedged.length) {
-      let byHash = null;
-      try {
-        const list = await lndRequest('GET', '/v1/payments?include_incomplete=true&reversed=true&max_payments=200', null);
-        byHash = {};
-        for (const p of ((list && list.payments) || [])) {
-          byHash[String(p.payment_hash || '').toLowerCase()] = p;
-        }
-      } catch (e) { byHash = null; } // LND unreachable: leave every wedge alone
-      if (byHash) {
-        for (const n of wedged) {
+    for (const n of wedged) {
+      await withNonceLock(n, async () => {
           const rec = store[n];
+          if (!rec || rec.state !== 'IN_FLIGHT') return;   // changed while waiting for the lock
           const f = rec.inflight || null;
-          const h = f ? String(f.payment_hash || '').toLowerCase() : '';
-          const p = h ? byHash[h] : null;
+          if (f && Date.now() - Number(f.ts || 0) < WEDGE_MIN_AGE_MS) return;
+          let h = f ? String(f.payment_hash || '').toLowerCase() : '';
+          if (!/^[0-9a-f]{64}$/.test(h) && f && f.bolt11) {   // a spend recorded without its hash: read it from the bill
+            try { const dec = await lndRequest('GET', '/v1/payreq/' + encodeURIComponent(f.bolt11), null); h = String((dec && dec.payment_hash) || '').toLowerCase(); } catch (e) {}
+            if (/^[0-9a-f]{64}$/.test(h)) { f.payment_hash = h; recPut(n, rec); }
+          }
+          if (!/^[0-9a-f]{64}$/.test(h)) { console.log('[delegate] JANITOR cannot resolve nonce=' + n.slice(0, 12) + '… — no payment hash; left IN_FLIGHT'); return; }
+          // the walk stops before the spend began (a held delivery: before the hold began); a record from before 0.88.0
+          // carries no since_ms and walks the whole list
+          const sinceS = (f && f.since_ms !== undefined) ? Math.floor(Number(f.since_ms) / 1000) - LOOKUP_MARGIN_S : 0;
+          const look = await lookupPaymentByHash(lndRequest, h, sinceS);
+          if (look.unknown) { console.log('[delegate] JANITOR left nonce=' + n.slice(0, 12) + '… IN_FLIGHT — ' + look.unknown); return; }
+          const p = look.found || null;
           if (p && p.status === 'SUCCEEDED') {
             const feeMsat = Number(p.fee_msat || 0);
             const amt = Number((f && f.amount_msat) || p.value_msat || 0);
@@ -846,14 +898,13 @@ async function janitorSweep(lndRequest) {
             rec.last_bill = { bolt11: (f && f.bolt11) || (rec.last_bill && rec.last_bill.payment_hash === h ? rec.last_bill.bolt11 : ''), payment_hash: h, amount_msat: Number((f && f.amount_msat) || 0), state: 'FAILED', error: String(p.failure_reason || 'FAILED'), updated_ms: Date.now() };   // 0.78.0
             delete rec.inflight; recPut(n, rec);
             console.log('[delegate] JANITOR reconciled FAILED nonce=' + n.slice(0, 12) + '… → LIVE');
-          } else if (!p) {
-            // LND has no record: the pay RPC never landed (crash before the
-            // call). Nothing was spent — free the slip.
+          } else if (look.absent) {
+            // 0.88.0: the complete walk found no payment with this hash since the spend began — the pay call never
+            // reached LND (a crash before it). Nothing was spent — free the slip.
             rec.state = 'LIVE'; delete rec.inflight; recPut(n, rec);
-            console.log('[delegate] JANITOR unwedged (no LND record) nonce=' + n.slice(0, 12) + '… → LIVE');
+            console.log('[delegate] JANITOR unwedged (no LND payment with this hash) nonce=' + n.slice(0, 12) + '… → LIVE');
           } // still IN_FLIGHT at LND: leave it, next sweep decides
-        }
-      }
+      });
     }
 
     // OWED → PAID: the issuer paying the claim invoice IS the acknowledgement.
@@ -986,4 +1037,4 @@ function report() {
   };
 }
 
-module.exports = { handle, report, setHooks, holdLoopArm, _test: { slipDigest, voidDigest, CFG, resolveBill, holdTick } };
+module.exports = { handle, report, setHooks, holdLoopArm, _test: { slipDigest, voidDigest, CFG, resolveBill, holdTick, janitorSweep, lookupPaymentByHash, ceilSat, dailySpentMsat, storeLoad, recPut } };   // 0.88.0: the janitor's parts for delegate-janitor.test.js
