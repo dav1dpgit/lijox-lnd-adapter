@@ -106,7 +106,10 @@
  *     - reservation_expires_at enforces hard cutoff
  *
  *   CONFIG additions (env overrides in parentheses):
- *     channel_buffer_sats           default 50_000 (LSPS2_CHANNEL_BUFFER_SATS)
+ *     0.90.0 THE JIT GRANT (computeChannelSizeSats): channel = payment + granted;
+ *       granted = base + bonus% of the payment above bonus-from, at most the ceiling, never below base
+ *       JIT_GRANT_BASE_SATS 25_000 · JIT_GRANT_BONUS_PCT 50 · JIT_GRANT_BONUS_FROM_SATS 25_000 · JIT_GRANT_CEILING_SATS 62_500
+ *     0.90.0 THE OPEN FEE LADDER (channelOpenFeeMsat): JIT_FEE_LADDER_SATS 100,400,1000,2000,3000,5000,10000,15000
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -724,6 +727,14 @@ function openFeeMinMsatFromEnv() {
 if (process.env.LSPS2_CHANNEL_OPEN_FEE_SATS !== undefined) {
   console.warn('[Config] LSPS2_CHANNEL_OPEN_FEE_SATS is IGNORED since 0.69.0 — the opening fee on every rail is max(CHANNEL_OPEN_FEE_MIN_SATS, CHANNEL_OPEN_FEE_PPM × amount); delete the line');
 }
+// 0.90.0 (S54, DP 2026-10-04 10:19): settings no longer read — named at boot so a stale line cannot pass for a live one.
+const RETIRED_0900 = {
+  JIT_FEE_FREE_OPENS: 'the open fee ladder JIT_FEE_LADDER_SATS', JIT_FEE_STEP_PCT: 'the open fee ladder JIT_FEE_LADDER_SATS',
+  LSPS2_CHANNEL_BUFFER_SATS: 'the JIT grant JIT_GRANT_BASE_SATS / _BONUS_PCT / _BONUS_FROM_SATS / _CEILING_SATS',
+  LSPS2_CHANNEL_ROOM_PCT: 'the JIT grant JIT_GRANT_BASE_SATS / _BONUS_PCT / _BONUS_FROM_SATS / _CEILING_SATS',
+};
+const RETIRED_0900_SET = Object.keys(RETIRED_0900).filter((n) => process.env[n] !== undefined && String(process.env[n]).trim() !== '');
+for (const n of RETIRED_0900_SET) console.warn(`[Config] ${n} is IGNORED since 0.90.0 — replaced by ${RETIRED_0900[n]}; comment the line out`);
 const CONFIG = {
   lnd: {
     endpoint:      process.env.LND_ENDPOINT  || 'https://localhost:8080',
@@ -838,8 +849,7 @@ const CONFIG = {
     variable_ceiling_msat:        parseInt(process.env.LSPS2_VAR_CEILING_MSAT   || process.env.LSPS2_MAX_PAYMENT_SIZE_MSAT || '1000000000', 10),  // sizing cap
     // v0.32.0 (S30, DP designs 26 Jul): LSP self-protection knobs.
     jit_min_onchain_reserve_sats: parseInt(process.env.JIT_MIN_ONCHAIN_RESERVE_SATS || '2000000', 10),  // no JIT open below this confirmed on-chain floor
-    jit_fee_free_opens:           parseInt(process.env.JIT_FEE_FREE_OPENS           || '5',       10),  // opens 1..N at base terms
-    jit_fee_step_pct:             parseInt(process.env.JIT_FEE_STEP_PCT             || '50',      10),  // each open past N adds +pct of the whole base fee
+    // 0.90.0: the per-wallet escalator is the open fee ladder (JIT_FEE_LADDER_SATS, read beside jitInWindow)
     // v0.33.0 (S30, DP ratified): SCARCITY curve — identity-free, Sybil-proof,
     // honest-globally. Base terms while headroom ≥ ramp_start; linear to
     // max_pct at zero headroom; the reserve gate refuses below the floor.
@@ -876,7 +886,11 @@ const CONFIG = {
     interceptor_enabled: (process.env.LSPS2_INTERCEPTOR_ENABLED || 'true').toLowerCase() !== 'false',
 
     // v0.18 Phase D.2: channel-open + trampoline parameters.
-    channel_buffer_sats:        parseInt(process.env.LSPS2_CHANNEL_BUFFER_SATS    || '50000', 10),
+    // 0.90.0 (S54, DP 2026-10-04 09:53): THE JIT GRANT — the inbound room a JIT open gives (computeChannelSizeSats).
+    jit_grant_base_sats:        parseInt(process.env.JIT_GRANT_BASE_SATS          || '25000', 10),   // every JIT gets this
+    jit_grant_bonus_pct:        parseInt(process.env.JIT_GRANT_BONUS_PCT          || '50',    10),   // + this % (rounded down) …
+    jit_grant_bonus_from_sats:  parseInt(process.env.JIT_GRANT_BONUS_FROM_SATS    || '25000', 10),   // … of the payment above this
+    jit_grant_ceiling_sats:     parseInt(process.env.JIT_GRANT_CEILING_SATS       || '62500', 10),   // granted never exceeds this
     reservation_validity_hours: parseInt(process.env.LSPS2_RESERVATION_HOURS      || '24',    10),
     htlc_safety_blocks:         parseInt(process.env.LSPS2_HTLC_SAFETY_BLOCKS     || '10',    10),
     // B-11: MPP aggregation -- shards accumulate under the promise until the
@@ -1374,7 +1388,7 @@ function lnurlpMintLimited(ip) {
 function lnurlpMinMsat(chan, clientPubkey) {
   return (chan && chan.room_msat > 1000n)   // 0.84.0: room, not balance
     ? 1000
-    : (Math.ceil(CONFIG.lsps2.open_fee_min_msat * jitFeeMultPct(clientPubkey) * scarcityMultPct() / 10000) + 1000000);   // v0.32.0×v0.33.0: quote and charge agree
+    : (Number(channelOpenFeeMsat(0, clientPubkey)) + 1000000);   // 0.90.0: this wallet's ladder step × scarcity — quote and charge agree
 }
 
 // ── JIT self-protection — v0.32.0 (S30, DP designs 26 Jul) ───────────
@@ -1419,14 +1433,23 @@ function jitRecordOpen(pubkey) {
   console.log(`[JIT] open recorded for ${k.slice(0, 16)}… (${jitOpenCounters[k].opens.length} in ${Math.round(JIT_WINDOW_MS / 86400000)}d window)`);
   return jitOpenCounters[k].opens.length;
 }
-// Multiplier in percent for the UPCOMING (n+1-th) open of this wallet —
-// n is now the IN-WINDOW count, free opens unchanged (jit_fee_free_opens).
-function jitFeeMultPct(pubkey) {
-  const k = String(pubkey || '').toLowerCase();
-  const upcoming = jitInWindow(k) + 1;
-  const extra = Math.max(0, upcoming - CONFIG.lsps2.jit_fee_free_opens);
-  return 100 + CONFIG.lsps2.jit_fee_step_pct * extra;
-}
+// ── 0.90.0 (S54, DP 2026-10-04 10:19 "Let's make the JIT fee ladder be 100, 400, 1000, 2000, 3000, 5000, 10,000 and
+// 15,000 for each after that"): THE OPEN FEE LADDER. A wallet's n-th JIT open inside the window pays step n; the last
+// step repeats. Replaces the free-opens + percent-step escalator. A setting that is not a list of whole numbers ≥ 0
+// falls back to the default (JIT_FEE_LADDER_BAD — the boot line names it).
+const JIT_FEE_LADDER_DEFAULT = [100, 400, 1000, 2000, 3000, 5000, 10000, 15000];
+const { JIT_FEE_LADDER, JIT_FEE_LADDER_BAD } = (function () {
+  const raw = process.env.JIT_FEE_LADDER_SATS;
+  if (raw === undefined || String(raw).trim() === '') return { JIT_FEE_LADDER: JIT_FEE_LADDER_DEFAULT.slice(), JIT_FEE_LADDER_BAD: false };
+  const v = String(raw).split(/[,;\s]+/).filter(Boolean).map((x) => Number(x.replace(/_/g, '')));
+  const ok = v.length > 0 && v.length <= 50 && v.every((x) => Number.isInteger(x) && x >= 0);
+  return ok ? { JIT_FEE_LADDER: v, JIT_FEE_LADDER_BAD: false } : { JIT_FEE_LADDER: JIT_FEE_LADDER_DEFAULT.slice(), JIT_FEE_LADDER_BAD: true };
+})();
+// The step for a wallet's n-th open (n ≥ 1); past the end of the ladder, the last step.
+function jitLadderStepSats(n) { return JIT_FEE_LADDER[Math.min(Math.max(1, n | 0), JIT_FEE_LADDER.length) - 1]; }
+// Which open the wallet's NEXT one is, inside the window (1 = its first).
+function jitNextOpenNumber(pubkey) { return jitInWindow(String(pubkey || '').toLowerCase()) + 1; }
+// ── end of the ladder
 // v0.33.0 (S30): the scarcity multiplier — refreshed every 30s from the
 // on-chain balance; changes are logged; the boot line prints the whole
 // self-protection posture.
@@ -1440,18 +1463,24 @@ function scarcityMultPct() { return scarcityCache.mult_pct; }
 // quote applies the same two multipliers lnurlpFeeMsat applies, for THIS
 // wallet, right now — an amount, not a formula. applies_up_to_sats is the
 // receive size above which the proportional term exceeds the minimum.
-function openFeeBaselineSats() { return Math.ceil(CONFIG.lsps2.open_fee_min_msat / 1000); }
+// 0.90.0: the baseline is a fresh wallet's first open on a calm box — the ladder's first step or the floor, the larger.
+function openFeeBaselineSats() { return Math.ceil(Math.max(CONFIG.lsps2.open_fee_min_msat, jitLadderStepSats(1) * 1000) / 1000); }
 function openFeeQuote(clientPubkey) {
   const minMsat = BigInt(CONFIG.lsps2.open_fee_min_msat);
-  const pw = clientPubkey ? BigInt(jitFeeMultPct(clientPubkey)) : 100n;
+  const n = clientPubkey ? jitNextOpenNumber(clientPubkey) : 1;
+  const stepMsat = BigInt(jitLadderStepSats(n)) * 1000n;
+  const lowMsat = stepMsat > minMsat ? stepMsat : minMsat;   // 0.90.0: this wallet's step, or the floor — before the % term
   const sc = BigInt(scarcityMultPct());
-  const feeMsat = (minMsat * pw * sc) / 10000n;
+  const feeMsat = (lowMsat * sc) / 100n;
   const ppm = BigInt(CONFIG.lsps2.open_fee_ppm);
-  const upTo = ppm > 0n ? Number((minMsat * 1000000n) / ppm / 1000n) : null;
+  const upTo = ppm > 0n ? Number((lowMsat * 1000000n) / ppm / 1000n) : null;
   return {
     next_open_fee_sats:  Number((feeMsat + 999n) / 1000n),
     applies_up_to_sats:  upTo,
-    per_wallet_mult_pct: Number(pw),
+    per_wallet_mult_pct: minMsat > 0n ? Number((lowMsat * 100n) / minMsat) : 100,   // kept for older readers: the step over the floor
+    open_number:         n,                                                          // 0.90.0: which open the next one is
+    ladder_sats:         JIT_FEE_LADDER.slice(),
+    window_days:         Math.round(JIT_WINDOW_MS / 86400000),
     scarcity_mult_pct:   Number(sc),
     baseline_sats:       openFeeBaselineSats(),
   };
@@ -1493,7 +1522,8 @@ setInterval(refreshScarcity, 30000);
 setTimeout(async () => {
   await refreshScarcity();
   const c = CONFIG.lsps2;
-  console.log(`[JIT] self-protection: floor=${c.jit_min_onchain_reserve_sats} ramp_start=${c.jit_scarcity_ramp_start_sats} max_mult=${c.jit_scarcity_max_pct}% | per-wallet(LNURLp): free_opens=${c.jit_fee_free_opens} step=${c.jit_fee_step_pct}% window=${Math.round(JIT_WINDOW_MS / 86400000)}d | live_mult=${scarcityMultPct()}% onchain=${scarcityCache.confirmed}`);
+  const _g = jitGrantTerms();   // 0.90.0: the ladder and the grant, live — the ride's receipt
+  console.log(`[JIT] self-protection: floor=${c.jit_min_onchain_reserve_sats} ramp_start=${c.jit_scarcity_ramp_start_sats} max_mult=${c.jit_scarcity_max_pct}% | ladder(per wallet, ${Math.round(JIT_WINDOW_MS / 86400000)}d)=${JIT_FEE_LADDER.join('/')} sats${JIT_FEE_LADDER_BAD ? ' (JIT_FEE_LADDER_SATS is not a list of whole numbers — the default is used)' : ''} | live_mult=${scarcityMultPct()}% onchain=${scarcityCache.confirmed} | grant=base ${_g.base} + ${_g.pct}% of the payment above ${_g.from}, ceiling ${_g.ceiling}${_g.bad ? ' (a JIT grant setting is not a whole number ≥ 0 — its default is used)' : ''}${RETIRED_0900_SET.length ? ' | IGNORED (retired): ' + RETIRED_0900_SET.join(', ') : ''}`);
 }, 6000);
 
 async function jitReserveOk(fundingSats, who) {
@@ -1521,10 +1551,12 @@ async function jitReserveOk(fundingSats, who) {
 function channelOpenFeeMsat(amountMsat, clientPubkey, scarcityPct) {
   const ppmFee = (BigInt(amountMsat) * BigInt(CONFIG.lsps2.open_fee_ppm) + 999999n) / 1000000n;
   const floor = BigInt(CONFIG.lsps2.open_fee_min_msat);
-  const base = ppmFee > floor ? ppmFee : floor;
-  const pw = clientPubkey ? BigInt(jitFeeMultPct(clientPubkey)) : 100n;
+  let base = ppmFee > floor ? ppmFee : floor;
+  // 0.90.0 (S54, DP 10:19): the wallet's step on the open fee ladder — the fee is never below it
+  const step = BigInt(jitLadderStepSats(clientPubkey ? jitNextOpenNumber(clientPubkey) : 1)) * 1000n;
+  if (step > base) base = step;
   const sc = BigInt(parseInt(scarcityPct, 10) || scarcityMultPct());
-  return (base * pw * sc) / 10000n;
+  return (base * sc) / 100n;
 }
 function lnurlpFeeMsat(amountMsat, clientPubkey) { return channelOpenFeeMsat(amountMsat, clientPubkey); }
 
@@ -2651,10 +2683,30 @@ function isWalletOnline(pubkeyHex) {
 }
 
 // v0.18: compute channel size for a JIT promise.
+// ── 0.90.0 (S54, DP 2026-10-04 09:53): THE JIT GRANT — the inbound room a JIT open gives the wallet. In DP's words:
+// base 25,000 on every JIT; bonus = 50 % (rounded down) of the JIT amount above 25,000; granted = base + bonus, never
+// more than the ceiling 62,500 (reached at a JIT of 100,000). The channel = the payment + granted. A setting that is not
+// a whole number ≥ 0 falls back to its default (bad: true — the boot line names it) rather than opening a NaN channel.
+const JIT_GRANT_DEFAULTS = { base: 25000, pct: 50, from: 25000, ceiling: 62500 };
+function jitGrantTerms() {
+  const L = CONFIG.lsps2, ok = (x) => Number.isInteger(x) && x >= 0;
+  const raw = { base: L.jit_grant_base_sats, pct: L.jit_grant_bonus_pct, from: L.jit_grant_bonus_from_sats, ceiling: L.jit_grant_ceiling_sats };
+  const t = { bad: false };
+  for (const k of Object.keys(JIT_GRANT_DEFAULTS)) { if (ok(raw[k])) t[k] = raw[k]; else { t[k] = JIT_GRANT_DEFAULTS[k]; t.bad = true; } }
+  return t;
+}
+// What a JIT of `paymentSats` is granted: base + the bonus, capped at the ceiling, never below base.
+function jitGrantedSats(paymentSats) {
+  const t = jitGrantTerms();
+  const bonus = Math.floor(Math.max(0, paymentSats - t.from) * t.pct / 100);
+  return Math.max(t.base, Math.min(t.ceiling, t.base + bonus));
+}
+// The JIT channel: the payment plus what it is granted.
 function computeChannelSizeSats(paymentSizeMsat) {
   const paymentSats = Math.ceil(Number(paymentSizeMsat) / 1000);
-  return Math.max(paymentSats * 2, paymentSats + CONFIG.lsps2.channel_buffer_sats);
+  return paymentSats + jitGrantedSats(paymentSats);
 }
+// ── end of the grant
 
 // v0.18: schedule a watchdog timer to FAIL an offline-held HTLC near its
 // CLTV expiry. Conservative — fires at (auto_fail - SAFETY_BLOCKS - 2)
@@ -4635,8 +4687,13 @@ function settingsReport() {
     row('Advertised fees', 'LSPS2 fee', 'LSPS2_FEE_PPM', L.fee_ppm, 'ppm', 'per forward, advertised'),
     row('Channel-open fee', 'open fee', 'LSPS2_VAR_FEE_PPM', L.open_fee_ppm, 'ppm', 'of the opening payment; the JIT, bolt11 and LNURL rails share it'),
     row('Channel-open fee', 'open fee floor', 'LSPS2_OPEN_FEE_MIN_MSAT', L.open_fee_min_msat, 'msat', 'the least an open costs the wallet'),
-    row('JIT sizing (inbound liquidity)', 'size rule', '', 'max(2 × payment, payment + buffer)', '', 'computeChannelSizeSats — the inbound room a first receive gets'),
-    row('JIT sizing (inbound liquidity)', 'buffer', 'LSPS2_CHANNEL_BUFFER_SATS', L.channel_buffer_sats, 'sats', 'added above the payment'),
+    ...(() => { const g = jitGrantTerms(), f = (x) => x.toLocaleString('en-US'); return [   // 0.90.0: the JIT grant, live
+      row('JIT sizing (inbound liquidity)', 'size rule', '', 'payment + granted · granted = ' + f(g.base) + ' + ' + g.pct + '% of the payment above ' + f(g.from) + ', at most ' + f(g.ceiling), '', 'computeChannelSizeSats — granted is the inbound room the JIT gives the wallet' + (g.bad ? ' · a setting is unreadable — its default is used' : '')),
+      row('JIT sizing (inbound liquidity)', 'base', 'JIT_GRANT_BASE_SATS', g.base, 'sats', 'every JIT gets at least this'),
+      row('JIT sizing (inbound liquidity)', 'bonus', 'JIT_GRANT_BONUS_PCT', g.pct, '%', 'of the payment above the bonus start, rounded down'),
+      row('JIT sizing (inbound liquidity)', 'bonus start', 'JIT_GRANT_BONUS_FROM_SATS', g.from, 'sats', 'the payment size where the bonus begins'),
+      row('JIT sizing (inbound liquidity)', 'ceiling', 'JIT_GRANT_CEILING_SATS', g.ceiling, 'sats', 'granted never exceeds this'),
+    ]; })(),
     row('JIT sizing (inbound liquidity)', 'channel min', 'MIN_CHANNEL_SATS', C.min_sats, 'sats', ''),
     row('JIT sizing (inbound liquidity)', 'channel default', 'CHANNEL_SIZE_SATS', C.size_sats, 'sats', ''),
     row('JIT sizing (inbound liquidity)', 'channel max', 'MAX_CHANNEL_SATS', C.max_sats, 'sats', 'JIT opens are not capped by this (intentional, S44)'),
@@ -4647,8 +4704,7 @@ function settingsReport() {
     row('Guardrails', 'on-chain reserve floor', 'JIT_MIN_ONCHAIN_RESERVE_SATS', L.jit_min_onchain_reserve_sats, 'sats', 'no JIT open below this confirmed balance'),
     row('Guardrails', 'scarcity ramp start', 'JIT_SCARCITY_RAMP_START_SATS', L.jit_scarcity_ramp_start_sats, 'sats', 'headroom where the open-fee multiplier starts rising'),
     row('Guardrails', 'scarcity max', 'JIT_SCARCITY_MAX_PCT', L.jit_scarcity_max_pct, '%', 'multiplier at zero headroom'),
-    row('Guardrails', 'free opens per wallet', 'JIT_FEE_FREE_OPENS', L.jit_fee_free_opens, '', 'per window'),
-    row('Guardrails', 'step after free opens', 'JIT_FEE_STEP_PCT', L.jit_fee_step_pct, '%', 'each further open adds this'),
+    row('Guardrails', 'open fee ladder', 'JIT_FEE_LADDER_SATS', JIT_FEE_LADDER.map((x) => x.toLocaleString('en-US')).join(' · '), 'sats', 'a wallet\'s 1st, 2nd … JIT open in the window; the last step for every open after; × the scarcity multiplier; never below the open-fee floor or the % of the payment' + (JIT_FEE_LADDER_BAD ? ' · the setting is unreadable — the default is used' : '')),   // 0.90.0
     row('Guardrails', 'window', 'LSPS2_JIT_WINDOW_DAYS', Math.round(JIT_WINDOW_MS / 86400000), 'days', ''),
     row('Guardrails', 'floor opens per day', 'JIT_FLOOR_MAX_OPENS_PER_DAY', JIT_FLOOR_MAX_OPENS_PER_DAY, '', ''),
     row('Guardrails', 'promise validity', 'LSPS2_PROMISE_VALIDITY_SECS', L.promise_validity_secs, 's', ''),
@@ -4893,7 +4949,7 @@ async function consoleSnapshot() {
     guardrails: {
       live_mult_pct: scarcityMultPct(), onchain_confirmed: scarcityCache.confirmed, headroom: scarcityCache.headroom, refreshed_ms: scarcityCache.ts,
       reserve_floor_sats: CONFIG.lsps2.jit_min_onchain_reserve_sats, ramp_start_sats: CONFIG.lsps2.jit_scarcity_ramp_start_sats, max_mult_pct: CONFIG.lsps2.jit_scarcity_max_pct,
-      free_opens: CONFIG.lsps2.jit_fee_free_opens, step_pct: CONFIG.lsps2.jit_fee_step_pct, window_days: Math.round(JIT_WINDOW_MS / 86400000), floor_max_opens_per_day: JIT_FLOOR_MAX_OPENS_PER_DAY,
+      ladder_sats: JIT_FEE_LADDER.slice(), grant: jitGrantTerms(), window_days: Math.round(JIT_WINDOW_MS / 86400000), floor_max_opens_per_day: JIT_FLOOR_MAX_OPENS_PER_DAY,   // 0.90.0: the ladder and the grant
       channel_min_sats: CONFIG.channel.min_sats, channel_size_sats: CONFIG.channel.size_sats, channel_max_sats: CONFIG.channel.max_sats,
       open_fee_min_sats: Math.round(CONFIG.lsps2.open_fee_min_msat / 1000), fee_ppm: CONFIG.node.fee_ppm, lease_days: CONFIG.lease.days, lease_enabled: !!(CONFIG.lease && CONFIG.lease.enabled), lease_dry_run: !!(CONFIG.lease && CONFIG.lease.dry_run), lease_cycle_min: CONFIG.lease.cycle_minutes,
       lease_list_saved_at: leaseExclude.saved_at || 0, lease_excluded: (chans.channels || []).filter((c) => leaseIsExcluded(c.channel_point)).length, lease_leased: (chans.channels || []).filter((c) => !leaseIsExcluded(c.channel_point) && c.remote_pubkey !== LEASE_WORLD_PEER).length,

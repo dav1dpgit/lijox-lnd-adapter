@@ -1,3 +1,8 @@
+// S54 2026-10-04: the clock is PINNED to mid-month, mid-day. The fixtures sit at now − 1 h, now − 24 h, now − 40 d; on the
+// wall clock "one hour ago" is yesterday in the first hour after midnight, and "yesterday" is last month on the 1st —
+// the ledger was right, the test was not (it failed 00:00–01:00 every day and all day on the 1st).
+{ const RealDate = Date, PIN = new RealDate(2026, 8, 15, 12, 0, 0).getTime(), off = PIN - RealDate.now();
+  global.Date = class extends RealDate { constructor(...a) { if (a.length === 0) super(RealDate.now() + off); else super(...a); } static now() { return RealDate.now() + off; } }; }
 const { createPL } = require(require('path').join(__dirname,'pl.js')); const fs = require('fs'); const os = require('os'); const path = require('path');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pl-')); const day = (ms) => new Date(ms);
 const now = Date.now(); const yday = now - 86400000; const lastMonth = now - 40 * 86400000;
