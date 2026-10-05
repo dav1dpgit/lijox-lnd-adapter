@@ -66,6 +66,7 @@ const HOLD = {
   MAX_TRIES: () => Number(process.env.DELEGATE_HOLD_MAX_TRIES || 30),
   MIN_WINDOW_MS: () => Number(process.env.DELEGATE_HOLD_MIN_WINDOW_MS || 30000),
   EXPIRY_MARGIN_S: () => Number(process.env.DELEGATE_HOLD_EXPIRY_MARGIN_S || 60),
+  OWN_ONLINE_WINDOW_MS: () => Number(process.env.DELEGATE_OWN_ONLINE_WINDOW_MS || 60000),   // 0.91.0
 };
 
 // ── store: flat-file nonce ledger, flush on every transition ─────────
@@ -216,6 +217,20 @@ async function resolveBill(lndRequest, bill, amountMsatFromBody) {
     meta.expires_at_s = ts ? ts + ex : 0;
     const our = H && typeof H.ourPubkey === 'function' ? H.ourPubkey() : '';
     meta.same_lsp = !!(our && meta.hint_node && meta.hint_node === our);
+    // 0.91.0 (S55, DP 2026-10-04 "Go", item 1): THIS LSP's OWN invoice. The Lightning-address rail mints its invoice on
+    // this node's LND (a hold invoice on a hash the wallet registered), so its payee is this node and no hint names it
+    // — the check above never fires, and LND does not pay itself. The money is the wallet's: the bill becomes a
+    // same-LSP bill for the wallet that owns the pay code — its pubkey, its registered payment secret, and no invoice
+    // clock (the chit cancels LND's invoice when it takes it; the wallet's hash has its own life). Any other invoice
+    // this node issued is refused plainly instead of being sent to LND as a self-payment.
+    if (our && meta.payee_pubkey === our) {
+      const own = H && typeof H.lnurlpOwnEntry === 'function' ? H.lnurlpOwnEntry(meta.payment_hash) : null;
+      if (!own) return { error: 'own_invoice: the provider cannot pay an invoice it issued itself' };
+      if (own.status !== 'reserved') return { error: 'own_invoice_' + own.status + ': this payment code was already paid or withdrawn \u2014 scan it again' };
+      meta.own_lnurl = { name: own.name };
+      meta.payee_pubkey = own.client; meta.secret_hex = own.secret; meta.same_lsp = true;
+      meta.hint_node = ''; meta.hint_scid = ''; meta.cltv_expiry = 0; meta.expires_at_s = 0;
+    }
   } catch (e) { meta.same_lsp = false; }
   if (invMsat > 0) return Object.assign({ bolt11: low, amount_msat: invMsat, from_invoice: true }, meta);
   const bodyMsat = Number(amountMsatFromBody || 0);
@@ -365,6 +380,7 @@ async function epSpend(req, res, lndRequest) {
       try { online = await H.isPeerConnected(bill.payee_pubkey); } catch (e) {}
       try { chan = await H.walletChannel(bill.payee_pubkey); } catch (e) {}
       const room = !!(chan && (chan.room_msat !== undefined ? chan.room_msat : chan.local_msat - 50000n) >= BigInt(bill.amount_msat));   // 0.84.0: the room LND will send
+      if (bill.own_lnurl) return ownLnurlSpend(res, nonce, rec, bill, feeLimit, payeeName, { online, hasChannel: !!chan });   // 0.91.0: never a self-payment
       if (!(online && room)) {
         return holdSpend(res, nonce, rec, bill, feeLimit, payeeName, { online, hasChannel: !!chan });
       }
@@ -499,9 +515,17 @@ async function epSlip(res, nonce, lndRequest) {
 
 // ── 0.78.0: the same-LSP hold rail ───────────────────────────────────
 function holdSpend(res, nonce, rec, bill, feeLimit, payeeName, why) {
+  const r = holdBegin(nonce, rec, bill, payeeName, why, {});
+  return j(res, r.status, r.body);
+}
+// 0.91.0: holdSpend's body, answering instead of writing — the own-invoice spend uses it and then tries at once.
+// opts.ownLnurl: a wallet that is online gets at least OWN_ONLINE_WINDOW_MS (its dial may be Off — that refuses
+// WAITING for it, not paying it while it is here); the wake is the caller's, sent once the pay code is taken.
+function holdBegin(nonce, rec, bill, payeeName, why, opts) {
   const now = Date.now();
   let windowMs = 0;
   try { windowMs = Number(H.holdCapMs(bill.payee_pubkey)) || 0; } catch (e) { windowMs = 0; }
+  if (opts.ownLnurl && why.online) windowMs = Math.max(windowMs, HOLD.OWN_ONLINE_WINDOW_MS());
   if (bill.expires_at_s) windowMs = Math.min(windowMs, bill.expires_at_s * 1000 - now - HOLD.EXPIRY_MARGIN_S() * 1000);
   if (windowMs < HOLD.MIN_WINDOW_MS()) {
     const err = bill.expires_at_s && (bill.expires_at_s * 1000 - now) < HOLD.MIN_WINDOW_MS() + HOLD.EXPIRY_MARGIN_S() * 1000
@@ -509,12 +533,12 @@ function holdSpend(res, nonce, rec, bill, feeLimit, payeeName, why) {
     rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'FAILED', error: err, updated_ms: now };
     recPut(nonce, rec);
     console.log('[delegate] HOLD refused nonce=' + nonce.slice(0, 12) + '…: ' + err + ' (window ' + Math.round(windowMs / 1000) + 's)');
-    return j(res, 502, { ok: false, code: 'PAY_FAILED', error: err === 'BILL_EXPIRING' ? 'the bill expires too soon to wait for the shop\u2019s wallet \u2014 ask for a fresh one' : 'the shop\u2019s wallet allows no waiting window' });
+    return { ok: false, status: 502, body: { ok: false, code: 'PAY_FAILED', error: err === 'BILL_EXPIRING' ? 'the bill expires too soon to wait for the shop\u2019s wallet \u2014 ask for a fresh one' : 'the shop\u2019s wallet allows no waiting window' } };
   }
   if (!bill.secret_hex || !bill.payment_hash) {
     rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash || '', amount_msat: bill.amount_msat, state: 'FAILED', error: 'NO_SECRET', updated_ms: now };
     recPut(nonce, rec);
-    return j(res, 502, { ok: false, code: 'PAY_FAILED', error: 'the bill carries no payment secret' });
+    return { ok: false, status: 502, body: { ok: false, code: 'PAY_FAILED', error: 'the bill carries no payment secret' } };
   }
   rec.hold = {
     bolt11: bill.bolt11, payment_hash: bill.payment_hash, secret_hex: bill.secret_hex,
@@ -522,14 +546,45 @@ function holdSpend(res, nonce, rec, bill, feeLimit, payeeName, why) {
     hint_scid: bill.hint_scid || '', cltv_expiry: bill.cltv_expiry || 0, expires_at_s: bill.expires_at_s || 0,
     held_since_ms: now, held_until_ms: now + windowMs, tries: 0, next_try_ms: 0, last_error: null,
   };
+  if (opts.ownLnurl) rec.hold.own_lnurl = true;   // 0.91.0: this LSP's own Lightning-address invoice
   rec.state = 'HELD';
   rec.last_bill = { bolt11: bill.bolt11, payment_hash: bill.payment_hash, amount_msat: bill.amount_msat, state: 'HELD', held_until_ms: rec.hold.held_until_ms, updated_ms: now };
   recPut(nonce, rec); // persist BEFORE the wake
   console.log('[delegate] HELD nonce=' + nonce.slice(0, 12) + '… amt=' + bill.amount_msat + ' → wallet ' + bill.payee_pubkey.slice(0, 16) + '… (' + (why.online ? 'online' : 'offline') + ', ' + (why.hasChannel ? 'channel without room' : 'no channel') + ') window ' + Math.round(windowMs / 1000) + 's');
-  try { Promise.resolve(H.sendWakePush(bill.payee_pubkey, windowMs)).catch(() => {}); } catch (e) {}
+  if (!opts.ownLnurl) { try { Promise.resolve(H.sendWakePush(bill.payee_pubkey, windowMs)).catch(() => {}); } catch (e) {} }   // 0.91.0: an own invoice wakes after it is taken
   holdLoopArm();
-  return j(res, 202, { ok: false, code: 'HELD', held_until_ms: rec.hold.held_until_ms, amount_msat: bill.amount_msat,
-    error: 'the shop\u2019s wallet is being woken \u2014 the bill is paid when it connects, within ' + Math.max(1, Math.round(windowMs / 60000)) + ' min' });
+  return { ok: true, status: 202, body: { ok: false, code: 'HELD', held_until_ms: rec.hold.held_until_ms, amount_msat: bill.amount_msat,
+    error: 'the shop\u2019s wallet is being woken \u2014 the bill is paid when it connects, within ' + Math.max(1, Math.round(windowMs / 60000)) + ' min' } };
+}
+
+// 0.91.0 (S55, DP 2026-10-04 "Go", item 1): a chit paying this LSP's own Lightning-address invoice. Called under the
+// nonce lock, after every chit check has passed. The pay code's invoice is TAKEN first (LND cancels it — nobody else
+// can pay it — and the address rail's watcher lets it go), then the hold rail's one delivery runs: at once when the
+// wallet is here (this request answers settled / failed), otherwise held and woken exactly as a 0.78.0 hold. The
+// chit pays the face; a JIT open's fee comes out of what the wallet receives — the address rail's own fee law.
+async function ownLnurlSpend(res, nonce, rec, bill, feeLimit, payeeName, why) {
+  const begun = holdBegin(nonce, rec, bill, payeeName, why, { ownLnurl: true });   // the window first: a refusal takes nothing
+  if (!begun.ok) return j(res, begun.status, begun.body);
+  let took = false;
+  try { took = !!(await H.lnurlpTakeForChit(bill.payment_hash, 'delegate ' + nonce.slice(0, 8))); } catch (e) { took = false; }
+  if (!took) {
+    const msg = 'this payment code was paid or withdrawn meanwhile \u2014 scan it again';
+    holdFail(nonce, recGet(nonce), msg);   // the chit back to LIVE, untouched
+    return j(res, 502, { ok: false, code: 'PAY_FAILED', error: msg });
+  }
+  if (!why.online) {   // asleep: held and woken, as a 0.78.0 hold
+    try { Promise.resolve(H.sendWakePush(bill.payee_pubkey, Math.max(0, recGet(nonce).hold.held_until_ms - Date.now()))).catch(() => {}); } catch (e) {}
+    return j(res, begun.status, begun.body);
+  }
+  await holdAttempt(nonce, Date.now());                       // here: deliver now, inside this request
+  const r = recGet(nonce), lb = (r && r.last_bill) || {};
+  if (lb.payment_hash === bill.payment_hash && lb.state === 'SETTLED') {
+    console.log('[delegate] SPEND ok (own address invoice) nonce=' + nonce.slice(0, 12) + '… amt=' + bill.amount_msat + ' → ' + r.state);
+    return j(res, 200, { ok: true, preimage: lb.preimage, spent_msat: r.spent_msat, state: r.state });
+  }
+  if (r && r.state === 'LIVE' && lb.state === 'FAILED') return j(res, 502, { ok: false, code: 'PAY_FAILED', error: String(lb.error || 'failed').slice(0, 160) });
+  if (r && r.state === 'IN_FLIGHT') return j(res, 503, { ok: false, code: 'PAY_PENDING', error: 'outcome not yet known \u2014 do not retry; ask again in a minute' });
+  return j(res, begun.status, Object.assign({}, begun.body, { error: 'paying the shop\u2019s wallet \u2014 retrying while it is connected' }));   // a temporary miss: the hold rail retries
 }
 
 function holdSettle(nonce, rec, preimage, feeKeptMsat, innerMsat) {
@@ -547,6 +602,7 @@ function holdSettle(nonce, rec, preimage, feeKeptMsat, innerMsat) {
   console.log('[delegate] HELD delivered nonce=' + nonce.slice(0, 12) + '… amt=' + amt + ' (merchant got ' + innerMsat + ', open fee ' + feeKeptMsat + ') → ' + rec.state);
   try { if (H && H.plRecord) H.plRecord(Number(feeKeptMsat) > 0 ? 'open_fee' : 'hold_fee', { msat: Number(feeKeptMsat), moved_msat: Number(innerMsat), wallet: h.payee_pubkey, hash: h.payment_hash }); } catch (e) {}
   try { if (H && H.leaseTouch) H.leaseTouch(h.payee_pubkey, 'delegate:delivered'); } catch (e) {}
+  if (h.own_lnurl) { try { H.lnurlpChitDone(h.payment_hash, true); } catch (e) {} }   // 0.91.0: the pay code's entry: settled
 }
 
 function holdFail(nonce, rec, error) {
@@ -555,6 +611,7 @@ function holdFail(nonce, rec, error) {
   rec.last_bill = { bolt11: h.bolt11 || '', payment_hash: h.payment_hash || '', amount_msat: h.amount_msat || 0, state: 'FAILED', error: String(error).slice(0, 160), updated_ms: Date.now() };
   delete rec.hold;
   recPut(nonce, rec);
+  if (h.own_lnurl) { try { H.lnurlpChitDone(h.payment_hash, false, error); } catch (e) {} }   // 0.91.0: the entry is burned (its invoice was cancelled)
   console.log('[delegate] HELD failed nonce=' + nonce.slice(0, 12) + '…: ' + error + ' → LIVE');
 }
 
@@ -564,56 +621,59 @@ async function holdTick(nowOverrideMs) {   // nowOverrideMs: tests only
   for (const nonce of Object.keys(store)) {
     const r0 = store[nonce];
     if (!r0 || r0.state !== 'HELD' || !r0.hold) continue;
-    await withNonceLock(nonce, async () => {
-      const rec = recGet(nonce);
-      if (!rec || rec.state !== 'HELD' || !rec.hold) return;
-      const h = rec.hold, now = Number(nowOverrideMs) || Date.now();
-      if (now >= h.held_until_ms) { holdFail(nonce, rec, 'the shop\u2019s wallet did not come online within ' + Math.max(1, Math.round((h.held_until_ms - h.held_since_ms) / 60000)) + ' min'); return; }
-      if (h.expires_at_s && now > h.expires_at_s * 1000 - 10000) { holdFail(nonce, rec, 'the bill expired before the shop\u2019s wallet came online'); return; }
-      if (now < (h.next_try_ms || 0)) return;
-      let online = false;
-      try { online = await H.isPeerConnected(h.payee_pubkey); } catch (e) { online = false; }
-      if (!online) return;
-      // A JIT hint: the fee the wallet was promised when it minted the bill. No promise and no
-      // channel = the promise lapsed; the wallet would refuse the skim — a fresh bill is needed.
-      let fixedFee;
-      try {
-        const pr = h.hint_scid ? H.promiseForScid(scidDecToHex(h.hint_scid)) : null;
-        if (pr && pr.fee_msat !== undefined) fixedFee = String(pr.fee_msat);
-      } catch (e) {}
-      let chan = null;
-      try { chan = await H.walletChannel(h.payee_pubkey); } catch (e) {}
-      if (!chan && fixedFee === undefined) { holdFail(nonce, rec, 'the shop\u2019s payment code has lapsed \u2014 ask for a fresh one'); return; }
-      h.tries = (h.tries || 0) + 1; h.next_try_ms = now + HOLD.RETRY_MS(); recPut(nonce, rec);
-      let out;
-      try {
-        out = await H.deliverToWallet({ client: h.payee_pubkey, hashHex: h.payment_hash, secretHex: h.secret_hex, amountMsat: String(h.amount_msat),
-          feeMsat: fixedFee, finalCltvDelta: Math.max(80, (Number(h.cltv_expiry) || 0) + 3), tag: 'delegate ' + nonce.slice(0, 8), jitTag: 'delegate:' + nonce.slice(0, 8) });
-      } catch (e) { out = { kind: 'retry', reason: 'deliver threw: ' + (e && e.message || e) }; }
-      const rec2 = recGet(nonce); if (!rec2 || rec2.state !== 'HELD' || !rec2.hold) return;   // changed under us
-      if (out.kind === 'refuse') { holdFail(nonce, rec2, out.reason); return; }
-      if (out.kind === 'retry') { rec2.hold.last_error = out.reason; recPut(nonce, rec2); if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.reason); return; }
-      if (out.kind === 'rejected') {
-        rec2.hold.last_error = out.error; recPut(nonce, rec2);
-        if (/attempted value exceeds|DEADLINE_EXCEEDED|payment in flight|already/i.test(out.error)) { holdToInflight(nonce, rec2, 'LND owns an attempt: ' + out.error); return; }
-        if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.error);
-        return;
-      }
-      const a = out.attempt;
-      if (!a || a.status !== 'SUCCEEDED') {
-        if (a && a.status === 'HARD_TIMEOUT') { holdToInflight(nonce, rec2, 'hard timeout — LND still owns the attempt'); return; }
-        const fc = a && a.failure ? String(a.failure.code || 'unknown') : 'unknown';
-        try { if (H.permanentCodes && H.permanentCodes().has(fc)) { holdFail(nonce, rec2, 'the shop\u2019s wallet refused the payment (' + fc + ')'); return; } } catch (e) {}
-        rec2.hold.last_error = fc; recPut(nonce, rec2);
-        console.log('[delegate] HELD attempt ' + rec2.hold.tries + ' did not land (' + fc + ') nonce=' + nonce.slice(0, 12) + '… — retrying while the window lasts');
-        if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + fc);
-        return;
-      }
-      const pre = Buffer.isBuffer(a.preimage) ? a.preimage.toString('hex')
-        : (/^[0-9a-f]{64}$/i.test(String(a.preimage)) ? String(a.preimage).toLowerCase() : Buffer.from(String(a.preimage), 'base64').toString('hex'));
-      holdSettle(nonce, rec2, pre, out.feeMsat, out.innerMsat);
-    });
+    await withNonceLock(nonce, () => holdAttempt(nonce, nowOverrideMs));
   }
+}
+// 0.91.0: one attempt on one HELD chit — the hold tick's body, under the caller's nonce lock (the own-invoice spend
+// calls it inside its own request's lock).
+async function holdAttempt(nonce, nowOverrideMs) {
+  const rec = recGet(nonce);
+  if (!rec || rec.state !== 'HELD' || !rec.hold) return;
+  const h = rec.hold, now = Number(nowOverrideMs) || Date.now();
+  if (now >= h.held_until_ms) { holdFail(nonce, rec, 'the shop\u2019s wallet did not come online within ' + Math.max(1, Math.round((h.held_until_ms - h.held_since_ms) / 60000)) + ' min'); return; }
+  if (h.expires_at_s && now > h.expires_at_s * 1000 - 10000) { holdFail(nonce, rec, 'the bill expired before the shop\u2019s wallet came online'); return; }
+  if (now < (h.next_try_ms || 0)) return;
+  let online = false;
+  try { online = await H.isPeerConnected(h.payee_pubkey); } catch (e) { online = false; }
+  if (!online) return;
+  // A JIT hint: the fee the wallet was promised when it minted the bill. No promise and no
+  // channel = the promise lapsed; the wallet would refuse the skim — a fresh bill is needed.
+  let fixedFee;
+  try {
+    const pr = h.hint_scid ? H.promiseForScid(scidDecToHex(h.hint_scid)) : null;
+    if (pr && pr.fee_msat !== undefined) fixedFee = String(pr.fee_msat);
+  } catch (e) {}
+  let chan = null;
+  try { chan = await H.walletChannel(h.payee_pubkey); } catch (e) {}
+  if (!chan && fixedFee === undefined && !h.own_lnurl) { holdFail(nonce, rec, 'the shop\u2019s payment code has lapsed \u2014 ask for a fresh one'); return; }   // 0.91.0: an address payment opens by the fee law
+  h.tries = (h.tries || 0) + 1; h.next_try_ms = now + HOLD.RETRY_MS(); recPut(nonce, rec);
+  let out;
+  try {
+    out = await H.deliverToWallet({ client: h.payee_pubkey, hashHex: h.payment_hash, secretHex: h.secret_hex, amountMsat: String(h.amount_msat),
+      feeMsat: fixedFee, finalCltvDelta: Math.max(80, (Number(h.cltv_expiry) || 0) + 3), tag: 'delegate ' + nonce.slice(0, 8), jitTag: 'delegate:' + nonce.slice(0, 8) });
+  } catch (e) { out = { kind: 'retry', reason: 'deliver threw: ' + (e && e.message || e) }; }
+  const rec2 = recGet(nonce); if (!rec2 || rec2.state !== 'HELD' || !rec2.hold) return;   // changed under us
+  if (out.kind === 'refuse') { holdFail(nonce, rec2, out.reason); return; }
+  if (out.kind === 'retry') { rec2.hold.last_error = out.reason; recPut(nonce, rec2); if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.reason); return; }
+  if (out.kind === 'rejected') {
+    rec2.hold.last_error = out.error; recPut(nonce, rec2);
+    if (/attempted value exceeds|DEADLINE_EXCEEDED|payment in flight|already/i.test(out.error)) { holdToInflight(nonce, rec2, 'LND owns an attempt: ' + out.error); return; }
+    if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + out.error);
+    return;
+  }
+  const a = out.attempt;
+  if (!a || a.status !== 'SUCCEEDED') {
+    if (a && a.status === 'HARD_TIMEOUT') { holdToInflight(nonce, rec2, 'hard timeout — LND still owns the attempt'); return; }
+    const fc = a && a.failure ? String(a.failure.code || 'unknown') : 'unknown';
+    try { if (H.permanentCodes && H.permanentCodes().has(fc)) { holdFail(nonce, rec2, 'the shop\u2019s wallet refused the payment (' + fc + ')'); return; } } catch (e) {}
+    rec2.hold.last_error = fc; recPut(nonce, rec2);
+    console.log('[delegate] HELD attempt ' + rec2.hold.tries + ' did not land (' + fc + ') nonce=' + nonce.slice(0, 12) + '… — retrying while the window lasts');
+    if (rec2.hold.tries >= HOLD.MAX_TRIES()) holdFail(nonce, rec2, 'delivery kept failing: ' + fc);
+    return;
+  }
+  const pre = Buffer.isBuffer(a.preimage) ? a.preimage.toString('hex')
+    : (/^[0-9a-f]{64}$/i.test(String(a.preimage)) ? String(a.preimage).toLowerCase() : Buffer.from(String(a.preimage), 'base64').toString('hex'));
+  holdSettle(nonce, rec2, pre, out.feeMsat, out.innerMsat);
 }
 // A held delivery LND now owns becomes an ordinary IN_FLIGHT wedge: the janitor's ListPayments
 // resolver settles or reverts it with the same bookkeeping as any spend.

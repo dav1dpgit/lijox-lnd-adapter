@@ -110,6 +110,8 @@
  *       granted = base + bonus% of the payment above bonus-from, at most the ceiling, never below base
  *       JIT_GRANT_BASE_SATS 25_000 · JIT_GRANT_BONUS_PCT 50 · JIT_GRANT_BONUS_FROM_SATS 25_000 · JIT_GRANT_CEILING_SATS 62_500
  *     0.90.0 THE OPEN FEE LADDER (channelOpenFeeMsat): JIT_FEE_LADDER_SATS 100,400,1000,2000,3000,5000,10000,15000
+ *     0.91.0 A CHIT PAYING THIS LSP'S OWN ADDRESS INVOICE: taken (LND's invoice cancelled) and delivered to the wallet
+ *       by the hold rail — never a self-payment. DELEGATE_OWN_ONLINE_WINDOW_MS 60_000 (the least window for a wallet that is here)
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -381,6 +383,11 @@ lijDelegate.setHooks({
   permanentCodes: () => LNURLP_PERMANENT_CODES,
   plRecord: (kind, fields) => plRecord(kind, fields),
   leaseTouch: (pk, src) => leaseTouch(pk, src),
+  // 0.91.0 (S55): a chit paying this LSP's own Lightning-address invoice — the pay code's entry by hash, taken for
+  // the chit (LND's invoice cancelled, the watcher stopped), and its end
+  lnurlpOwnEntry: (hashHex) => lnurlpOwnEntry(hashHex),
+  lnurlpTakeForChit: (hashHex, tag) => lnurlpTakeForChit(hashHex, tag),
+  lnurlpChitDone: (hashHex, ok, why) => lnurlpChitDone(hashHex, ok, why),
 });
 
 // ── OPEN-INTENT v1 (v0.35.0, S30) — docs/openintent-v1.md ─────────────────
@@ -1803,6 +1810,50 @@ async function lnurlpDeliver(name, entry) {
   }
 }
 
+// 0.91.0 (S55, DP 2026-10-04 "Go", item 1): a chit (delegate.js) paying a wallet's Lightning address on THIS LSP. The
+// invoice the address minted is this node's own hold invoice, which LND will not pay itself; the delegate rail takes
+// it instead: the entry leaves 'reserved' for 'chit' FIRST (so the watcher's next look and every sweep leave it
+// alone), the watcher stops, LND's invoice is cancelled (nobody else can pay it now), and the delegate rail delivers
+// to the wallet with the entry's own hash and secret through deliverToWallet — the one delivery every rail shares.
+// The entry ends 'settled' (settled_by: chit) or 'burned' (lnurlpChitDone). Only a 'reserved' entry can be taken:
+// minted for this payment and not yet paid by anyone.
+function lnurlpEntryByHash(hashHex) {
+  const h = String(hashHex || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(h)) return null;
+  for (const [name, rec] of Object.entries(lnurlpRegistry)) {
+    const entry = (rec.entries || []).find((e) => e.hash === h);
+    if (entry) return { name, rec, entry };
+  }
+  return null;
+}
+function lnurlpOwnEntry(hashHex) {
+  const f = lnurlpEntryByHash(hashHex);
+  if (!f || !/^0[23][0-9a-f]{64}$/.test(String(f.rec.client_pubkey || '').toLowerCase()) || !f.entry.secret) return null;
+  return { name: f.name, client: String(f.rec.client_pubkey).toLowerCase(), secret: f.entry.secret, status: f.entry.status, amount_msat: f.entry.amount_msat };
+}
+async function lnurlpTakeForChit(hashHex, tag) {
+  const f = lnurlpEntryByHash(hashHex);
+  if (!f || f.entry.status !== 'reserved') return false;
+  f.entry.status = 'chit'; f.entry.chit_at = Date.now(); f.entry.chit = String(tag || 'delegate');
+  lnurlpStopWatch(f.entry.hash);
+  lnurlpPersist();
+  try {
+    await lndPost('/v2/invoices/cancel', { payment_hash: Buffer.from(f.entry.hash, 'hex').toString('base64') });
+  } catch (e) {
+    console.warn(`[LNURLP] ${f.name}: cancelling the invoice a chit took failed (${e.message}) — only the chit's page held it`);
+  }
+  console.log(`[LNURLP] ${f.name}: a chit takes this invoice (${f.entry.chit}) — LND's invoice cancelled; the delegate rail delivers hash=${f.entry.hash.slice(0,16)}…`);
+  return true;
+}
+function lnurlpChitDone(hashHex, ok, why) {
+  const f = lnurlpEntryByHash(hashHex);
+  if (!f || f.entry.status !== 'chit') return;
+  if (ok) { f.entry.status = 'settled'; f.entry.settled_at = Date.now(); f.entry.settled_by = 'chit'; }
+  else { f.entry.status = 'burned'; f.entry.burn_reason = 'chit: ' + String(why || 'failed').slice(0, 120); }
+  lnurlpPersist();
+  console.log(`[LNURLP] ${f.name}: chit ${ok ? 'delivered — entry settled' : 'did not deliver — entry burned (' + String(why || 'failed').slice(0, 80) + ')'} hash=${f.entry.hash.slice(0,16)}…`);
+}
+
 async function lnurlpCancelOuter(name, entry, why) {
   try {
     await lndPost('/v2/invoices/cancel', { payment_hash: Buffer.from(entry.hash, 'hex').toString('base64') });
@@ -1868,7 +1919,7 @@ function lnurlpWatch(name, entry) {
         if (entry.status !== 'settled') { entry.status = 'settled'; lnurlpPersist(); }
         lnurlpStopWatch(entry.hash);
       } else if (state === 'CANCELED') {
-        if (entry.status !== 'burned') { entry.status = 'burned'; entry.burn_reason = 'canceled/expired'; lnurlpPersist(); }
+        if (entry.status !== 'burned' && entry.status !== 'chit') { entry.status = 'burned'; entry.burn_reason = 'canceled/expired'; lnurlpPersist(); }   // 0.91.0: a chit's cancel is not a burn
         lnurlpStopWatch(entry.hash);
       } else if (state === 'OPEN' && entry.status === 'reserved' && Date.now() - started > 1500000) {
         // 0.67.0: 25 min unpaid (invoice life is 20): past expiry — stop watching; LND cancels it.
@@ -6030,7 +6081,7 @@ const server = http.createServer(async (req, res) => {
         if (e) {
           out.source = 'lnurlp'; out.status = e.status; out.burn_reason = e.burn_reason || null;
           out.outcome = e.status === 'settled' ? 'settled'
-            : e.status === 'accepted' ? 'pending'
+            : (e.status === 'accepted' || e.status === 'chit') ? 'pending'   // 0.91.0: a chit is delivering it
             : (e.status === 'free' || e.status === 'reserved') ? 'unpaid'
             : 'failed';   // burned: canceled / refunded / expired
           // 0.75.0 (S46, DP): the sender's hold verdict for a pool hash. An LNURL
