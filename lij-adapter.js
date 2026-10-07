@@ -112,6 +112,8 @@
  *     0.90.0 THE OPEN FEE LADDER (channelOpenFeeMsat): JIT_FEE_LADDER_SATS 100,400,1000,2000,3000,5000,10000,15000
  *     0.91.0 A CHIT PAYING THIS LSP'S OWN ADDRESS INVOICE: taken (LND's invoice cancelled) and delivered to the wallet
  *       by the hold rail — never a self-payment. DELEGATE_OWN_ONLINE_WINDOW_MS 60_000 (the least window for a wallet that is here)
+ *     0.91.1 GET /rates answers at once from the copy it holds (within RATES_STALE_SECONDS) and refreshes behind the
+ *       answer — a wallet is never made to wait for the upstream ticker for a copy the provider already has
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -5482,8 +5484,12 @@ function ratesFetchUpstream() {
   return ratesFetching;
 }
 async function ratesHandler(res) {
-  if (!ratesCache || (Date.now() - ratesCache.fetched_at_ms) > RATES_TTL_MS) {
-    await ratesFetchUpstream();
+  const heldFor = ratesCache ? Date.now() - ratesCache.fetched_at_ms : Infinity;
+  if (heldFor > RATES_TTL_MS) {
+    // 0.91.1 (S56): a copy within the stale limit answers at once and the refresh runs behind it (single-flight) — a
+    // wallet's rate ask gives up at 4 s and the upstream can take 8; only no copy, or one past the limit, waits
+    if (ratesCache && heldFor <= RATES_STALE_MS) ratesFetchUpstream();
+    else await ratesFetchUpstream();
   }
   if (!ratesCache) return errResponse(res, 'rates unavailable', 503);
   const age = Date.now() - ratesCache.fetched_at_ms;
