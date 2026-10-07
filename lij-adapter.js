@@ -114,6 +114,11 @@
  *       by the hold rail — never a self-payment. DELEGATE_OWN_ONLINE_WINDOW_MS 60_000 (the least window for a wallet that is here)
  *     0.91.1 GET /rates answers at once from the copy it holds (within RATES_STALE_SECONDS) and refreshes behind the
  *       answer — a wallet is never made to wait for the upstream ticker for a copy the provider already has
+ *     0.92.0 POST /lsps/registry/my-channels — before it connects, a wallet asks which channels this LSP holds under its
+ *       node key (signed challenge, read-only), so a copy with no record of a channel can stop before LND closes it
+ *     0.92.1 my-channels names each channel's commitment type (where a closed channel pays the wallet's share)
+ *     0.93.0 one open copy at a time — a session registered in the signed my-channels request, heartbeats name
+ *       another live copy of the same wallet (copies.js; LIJOX standard: one open copy per wallet)
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -535,6 +540,9 @@ function oiRateLimited(ip) {
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 // 0.79.0: the kit holder's store, DATA_DIR/kits/<npub>.json (ciphertext the box cannot read)
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+// 0.93.0 (S57): one open copy at a time — sessions registered by a signed my-channels request, kept in memory
+const { CopyWatch } = require('./copies');
+const copyWatch = new CopyWatch();
 // 0.82.0: the Push Key rail. Every dependency is handed over lazily — lndGet/lndPost are consts defined
 // further down the file, and the function declarations are hoisted anyway.
 // 0.86.0 (S50, DP GO — NWC): the wallet registers each connection's (service key, client key) pair, signed with its
@@ -5352,6 +5360,88 @@ async function handleRecoverClose(req, res, ip) {
   return jsonResponse(res, { ok: true, closed, failed, pending, first_channel_height: firstChannelHeight });   // 0.77.2
 }
 
+// ── 0.92.0 (S57, DP 2026-10-07 "Proposal 4"): MY-CHANNELS ─────────────────────────────
+// A wallet asks, BEFORE it connects, which channels this LSP holds under its node key. A copy of a wallet that has
+// no record of one of them (another phone or computer opened it) can then stop and ask its person, instead of
+// connecting: its engine answers LND's re-establish for an unknown channel with LDK's bogus one, and LND force-closes
+// that channel (Oct 6, the SA tester's 35,400-sat JIT channel). The provider is the one party that always knows a
+// channel exists. READ-ONLY — nothing is closed or changed here. The answer goes to the key holder only:
+//   POST /lsps/registry/my-channels  { node_pubkey, nonce, signature }
+//   nonce     = a single-use challenge from GET /lsps/registry/challenge
+//   signature = LND-style signmessage (zbase32) over "lij-my-channels-v1:" + nonce by the NODE key, verified by LND
+//               /v1/verifymessage; the recovered pubkey must equal node_pubkey (as recover-close)
+//   200 { ok: true, channels: [{ chan_point, capacity_sats, wallet_side_sats, active, pending_htlcs, commitment_type }],
+//         pending_open: [{ chan_point, capacity_sats, commitment_type }] }   — this key's open channels and pending opens
+//   0.92.1: commitment_type as LND names it (STATIC_REMOTE_KEY pays a closed channel's wallet share to its m/84 address)
+// A wallet that gets no answer starts as it always has (DP: the check must never lock up the device).
+const MY_CHANNELS_DOMAIN = 'lij-my-channels-v1:';
+async function handleMyChannels(req, res, ip) {
+  if (isRateLimited(ip)) return errResponse(res, 'Rate limit exceeded', 429);
+  let body;
+  try { body = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON'); }
+  const pk = String((body && body.node_pubkey) || '').toLowerCase().trim();
+  const nonce = String((body && body.nonce) || '').toLowerCase().trim();
+  const sig = String((body && body.signature) || '').trim();
+  if (!/^0[23][0-9a-f]{64}$/.test(pk)) return errResponse(res, 'node_pubkey must be 66 lowercase hex chars');
+  if (!/^[0-9a-f]{64}$/.test(nonce)) return errResponse(res, 'nonce must be 64 hex chars');
+  if (!sig) return errResponse(res, 'Missing signature');
+  // 1. signature → recovered pubkey must equal the claimed node key
+  let recovered = '';
+  try {
+    const r = await lndRequest('POST', '/v1/verifymessage', {
+      msg: Buffer.from(MY_CHANNELS_DOMAIN + nonce, 'utf8').toString('base64'),
+      signature: sig,
+    });
+    const emsg = String((r && (r.message || r.error)) || '');
+    if (!r || (!r.pubkey && /permission|macaroon|unauthenticated|unavailable|deadline|connection|EOF|unimplemented/i.test(emsg))) {
+      return jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503);
+    }
+    recovered = String((r && r.pubkey) || '').toLowerCase();
+  } catch (e) {
+    return jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503);
+  }
+  if (!recovered || recovered !== pk) {
+    console.warn(`[MyChannels] BAD_SIG from ${ip} for ${pk.slice(0, 16)}`);
+    return jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401);
+  }
+  // 2. consume the nonce AFTER the signature check (same order as recover-close and the registry)
+  const nr = registryNonceStore.consume(nonce);
+  if (!nr.ok) return jsonResponse(res, { ok: false, reason: nr.code }, 400);
+  // 0.93.0: the copy's session number, registered only now that the key and the nonce are proven
+  const sid = String((body && body.session) || '').toLowerCase();
+  let otherSeen;
+  if (/^[0-9a-f]{32}$/.test(sid) && copyWatch.register(pk, sid)) otherSeen = copyWatch.lastOtherSeenS(pk, sid);
+  // 3. what this LSP holds with that key — open channels, then pending opens (closes are not the wallet's question)
+  let channels = [];
+  try {
+    const r = await lndGet('/v1/channels');
+    channels = ((r && r.channels) || [])
+      .filter(c => String(c.remote_pubkey || '').toLowerCase() === pk)
+      .map(c => ({
+        chan_point: c.channel_point,
+        capacity_sats: Number(c.capacity) || 0,
+        wallet_side_sats: Number(c.remote_balance) || 0,
+        active: !!c.active,
+        pending_htlcs: Array.isArray(c.pending_htlcs) ? c.pending_htlcs.length : 0,
+        commitment_type: String(c.commitment_type || ''),   // 0.92.1
+      }));
+  } catch (e) {
+    return jsonResponse(res, { ok: false, reason: 'lnd_unavailable' }, 503);
+  }
+  const pendingOpen = [];
+  try {
+    const pr = await lndGet('/v1/channels/pending');
+    for (const pc of ((pr && pr.pending_open_channels) || [])) {
+      const ch = pc.channel || pc;
+      if (String(ch.remote_node_pub || '').toLowerCase() === pk) pendingOpen.push({ chan_point: ch.channel_point, capacity_sats: Number(ch.capacity) || 0, commitment_type: String(ch.commitment_type || '') });   // 0.92.1
+    }
+  } catch (e) { /* pending opens are informational */ }
+  console.log(`[MyChannels] ${pk.slice(0, 16)}: ${channels.length} open, ${pendingOpen.length} pending open` + (otherSeen !== undefined && otherSeen !== null ? ` · another copy seen ${otherSeen} s ago` : ''));
+  const out = { ok: true, channels, pending_open: pendingOpen };
+  if (otherSeen !== undefined) out.other_copy_seen_s = otherSeen;   // 0.93.0: null = no other copy known
+  return jsonResponse(res, out);
+}
+
 function leaseForceClose(fundingTxid, outputIndex) {
   return new Promise((resolve, reject) => {
     const { execFile } = require('child_process');
@@ -5593,6 +5683,18 @@ const server = http.createServer(async (req, res) => {
         filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it
       };
       if (HEALTH_DETAIL) base.lnd_version = info.version;
+      // 0.93.0 (S57): a registered copy's heartbeat — alive, how many of this provider's channels it knows, its backup
+      // number; the answer names any other copy of the same wallet alive with it
+      { const u = String(req.url || '');
+        const mc = u.match(/[?&]client(?:_pubkey)?=([0-9a-fA-F]{66})/), ms = u.match(/[?&]session=([0-9a-f]{32})(?:&|$)/);
+        if (mc && ms) {
+          const mk = u.match(/[?&]known=(\d{1,6})(?:&|$)/), mb = u.match(/[?&]bn=(\d{1,15})(?:&|$)/);
+          const cv = copyWatch.beat(mc[1].toLowerCase(), ms[1], mk ? Number(mk[1]) : NaN, mb ? Number(mb[1]) : NaN);
+          if (cv) {
+            base.copies = cv;
+            if (cv.others.length) console.log(`[Copies] ${mc[1].toLowerCase().slice(0, 16)}: ${cv.others.length + 1} copies open at once — both told`);
+          }
+        } }
       return jsonResponse(res, base);
     } catch (e) {
       return jsonResponse(res, { ok: false, error: e.message }, 503);
@@ -5603,6 +5705,10 @@ const server = http.createServer(async (req, res) => {
   // registry.js). MUST dispatch BEFORE the authOk gate below -- adapter
   // secret is the wrong auth model for these endpoints. Any exception
   // here logs + 500s rather than falling through to the auth gate.
+  if (path === '/lsps/registry/my-channels' && method === 'POST') {   // 0.92.0 (S57): public, signed-challenge auth, read-only
+    try { return await handleMyChannels(req, res, ip); }
+    catch (e) { console.error('[MyChannels] handler threw:', e); return errResponse(res, 'Internal error', 500); }
+  }
   if (path === '/lsps/registry/recover-close' && method === 'POST') {   // 0.70.0 (S44): public, signed-challenge auth
     try { return await handleRecoverClose(req, res, ip); }
     catch (e) { console.error('[Recover] handler threw:', e); return errResponse(res, 'Internal error', 500); }
