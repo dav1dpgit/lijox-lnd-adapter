@@ -119,6 +119,8 @@
  *     0.92.1 my-channels names each channel's commitment type (where a closed channel pays the wallet's share)
  *     0.93.0 one open copy at a time — a session registered in the signed my-channels request, heartbeats name
  *       another live copy of the same wallet (copies.js; LIJOX standard: one open copy per wallet)
+ *     0.94.0 /lsps2/get_info states channel_type and words_recoverable; the kit holder keeps the newest kit of the
+ *       last two other writers beside the newest (Black start kits across copies)
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -6265,6 +6267,10 @@ const server = http.createServer(async (req, res) => {
       channel_open_fee_sats: openFeeBaselineSats(),   // 0.61.0: derived — same number the registry advertises
       open_fee_quote:        openFeeQuote(_client),    // 0.61.0: THIS wallet's next open, multipliers applied — an amount, not a formula
       channel_model:         c.channel_model,
+      // 0.94.0 (S57, DP ruling (a)): the channel type this provider opens for JIT and whether a wallet's 12 words alone
+      // recover its share on a close — a field, not a rule; LiJ wallets take only words-recoverable channels
+      channel_type:          String(process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS').toUpperCase(),
+      words_recoverable:     String(process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS').toUpperCase() === 'STATIC_REMOTE_KEY',
       // 0.80.0 (S49, DP): whether THIS provider holds for offline wallets, and how long at most — the
       // wallet's dial and its provider card read it and say so plainly.
       offline_hold:          { enabled: OFFLINE_HOLD_ENABLED, cap_ms: OFFLINE_HOLD_CAP_MS, headroom_blocks: OFFLINE_MIN_HEADROOM_BLOCKS },

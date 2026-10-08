@@ -6,7 +6,14 @@
 //   POST /v1/kit   { pubkey (33-byte hex), seq (int), kit (envelope), sig (64-byte hex) }
 //                  sig = ECDSA secp256k1 (compact r‖s, low-S) over SHA-256 of
 //                        "lijox-kit-put-v1" ‖ pubkey ‖ seq_be8 ‖ SHA-256(canonical envelope)
-//   GET  /v1/kit?npub=<hex>   → { ok, seq, at, pubkey, kit } or 404
+//   GET  /v1/kit?npub=<hex>   → { ok, seq, at, pubkey, kit, w, others } or 404
+//
+// 0.94.0 (S57, DP 2026-10-07 — Black start kits across copies): a PUT may carry `w` (16 hex: the writing device,
+// random per install, outside the signed envelope; absent = the legacy writer ''). Beside the newest kit the holder
+// keeps `others`: the newest kit of each of the last two OTHER writers. A validly signed kit refused as STALE (its seq
+// not above the newest) is still kept there when it comes from another writer and is newer than that writer's kit
+// held. One device pushing again and again can never erase another device's last kit; the wallet merges them
+// (LiJ docs/design/black-start/kit-merge-r1.md).
 //
 // Verification uses Node's own crypto (the compressed public key wrapped as SPKI DER; the
 // signature as IEEE P1363 r‖s) — no third-party signature code on the box. The canonical envelope
@@ -24,6 +31,26 @@ const SPKI_PREFIX = Buffer.from('3036301006072a8648ce3d020106052b8104000a032200'
 const MAX_BYTES_DEFAULT = 65536;
 const MAX_RECORDS_DEFAULT = 20000;
 const KEEP_MS = 90 * 24 * 3600 * 1000;
+const OTHERS_MAX = 2;   // 0.94.0: the newest kit of each of the last two other writers
+
+function writerOf(body) { const w = String((body && body.w) || '').toLowerCase(); return /^[0-9a-f]{16}$/.test(w) ? w : ''; }
+/** 0.94.0: the `others` list after `rec` (a record {seq, at, w, kit}) is offered — one per writer, never the newest's
+ *  writer, the highest seq per writer, the two highest-seq writers kept. */
+function mergeOthers(others, rec, newestW) {
+  const byW = new Map();
+  for (const o of (Array.isArray(others) ? others : [])) {
+    if (!o || typeof o !== 'object') continue;
+    const w = String(o.w || '');
+    if (w === newestW) continue;
+    const have = byW.get(w); if (!have || Number(o.seq) > Number(have.seq)) byW.set(w, o);
+  }
+  if (rec && String(rec.w || '') !== newestW) {
+    const have = byW.get(String(rec.w || ''));
+    if (!have || Number(rec.seq) > Number(have.seq)) byW.set(String(rec.w || ''), rec);
+  }
+  return Array.from(byW.values()).sort((x, y) => Number(y.seq) - Number(x.seq)).slice(0, OTHERS_MAX)
+    .map((o) => ({ seq: Number(o.seq), at: Number(o.at) || 0, w: String(o.w || ''), kit: o.kit }));
+}
 
 function canonicalEnvelope(k) {
   if (!k || typeof k !== 'object') return null;
@@ -100,13 +127,27 @@ function createKitHolder(opts) {
     const v = verifyPut(body, maxBytes);
     if (!v.ok) return { status: v.code === 'TOO_LARGE' ? 413 : 400, body: { ok: false, code: v.code } };
     const cur = read(v.npub);
-    if (cur && Number(cur.seq) >= v.seq) return { status: 409, body: { ok: false, code: 'STALE', seq: Number(cur.seq) } };
+    const w = writerOf(body);
+    const write = (rec) => {
+      const tmp = file(v.npub) + '.tmp';
+      try { fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(v.npub)); return true; } catch (e) { return false; }
+    };
+    if (cur && Number(cur.seq) >= v.seq) {
+      // 0.94.0: another writer's validly signed kit is kept beside the newest, never thrown away for its number
+      const curW = String(cur.w || '');
+      if (w !== curW) {
+        const before = JSON.stringify(cur.others || []);
+        const others = mergeOthers(cur.others, { seq: v.seq, at: Date.now(), w, kit: JSON.parse(v.canon) }, curW);
+        if (JSON.stringify(others) !== before && write(Object.assign({}, cur, { others }))) log('[Kits] ' + v.npub.slice(0, 16) + '… seq ' + v.seq + ' from another writer kept beside the newest (' + cur.seq + ')');
+      }
+      return { status: 409, body: { ok: false, code: 'STALE', seq: Number(cur.seq) } };
+    }
     if (!cur) evictIfFull();
-    const rec = { seq: v.seq, at: Date.now(), pubkey: v.pubkey, kit: JSON.parse(v.canon) };
-    const tmp = file(v.npub) + '.tmp';
-    try { fs.writeFileSync(tmp, JSON.stringify(rec)); fs.renameSync(tmp, file(v.npub)); }
-    catch (e) { return { status: 500, body: { ok: false, code: 'WRITE_FAILED' } }; }
-    log('[Kits] ' + v.npub.slice(0, 16) + '… seq ' + v.seq + ' (' + v.canon.length + ' B)' + (cur ? ' replaces ' + cur.seq : ' new'));
+    const curW = cur ? String(cur.w || '') : null;
+    const others = cur ? mergeOthers(cur.others, curW !== w ? { seq: cur.seq, at: cur.at, w: curW, kit: cur.kit } : null, w) : [];
+    const rec = { seq: v.seq, at: Date.now(), pubkey: v.pubkey, kit: JSON.parse(v.canon), w, others };
+    if (!write(rec)) return { status: 500, body: { ok: false, code: 'WRITE_FAILED' } };
+    log('[Kits] ' + v.npub.slice(0, 16) + '… seq ' + v.seq + ' (' + v.canon.length + ' B)' + (cur ? ' replaces ' + cur.seq : ' new') + (others.length ? ' · ' + others.length + ' other writer(s) kept' : ''));
     return { status: 200, body: { ok: true, seq: v.seq } };
   }
   function get(npub) {
@@ -114,7 +155,7 @@ function createKitHolder(opts) {
     if (!/^[0-9a-f]{64}$/.test(npub)) return { status: 400, body: { ok: false, code: 'BAD_NPUB' } };
     const cur = read(npub);
     if (!cur) return { status: 404, body: { ok: false, code: 'NOT_FOUND' } };
-    return { status: 200, body: { ok: true, seq: cur.seq, at: cur.at, pubkey: cur.pubkey, kit: cur.kit } };
+    return { status: 200, body: { ok: true, seq: cur.seq, at: cur.at, pubkey: cur.pubkey, kit: cur.kit, w: String(cur.w || ''), others: Array.isArray(cur.others) ? cur.others : [] } };
   }
   /** The kit routes are open to EVERY wallet origin (the signature is the gate, there are no
    *  credentials): wildcard CORS, unlike the wallet-origin-scoped routes. 0.79.1. */
@@ -142,4 +183,4 @@ function createKitHolder(opts) {
   return { put, get, handle, count, openCors, capability: { v: 1, max_bytes: maxBytes } };
 }
 
-module.exports = { createKitHolder, verifyPut, canonicalEnvelope, SPKI_PREFIX, PUT_DOMAIN };
+module.exports = { createKitHolder, verifyPut, canonicalEnvelope, mergeOthers, SPKI_PREFIX, PUT_DOMAIN };
