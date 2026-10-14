@@ -1,0 +1,120 @@
+{
+ "T": 1791979200000,
+ "ts": 1791979200,
+ "keys": [
+  "03bb90e600d908353395c61371db42c4c0271c96802db56a68a097b219940a8ee4",
+  "032d9a896282f004b60f9e92b12b23309e0432d66e2647777366fa29c774293d16",
+  "0386263f5c333e7358c6ef91377c46a9a902308642c111130888a54db2d2b4ee5a"
+ ],
+ "sorted": [
+  "032d9a896282f004b60f9e92b12b23309e0432d66e2647777366fa29c774293d16",
+  "0386263f5c333e7358c6ef91377c46a9a902308642c111130888a54db2d2b4ee5a",
+  "03bb90e600d908353395c61371db42c4c0271c96802db56a68a097b219940a8ee4"
+ ],
+ "ring_hash": "bb1abd8671e41bf26d5b5916da6a781615b83f172f9be6e0f3a18e65f2f092d5",
+ "wake": "{\"endpoint\":\"https://push.example.org/seat-1\",\"keys\":{\"p256dh\":\"BP\",\"auth\":\"au\"}}",
+ "jobs": [
+  {
+   "name": "a",
+   "signer": 1,
+   "size": 50000,
+   "seat": "d4fcb94b60f6d18d188fce0269e016b1362d44fac8c1d9a1f0fe7e36c20c26e4",
+   "tag": "lij/tatara/seat/v1/2026-W42",
+   "m": "336ec3dc2f2f8530147dbe01e3422ae1c3637c4e9c29a1937018ab7d8f50dc88",
+   "sig": {
+    "c0": "a052e692736d7aa3d8ae6cdfdb0581003da050bd8af927852acb03a8a3595e8e",
+    "key_image": "02de743cb70c2bc6cba445aecd130eff5d75009b7ad7ac046004f5be56e31385e1",
+    "s": [
+     "1b02010247bbfeece8c9167e7c0a0346452d6bbb79955d323520f290972224f9",
+     "4a7a02259aa41a4501e584b72e145fc599b3b7fd9c860a8423870b5128b9e5d6",
+     "d32bd4477cb0ed394ff683523b4fd31c08d4696c0bd377ea97d9089a2bbd8779"
+    ]
+   }
+  },
+  {
+   "name": "b",
+   "signer": 1,
+   "size": 50000,
+   "seat": "c408ccbe83f8425a4a7144cac7fca2da669c1aa02d082573ccca02f344f005c0",
+   "tag": "lij/tatara/seat/v1/2026-W42",
+   "m": "cac03a609153b4aeced3a4d9efca35b3491c4b9942f7ac1cf3049fe41017816e",
+   "sig": {
+    "c0": "a6506beff96af46bbd10f055d2dbb36475a533b8d9f713cf77afb601f43f9162",
+    "key_image": "02de743cb70c2bc6cba445aecd130eff5d75009b7ad7ac046004f5be56e31385e1",
+    "s": [
+     "565ad2a893f32a70b98ba2ea861b240f568aa6d693f25b9de403355fb749ba6f",
+     "22f9ed5987b6776dedf347bb5af5e48ee5c3bb269e632e16367547ef2aade3ee",
+     "5d6b03d3acf1e48d673ab04c4a196b9564c361db2671ea762c627c4a8e49fbb8"
+    ]
+   }
+  },
+  {
+   "name": "c",
+   "signer": 1,
+   "size": 100000,
+   "seat": "9892650c8b9dc4d26acbae02b8c7d533e6e84220f8caf82f91e3ecf86cea5315",
+   "tag": "lij/tatara/seat/v1/2026-W42",
+   "m": "c93c8a67fe72f28fc29ca61d6de497f6384120f2aad3b161adb971e4cb377d6e",
+   "sig": {
+    "c0": "a9d9e8772c77bec949093906e52c610c99f0428ee6d3958d405b7b9e14921f12",
+    "key_image": "02de743cb70c2bc6cba445aecd130eff5d75009b7ad7ac046004f5be56e31385e1",
+    "s": [
+     "31bb09e07aa024a6e7e3aa14ed26b29e4fe1b84fa3d9c4240234bc3aede00f65",
+     "1b56069b5f3c33ba20b35384f3954105f1fb53cd8188a28745c8922b608764f2",
+     "1c2177f0d4cf5dce1b49b1a7dafc9fb8bce3f58ea5132364146d2e41f44e5480"
+    ]
+   }
+  },
+  {
+   "name": "d",
+   "signer": 2,
+   "size": 50000,
+   "seat": "55cd3e6b00787cd803685eb1b9e4c45e9ede351193aff691dcb724cad6d3a205",
+   "tag": "lij/tatara/seat/v1/2026-W42",
+   "m": "235d680ff1d97388bf990e3917e976eab7e4618f77bb9f127a6871b288bd3440",
+   "sig": {
+    "c0": "bdc2fd4b509808062b8883b75e6021fe4fe8abb9a01f977d6755f9971b11cdac",
+    "key_image": "021d3f6bf8e7fb54317f7e63004457d111ba1b59da0b66629d5895257589eb9d72",
+    "s": [
+     "c0d2ccdee66736e9d7ed68bb9af33433123722fa63077f1aca5407a6e953c6ea",
+     "708d2a307ae413b2b8f68b20d9245ddb85495019110ac860d27706a88d1337c4",
+     "843005ef3ed4d6fdd56a0328122df64161a26420adbaaa8e6aba772f90c33e89"
+    ]
+   }
+  },
+  {
+   "name": "e",
+   "signer": 0,
+   "size": 50000,
+   "seat": "4e95f166b997b5c985cf5aa912ae761731b12a05c5bcd393402467413fad2a0a",
+   "tag": "lij/tatara/seat/v1/2026-W43",
+   "m": "5a2327a3f9eba93114a8597bc7b961be44802a70ccf97ac3e5c5ecb1f7183bac",
+   "sig": {
+    "c0": "780fd5b0f4254424dc9e1a3df5ed327713a3e692250d53c1128756bc21b8fda0",
+    "key_image": "0320d2a05a1db5204a38845a8b8a50c985ed34b654f4b726871b040e11f20d4e9d",
+    "s": [
+     "45277fd22c35d2bbaa2fda9cd3dde5aa725cf304a01b3085cb4f0254c30d5481",
+     "c6717368e33a80c1ca1fec334a884caa7c995ee4d3d6e90491b323fa6b47b3cd",
+     "0970e20787ce1e50d17fe292f8c659c37f906fa6cbd4c1a1ad68f9182bb71502"
+    ]
+   }
+  },
+  {
+   "name": "f",
+   "signer": 0,
+   "size": 50000,
+   "seat": "0558e2268d70e0b51ffc4387673e4c9f50970df7414b57b297bea65346d98b24",
+   "tag": "lij/tatara/seat/v1/2026-W42",
+   "m": "2a3729884277c76033a3dd299174dfe2eebe14b72b07ef6a98e793d9a6f26e60",
+   "sig": {
+    "c0": "179604c2f6312650773ee8b58b3587924579c6a800353d91d99ec9f82af7bff2",
+    "key_image": "0322cba3cc11eb7c88e6daa43513fb053eeca6278fff5dbf47aa783f80e00a4a84",
+    "s": [
+     "e384483e2d88b4ad4d4d70457375f2de5084b73d47164cc77d6e693f5b6deee4",
+     "eb3a610a8fb9da52a9fa52535ce0dbc42f0ce9f8616d34049039b90839645841",
+     "f72305cf3e51dc66ecf06c9ab428ebc36aff3282b038a287c98ed9b614daba34"
+    ]
+   }
+  }
+ ]
+}

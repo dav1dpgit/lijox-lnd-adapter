@@ -164,6 +164,8 @@ const HEIGHT_HINT_LOOKBACK = 1000;
  * @param {string} opts.hostname               LND REST host (for getinfo/estimatefee)
  * @param {number} opts.port                   LND REST port
  * @param {string} opts.macaroon               Hex-encoded macaroon (REST + gRPC use same one)
+ * @param {Object} [opts.restTls]               0.95.0: TLS options for the REST helpers — { ca, rejectUnauthorized: true }
+ *                                              when LND_REST_CA_PATH is set; absent = no check, as before
  * @returns {{stop, registrySize, registrySnapshot, streamCounts}}
  */
 function startBridge(opts) {
@@ -174,6 +176,7 @@ function startBridge(opts) {
     hostname,
     port,
     macaroon,
+    restTls,
   } = opts;
   if (!lightningClient)     throw new Error('startBridge: lightningClient required');
   if (!chainNotifierClient) throw new Error('startBridge: chainNotifierClient required');
@@ -222,7 +225,8 @@ function startBridge(opts) {
         payload = JSON.stringify(body);
         headers['Content-Length'] = Buffer.byteLength(payload);
       }
-      const options = { hostname, port, path: reqPath, method, rejectUnauthorized: false, headers };
+      // 0.95.0 (D3): the adapter's certificate rule (restTls); absent = no check, as before
+      const options = Object.assign({ hostname, port, path: reqPath, method, headers }, restTls || { rejectUnauthorized: false });
       const req = https.request(options, (res) => {
         let respBody = '';
         res.on('data', (c) => { respBody += c; });
@@ -814,6 +818,21 @@ function startBridge(opts) {
       spendStreams.clear();
       registry.clear();
       console.log('[ChainBridge] stopped, all streams torn down, registry cleared');
+    },
+    // 0.96.0 (S58, proposal 3): a ChainDataBundle sent unasked — the adapter's tunnel calls this the moment a wallet's
+    // handshake has passed. Type 32803 is odd, so a peer that does not know it ignores it. Resolves true when LND took
+    // the message, false otherwise; never throws; touches no subscription (the wallet still subscribes as before, and
+    // a failure here never counts toward evicting a subscriber).
+    pushBundle: async (peerHex, contextLabel) => {
+      try {
+        const bundle = await buildChainDataBundle();
+        await sendToPeer(peerHex, m.TYPE_CHAIN_DATA_BUNDLE, m.encodeChainDataBundle(bundle));
+        console.log(`[ChainBridge] sent ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}, unasked): tip=${bundle.tip_height} fees=${bundle.fee_sat_per_vb_fast}/${bundle.fee_sat_per_vb_medium}/${bundle.fee_sat_per_vb_slow} sat/vB`);
+        return true;
+      } catch (e) {
+        console.warn(`[ChainBridge] unasked ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}) not sent: ${e.message}`);
+        return false;
+      }
     },
     registrySize: () => registry.size,
     registrySnapshot: () => {

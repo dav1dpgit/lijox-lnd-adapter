@@ -32,6 +32,7 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
 | walletrpc.WalletKit/EstimateFee | fee estimates |
 | lnrpc.Lightning/VerifyMessage, GetNodeInfo, AddInvoice, DecodePayReq, ListPayments, SendPaymentSync; routerrpc.Router/SendPaymentV2 | DELEGATE PAYMENT module (slip self-auth, funding invoice, spend, refund) — missing from the v0.58.0 derivation; found 2026-09-01 when every delegate register died on the strict key |
 | lnrpc.Lightning/UpdateChannelPolicy | per-channel fee policy enforcement (planned) — baked now so no re-bake later |
+| lnrpc.Lightning/AbandonChannel | TATARA CHANNEL POOLS (0.103.0+): drop a pool's pending inbound channel whose funding can never confirm (an input spent elsewhere, 6 deep) — called with i_know_what_i_am_doing, on pending channels of Tatara pools only (tatara-channels.js) |
 | lnrpc.Lightning/DecodePayReq, ListPayments, VerifyMessage; routerrpc.Router/SendPaymentV2 | PUSH KEY HOLDER (0.82.0+): read the recipient's provider's invoice, pay it, probe it, verify a void's signature. The same four the delegate module uses — a key without them holds and delivers on its own provider only, and cannot verify a void; the adapter probes them at boot and says so (0.83.1). In bake-permissions-nodelegate.json from 0.83.1. |
 
 ## RECOMMENDED — strict per-RPC macaroon (exactly the table above)
@@ -41,6 +42,7 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
       uri:/lnrpc.Lightning/SignMessage \
       uri:/lnrpc.Lightning/ListChannels \
       uri:/lnrpc.Lightning/PendingChannels \
+      uri:/lnrpc.Lightning/AbandonChannel \
       uri:/lnrpc.Lightning/WalletBalance \
       uri:/lnrpc.Lightning/GetChanInfo \
       uri:/lnrpc.Lightning/QueryRoutes \

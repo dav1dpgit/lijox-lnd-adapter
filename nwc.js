@@ -331,7 +331,8 @@ function createNwc(deps) {
     server.on('upgrade', (req, socket, head) => {
       let pathname = '';
       try { pathname = new URL(req.url || '', 'http://lsp.local').pathname; } catch (_) {}
-      if (pathname !== RELAY_PATH || !ENABLED) { try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch (_) {} socket.destroy(); return; }
+      if (pathname !== RELAY_PATH) return;   // 0.99.0: another module's path (the Tatara relay); lij-adapter.js refuses unknown ones
+      if (!ENABLED) { try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch (_) {} socket.destroy(); return; }
       wss.handleUpgrade(req, socket, head, (ws) => {
         const s = { ws, authed: new Set(), challenge: crypto.randomBytes(16).toString('hex'), subs: new Map(), events: [] };
         sockets.add(s);

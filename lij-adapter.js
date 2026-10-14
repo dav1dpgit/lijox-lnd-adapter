@@ -121,6 +121,30 @@
  *       another live copy of the same wallet (copies.js; LIJOX standard: one open copy per wallet)
  *     0.94.0 /lsps2/get_info states channel_type and words_recoverable; the kit holder keeps the newest kit of the
  *       last two other writers beside the newest (Black start kits across copies)
+ *     0.95.0 the channel list behind findChannelScid / realChannelScids follows LND_ENDPOINT (it always asked
+ *       localhost:8080); LND_REST_CA_PATH, optional, checks LND REST's certificate (D3 — a Start9's REST is not local)
+ *     0.96.0 my-channels and recover-close have their own limits (wallet-limits.js; they shared the channel-open's 3
+ *       an hour per address); the tunnel to LND opens on the wallet's first bytes and, once its handshake has passed,
+ *       the first chain data goes out unasked (ws-tunnel.js + the bridge's pushBundle)
+ *       WALLET_CHECK_IP_REQUESTS 120 · WALLET_CHECK_IP_WINDOW_MS 600_000 · MY_CHANNELS_KEY_REQUESTS 60 ·
+ *       RECOVER_CLOSE_KEY_REQUESTS 10 · WALLET_CHECK_KEY_WINDOW_MS 3_600_000
+ *     0.97.0 LIJOX's Tatara, slice 1 (tatara.js): TATARA_* settings bounds-checked (off unless TATARA_ENABLED=true);
+ *       the registry record's tatara block (lijox-register:v3, lij-worker 0.11.0's twin); GET /tatara/info
+ *     0.98.0 Tatara slices 2–3: the waiting list (tatara-list.js) and its signed routes — seat (node key), check-in,
+ *       leave, pause, resume, open, announce, report (the seat key); signed notices; the start's wake ({t:"tatara"})
+ *     0.99.0 Tatara slice 4: the pool's private relay at /tatara/relay (tatara-relay.js) — a room per attempt, the
+ *       posting token, kind 4 for the pool's key only, memory only; one upgrade listener per path (nwc.js leaves others alone)
+ *     0.100.0 Tatara slice 5 (tatara-forward.js): forwarding other providers' wallets' payouts (to declared relays only)
+ *       and coin checks; the backup sender (the funding and the exits, sent after 3 minutes if no member has)
+ *     0.101.0 Tatara 5a — doors 1 and 2 (tatara-ring.js, tatara-ringstore.js): the week's ring of Mix-on wallets, ring-
+ *       signed seats (the tagged LSAG verifier — independently reviewed), the wake to a seat's own push address, the
+ *       relay at a random other provider, seat traffic through another provider; the arrangement read from the registry
+ *     0.102.0 Tatara (the phone's side): the "create" notice names the other opened seats' keys, so the creating phone seals
+ *       the pool's key to each inside its announcement — the provider passes it on and never holds the pool's key
+ *     0.103.0 Tatara channel pools (Phase 1b, step 12): TATARA_CHANNEL_POOLS with TATARA_CHANNEL_SIZES and LND's room for a
+ *       retry's channels read from TATARA_LND_CONF; seats on the channel route; the pending channels of channel pools
+ *       watched and abandoned when their pool can never fund (tatara-channels.js; the key gains AbandonChannel)
+ *     0.103.1 the lnd.conf room reader moved into tatara.js (0.103.0's copy here named an undefined `fs` — every read failed)
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -375,6 +399,9 @@ const { WebSocketServer } = require('ws');
 // v0.6: gRPC client for streaming + custom message send
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
+const { windowLimiter } = require('./wallet-limits');   // 0.96.0 (S58, proposal 1): the wallet checks' own limits
+const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
+const { createTatara, readLndRoom } = require('./tatara');   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
 const { createKitHolder } = require('./kits.js');
 const { createNwc } = require('./nwc.js');   // 0.86.0 (S50, DP GO — NWC): the provider's half — registration, the relay at /nwc, the wake; see nwc.js
 const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
@@ -692,6 +719,7 @@ const {
   makeWalletKitClient,
   makeRouterClient,
   makeLightningOpenChannelClient,
+  subscribeSpend,   // 0.103.0: the channel watch's spend streams
   subscribeHtlcInterceptor,
   openChannelSync,
   sendToRouteV2,
@@ -763,6 +791,8 @@ const CONFIG = {
     // v0.6: gRPC for streaming RPCs (REST gateway hangs on streams in this LND build)
     grpc_endpoint: process.env.LND_GRPC_ENDPOINT || 'localhost:10009',
     tls_cert_path: process.env.LND_TLS_CERT_PATH || `${os.homedir()}/.lnd/tls.cert`,
+    // 0.95.0 (D3): when set, REST calls check LND's certificate against this file; empty = no check (LND local)
+    rest_ca_path:  (process.env.LND_REST_CA_PATH || '').trim(),
   },
   adapter: {
     port:    parseInt(process.env.ADAPTER_PORT  || '7000'),
@@ -796,6 +826,13 @@ const CONFIG = {
     // the 3/hour channel-open limit. 60/min default.
     admin_rate_limit_requests:  parseInt(process.env.ADMIN_RATE_LIMIT_REQUESTS  || '60'),
     admin_rate_limit_window_ms: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '60000'),
+    // 0.96.0 (S58, proposal 1): my-channels and recover-close — their own limits, never the channel-open's 3 an hour.
+    // Per address (before LND checks the signature; many phones can share one address), then per node key (after).
+    wallet_check_ip_requests:   parseInt(process.env.WALLET_CHECK_IP_REQUESTS   || '120'),
+    wallet_check_ip_window_ms:  parseInt(process.env.WALLET_CHECK_IP_WINDOW_MS  || '600000'),
+    my_channels_key_requests:   parseInt(process.env.MY_CHANNELS_KEY_REQUESTS   || '60'),
+    recover_close_key_requests: parseInt(process.env.RECOVER_CLOSE_KEY_REQUESTS || '10'),
+    wallet_check_key_window_ms: parseInt(process.env.WALLET_CHECK_KEY_WINDOW_MS || '3600000'),
     // v0.18.5: SqliteChannelStore DB file path.
     registry_db_path:     process.env.REGISTRY_DB_PATH || require('path').join(DATA_DIR, 'registry.db'),  // v0.48 (D1)
     ws_allowed_origins:   (process.env.WS_ALLOWED_ORIGINS || '')  // v0.47: REQUIRED (checked at startup)
@@ -2155,6 +2192,83 @@ function isAdminRateLimited(ip) {
   return false;
 }
 
+// 0.96.0 (S58, proposal 1): the wallet checks' own limits (wallet-limits.js) — my-channels and recover-close share
+// the address ceiling (each costs LND a verifymessage); each has its own limit per node key.
+const walletCheckIpLimit   = windowLimiter(CONFIG.security.wallet_check_ip_requests,   CONFIG.security.wallet_check_ip_window_ms);
+const myChannelsKeyLimit   = windowLimiter(CONFIG.security.my_channels_key_requests,   CONFIG.security.wallet_check_key_window_ms);
+const recoverCloseKeyLimit = windowLimiter(CONFIG.security.recover_close_key_requests, CONFIG.security.wallet_check_key_window_ms);
+
+// 0.103.0 (Phase 1b, §6.3.6): LND's room for pending inbound channels, read from the lnd.conf TATARA_LND_CONF names (null
+// when not set or not readable; the module then refuses channel pools and says so).
+function lndRoomFromConf() { return readLndRoom(process.env.TATARA_LND_CONF); }   // 0.103.1: the reader lives in tatara.js (0.103.0's copy here named an `fs` this file never defines)
+let tataraChainNotifier = null;   // 0.103.0: a ChainNotifier client of the watch's own, made on first use
+function tataraNotifier() {
+  if (tataraChainNotifier) return tataraChainNotifier;
+  tataraChainNotifier = makeChainNotifierClient({ grpcEndpoint: CONFIG.lnd.grpc_endpoint, tlsCertPath: CONFIG.lnd.tls_cert_path, macaroonHex: CONFIG.lnd.macaroon });
+  return tataraChainNotifier;
+}
+
+// 0.97.0 (S58): LIJOX's Tatara (tatara.js) — made here, after CONFIG, because it reads the operator's channel limits.
+const tatara = createTatara({
+  log: (m) => console.log(m),
+  publicHttpsUrl: () => CONFIG.public.https_url,
+  channelLimits: () => ({ minChannelSats: CONFIG.channel.min_sats, maxChannelSats: CONFIG.channel.max_sats }),
+  dataDir: DATA_DIR,   // 0.98.0: the list on disk, DATA_DIR/tatara/state.json
+  // 0.98.0: a seat is signed by the wallet's node key — LND VerifyMessage; the recovered key must be the claimed one
+  verifyWalletSig: async (msg, sig) => {
+    const r = await lndPost('/v1/verifymessage', { msg: Buffer.from(msg, 'utf8').toString('base64'), signature: sig });
+    const m = r ? String(r.message || (r.error && r.error.message) || '') : '';
+    if (/permission denied|macaroon|unauthorized/i.test(m)) throw new Error('the key lacks /lnrpc.Lightning/VerifyMessage');
+    return String((r && r.pubkey) || '').toLowerCase();
+  },
+  // 0.98.0: every notice to a seat is signed by this provider's node key (LND SignMessage); '' = not signed (none sent)
+  signNotice: async (msg) => {
+    try { const r = await lndPost('/v1/signmessage', { msg: Buffer.from(msg, 'utf8').toString('base64') }); return String((r && r.signature) || ''); }
+    catch (_) { return ''; }
+  },
+  sendWakePush: (pk, kind) => sendWakePush(pk, undefined, kind),   // 0.98.0: the start wakes the seat's wallet, {t:"tatara"}
+  // 0.100.0: the registry's records (a forwarded payout goes only to a relay a registered provider declares)
+  listProviders: async () => { if (!CONFIG.registry) return []; const r = await httpsGetJson(CONFIG.registry + '/lsps'); return (r && r.json && Array.isArray(r.json.lsps)) ? r.json.lsps : []; },
+  getJson: (u) => httpsGetJson(u),   // 0.100.0: coin checks and the settlement check
+  // 0.101.0 (door 1, (b)): the start pushed to a seat's own wake address (a subscription the phone made for that seat alone)
+  sendToSubscription: async (sub, payload) => { if (!PUSH_ENABLED) return; await webpush.sendNotification(sub, JSON.stringify(payload), { TTL: 180 }); },
+  postJson: (u, b) => httpsPostJson(u, b),   // 0.101.0: provider ↔ provider (a room at another provider; seat traffic passed on)
+  selfPubkey: () => CONFIG.node.pubkey,
+  onRecordChanged: () => { registerWithRegistry().catch((e) => console.error(`[Registry] re-registration (a new week's ring) failed: ${e.message}`)); },
+  // 0.103.0 (Phase 1b): LND's room, its pending channels, AbandonChannel on a pool's dead pending channel, a spend stream, the tip
+  lndRoom: () => lndRoomFromConf(),
+  pendingChannels: async () => {
+    const r = await lndGet('/v1/channels/pending');
+    return (r && Array.isArray(r.pending_open_channels) ? r.pending_open_channels : []).map((c) => String((c && c.channel && c.channel.channel_point) || '')).filter((cp) => /^[0-9a-f]{64}:[0-9]+$/.test(cp));
+  },
+  abandonChannel: async (txid, vout) => {
+    try {
+      const r = await lndRequest('DELETE', `/v1/channels/abandon/${txid}/${vout}?i_know_what_i_am_doing=true`, null);
+      const err = String((r && (r.message || (r.error && r.error.message))) || '');
+      return err && !/^\s*$/.test(err) && !('status' in (r || {})) ? { ok: false, error: err } : { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  },
+  watchSpend: ({ txid, vout }, cb) => {
+    try {
+      // chainrpc.Outpoint.hash is the transaction id in internal byte order (the display txid reversed); so is spending_tx_hash
+      const hash = Buffer.from(txid, 'hex').reverse();
+      return subscribeSpend(tataraNotifier(), { outpoint: { hash, index: vout }, script: Buffer.alloc(0), heightHint: 0 },
+        (ev) => { if (ev.spend) cb({ spending_txid: Buffer.from(ev.spend.spending_tx_hash).reverse().toString('hex'), height: Number(ev.spend.spending_height) || 0 }); },
+        `TataraSpend:${txid.slice(0, 8)}…:${vout}`);
+    } catch (e) { console.error(`[Tatara] spend stream for ${txid.slice(0, 12)}…:${vout} could not be opened: ${e.message}`); return null; }
+  },
+  tipHeight: async () => Number((await lndGet('/v1/getinfo').catch(() => null))?.block_height || 0),
+  // 0.100.0: the backup sender — LND PublishTransaction (REST /v2/wallet/tx; the transaction's bytes base64)
+  publishTx: async (hex) => {
+    try {
+      const r = await lndPost('/v2/wallet/tx', { tx_hex: Buffer.from(hex, 'hex').toString('base64'), label: 'tatara backup' });
+      const err = String((r && (r.publish_error || r.message || (r.error && r.error.message))) || '');
+      return err ? { ok: false, error: err } : { ok: true };
+    } catch (e) { return { ok: false, error: e.message }; }
+  },
+});
+setInterval(() => { tatara.tick().catch((e) => console.error(`[Tatara] tick failed: ${e.message}`)); }, 1000);   // 0.98.0: countdowns, starts, timeouts
+
 // Clean up expired entries every 10 minutes
 setInterval(() => {
   const now = Date.now();
@@ -2164,6 +2278,7 @@ setInterval(() => {
   for (const [ip, entry] of adminRateLimitMap.entries()) {
     if (now > entry.resetAt) adminRateLimitMap.delete(ip);
   }
+  walletCheckIpLimit.sweep(); myChannelsKeyLimit.sweep(); recoverCloseKeyLimit.sweep();   // 0.96.0
 }, 600000);
 
 // v0.16: LSPS2 JIT helpers.
@@ -3518,9 +3633,7 @@ async function findChannelScid(peerPubkeyHex, channelPoint) {
   const txidHex = Buffer.from(txidBytes).reverse().toString('hex');
   const fundingOutpoint = `${txidHex}:${channelPoint.output_index}`;
 
-  // Query the chain bridge's REST helper not directly accessible — instead
-  // hit the LND REST endpoint with the same macaroon.
-  const https = require('https');
+  // 0.95.0: the channel list comes through the one REST builder (LND_ENDPOINT), never a host of its own.
 
   // F4b: a freshly-opened zero-conf channel may not have its alias_scids
   // populated in /v1/channels for a few hundred ms after openChannelSync returns
@@ -3534,29 +3647,8 @@ async function findChannelScid(peerPubkeyHex, channelPoint) {
   const scidAttempts = (CONFIG.lsps2 && CONFIG.lsps2.scid_lookup_attempts) || 60;
   const scidDelayMs  = (CONFIG.lsps2 && CONFIG.lsps2.scid_lookup_delay_ms) || 500;
 
-  const queryChannels = () => new Promise((resolve, reject) => {
-    const opts = {
-      hostname: CONFIG.lnd.rest_hostname || 'localhost',
-      port:     CONFIG.lnd.rest_port || 8080,
-      path:     `/v1/channels`,
-      method:   'GET',
-      rejectUnauthorized: false,
-      headers:  { 'Grpc-Metadata-macaroon': CONFIG.lnd.macaroon },
-    };
-    const req = https.request(opts, (res) => {
-      let body = '';
-      res.on('data', (c) => body += c);
-      res.on('end', () => {
-        if (res.statusCode === 200) {
-          try { resolve(JSON.parse(body).channels || []); }
-          catch (e) { reject(new Error(`parse: ${body.slice(0,200)}`)); }
-        } else reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0,200)}`));
-      });
-      res.on('error', reject);
-    });
-    req.on('error', reject);
-    req.end();
-  });
+  // 0.95.0: any answer but HTTP 200 is an error (lndGetOk), as before.
+  const queryChannels = async () => (await lndGetOk('/v1/channels')).channels || [];
 
   for (let attempt = 0; attempt < scidAttempts; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, scidDelayMs));
@@ -3579,36 +3671,14 @@ async function findChannelScid(peerPubkeyHex, channelPoint) {
 
 // F4: refresh the realChannelScids cache from LND ListChannels. Collects every
 // channel's chan_id, all alias_scids, and peer_scid_alias as decimal strings.
-// Reuses findChannelScid's exact REST pattern (same host/port/macaroon/TLS). On
-// success, atomically swaps in the new Set. On failure, keeps the last good Set
-// (never resets to null after a successful load), so a transient LND blip cannot
-// flip the handler into wrongly FAILing legitimate forwards.
+// Reads the channel list the same way findChannelScid does (lndGetOk: LND_ENDPOINT,
+// any answer but HTTP 200 an error — 0.95.0). On success, atomically swaps in the
+// new Set. On failure, keeps the last good Set (never resets to null after a
+// successful load), so a transient LND blip — or an LND error reply — cannot flip
+// the handler into wrongly FAILing legitimate forwards.
 async function refreshRealChannelScids() {
-  const https = require('https');
   try {
-    const channels = await new Promise((resolve, reject) => {
-      const opts = {
-        hostname: CONFIG.lnd.rest_hostname || 'localhost',
-        port:     CONFIG.lnd.rest_port || 8080,
-        path:     `/v1/channels`,
-        method:   'GET',
-        rejectUnauthorized: false,
-        headers:  { 'Grpc-Metadata-macaroon': CONFIG.lnd.macaroon },
-      };
-      const req = https.request(opts, (res) => {
-        let body = '';
-        res.on('data', (c) => body += c);
-        res.on('end', () => {
-          if (res.statusCode === 200) {
-            try { resolve(JSON.parse(body).channels || []); }
-            catch (e) { reject(new Error(`parse: ${body.slice(0,200)}`)); }
-          } else reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0,200)}`));
-        });
-        res.on('error', reject);
-      });
-      req.on('error', reject);
-      req.end();
-    });
+    const channels = (await lndGetOk('/v1/channels')).channels || [];
     const next = new Set();
     for (const ch of channels) {
       if (ch.chan_id && ch.chan_id !== '0') next.add(String(ch.chan_id));
@@ -3891,35 +3961,76 @@ function validateChannelSize(requested_sats) {
 
 const lndUrl = new url.URL(CONFIG.lnd.endpoint);
 
-function lndRequest(method, path, body) {
+// 0.95.0 (D3, DP 2026-10-10): the TLS of every REST call to LND, in one place (this file and the chain bridge).
+// LND_REST_CA_PATH set → the certificate LND's REST answers with is CHECKED against that file — on a Start9, REST
+// goes through StartOS's proxy on the internal network, so the file is StartOS's root CA. Unset → no check, as
+// before: on the UM890 and the Umbrel REST is 127.0.0.1, nothing else can answer there.
+let LND_REST_CA = null;
+if (CONFIG.lnd.rest_ca_path) {
+  try { LND_REST_CA = require('fs').readFileSync(CONFIG.lnd.rest_ca_path); }
+  catch (e) { LND_REST_CA = null; /* requireIdentityConfig stops the start — always, doctor or not */ }
+}
+function lndRestTls() {
+  // Asking for the check never quietly turns it off: a set but unreadable file still checks (against the system's
+  // authorities, which refuse LND's self-signed certificate) — and the start is refused before any call anyway.
+  if (CONFIG.lnd.rest_ca_path) return { ca: LND_REST_CA || undefined, rejectUnauthorized: true };
+  return { rejectUnauthorized: false };
+}
+
+// 0.95.0: the REST port LND_ENDPOINT names. The URL parser drops a written ':443' (https's default), which sent
+// "https://host:443" to 8080; a written port is now kept, and no port at all still means LND's 8080.
+function lndRestPort() {
+  if (lndUrl.port) return Number(lndUrl.port);
+  return /^https:\/\/[^/]*:443(\/|$)/i.test(String(CONFIG.lnd.endpoint).trim()) ? 443 : 8080;
+}
+
+// 0.95.0: the one builder for a REST call to LND — host and port from LND_ENDPOINT, TLS from lndRestTls().
+// Resolves { status, data } (the raw body); the callers below decide what an answer means.
+function lndRequestRaw(method, path, body) {
   return new Promise((resolve, reject) => {
     const payload = body ? JSON.stringify(body) : null;
-    const options = {
+    const options = Object.assign({
       hostname:           lndUrl.hostname,
-      port:               lndUrl.port || 8080,
+      port:               lndRestPort(),
       path,
       method,
-      rejectUnauthorized: false, // LND self-signed cert — safe on localhost
       headers: {
         'Grpc-Metadata-macaroon': CONFIG.lnd.macaroon,
         'Content-Type':           'application/json',
       },
-    };
+    }, lndRestTls());
     if (payload) options.headers['Content-Length'] = Buffer.byteLength(payload);
 
     const req = https.request(options, res => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error(`JSON parse error: ${data}`)); }
-      });
+      res.on('end', () => resolve({ status: res.statusCode, data }));
+      // an answer cut off halfway (LND restarting) is an error — never a wait with no end
+      res.on('error', reject);
+      res.on('close', () => { if (!res.complete) reject(new Error('LND REST answer cut off (aborted)')); });
     });
 
     req.on('error', reject);
     if (payload) req.write(payload);
     req.end();
   });
+}
+
+// Unchanged contract: the parsed body, whatever the HTTP status (an LND error reply comes back as data).
+function lndRequest(method, path, body) {
+  return lndRequestRaw(method, path, body).then(({ data }) => {
+    try { return JSON.parse(data); }
+    catch (e) { throw new Error(`JSON parse error: ${data}`); }
+  });
+}
+
+// 0.95.0: a GET where any answer but HTTP 200 is an error — for reads where an error reply taken as data would do
+// harm (the channel list behind findChannelScid and realChannelScids).
+async function lndGetOk(path) {
+  const { status, data } = await lndRequestRaw('GET', path, null);
+  if (status !== 200) throw new Error(`HTTP ${status}: ${String(data).slice(0, 200)}`);
+  try { return JSON.parse(data); }
+  catch (e) { throw new Error(`parse: ${String(data).slice(0, 200)}`); }
 }
 
 const lndGet  = path         => lndRequest('GET',  path, null);
@@ -4453,49 +4564,14 @@ function startWebSocketProxy() {
 
     console.log(`[WS] Peer connection from ${clientIp} (origin: ${origin})`);
 
-    // Open a raw TCP connection to LND's peer port
-    const tcp = net.createConnection({
+    // 0.96.0 (S58): ws-tunnel.js pipes the socket to LND's peer port — TCP opens on the wallet's first bytes (a socket
+    // engine v322 opened early holds nothing at LND); once its handshake has passed, the first chain data goes unasked.
+    wsTunnel(ws, {
       host: CONFIG.lnd.peer_host,
       port: CONFIG.lnd.peer_port,
+      onHandshake: (local) => { pushFirstBundle(local).catch((e) => console.warn(`[WS] first chain data: ${e.message}`)); },
     });
-
-    tcp.on('connect', () => {
-      console.log(`[WS] TCP tunnel open to ${CONFIG.lnd.peer_host}:${CONFIG.lnd.peer_port}`);
-    });
-
-    // WebSocket → TCP
-    ws.on('message', data => {
-      if (tcp.writable) {
-        tcp.write(typeof data === 'string' ? Buffer.from(data) : data);
-      }
-    });
-
-    // TCP → WebSocket
-    tcp.on('data', data => {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(data);
-      }
-    });
-
-    // Teardown
-    ws.on('close', () => {
-      console.log(`[WS] Peer disconnected: ${clientIp}`);
-      tcp.destroy();
-    });
-
-    ws.on('error', err => {
-      console.error(`[WS] WebSocket error: ${err.message}`);
-      tcp.destroy();
-    });
-
-    tcp.on('close', () => {
-      if (ws.readyState === ws.OPEN) ws.close();
-    });
-
-    tcp.on('error', err => {
-      console.error(`[WS] TCP error: ${err.message}`);
-      if (ws.readyState === ws.OPEN) ws.close();
-    });
+    ws.on('close', () => console.log(`[WS] Peer disconnected: ${clientIp}`));
   });
 
   wss.on('listening', () => {
@@ -4506,6 +4582,28 @@ function startWebSocketProxy() {
   wss.on('error', err => {
     console.error(`[WS] Server error: ${err.message}`);
   });
+}
+
+// 0.96.0 (S58, DP 2026-10-12 20:18 — proposal 3): THE FIRST CHAIN DATA, UNASKED. The wallet's CHAIN dot waited a
+// round trip it did not need: the wallet asked (SubscribeChainData) once its connection was up, and only then did the
+// bridge answer with a ChainDataBundle. Now the tunnel's own address finds the wallet's node key in ListPeers (LND
+// names an inbound peer by the address it came from — the tunnel's end) and the bridge sends the bundle at once.
+// Type 32803 is odd: a peer that does not know it ignores it; the engine takes a bundle whether or not it asked.
+// The wallet still subscribes and is answered as before. No peer matched, or no bridge: nothing sent, nothing changed.
+async function pushFirstBundle(local) {
+  if (!chainBridge || typeof chainBridge.pushBundle !== 'function') return;
+  const found = await findPeerOn(local, async () => ((await lndGet('/v1/peers')) || {}).peers || []);
+  if (!found) {
+    if (local.alive()) console.log(`[WS] no LND peer on the tunnel's address (port ${local.port}) within 2 s — the wallet asks for its chain data as before`);
+    return;
+  }
+  for (let i = 0; i < 3 && local.alive(); i++) {
+    if (i) await new Promise((r) => setTimeout(r, 200));
+    if (await chainBridge.pushBundle(found.peerHex, 'handshake')) {
+      console.log(`[WS] ${found.peerHex.slice(0, 16)}… found on the tunnel ${found.ms} ms after its handshake; its first chain data sent unasked`);
+      return;
+    }
+  }
 }
 
 // ── Registry Registration ─────────────────────────────────────────────────────
@@ -4555,15 +4653,51 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.tatara) {
+    const t = f.tatara;
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    return 'lijox-register:v3:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf).map(encodeURIComponent).join(':');
+  }
   if (f.filter_url) {
     return 'lijox-register:v2:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')]).map(encodeURIComponent).join(':');
   }
   return 'lijox-register:v1:' + fields.map(encodeURIComponent).join(':');
 }
+// 0.97.0 (lij-worker 0.11.0, S58 — Tatara step 4): a record that offers Tatara pools is signed as 'lijox-register:v3:' +
+// the v1 fields + filter_url ('' when none) + filter_sp + the tatara block in this order. VERBATIM twin of the worker's
+// TATARA_FIELDS — any change there changes here in the same release, or registration 403s.
+const TATARA_FIELDS = [
+  ['v', 'int'], ['sizes', 'list'], ['min_people', 'int'], ['max_people', 'int'], ['countdown_s', 'int'],
+  ['wake_window_s', 'int'], ['max_retries', 'int'], ['strikes', 'int'], ['max_pools_per_size', 'int'],
+  ['max_pools_total', 'int'], ['max_list_per_size', 'int'], ['max_fee_rate', 'int'], ['channel_pools', 'bool'],
+  ['channel_sizes', 'list'], ['relay_url', 'str'], ['relay_for_others', 'bool'], ['forward_payouts', 'bool'],
+  ['forward_coin_checks', 'bool'], ['coin_check_url', 'str'], ['ring_hash', 'str'],
+];
 
 // 0.87.0: the address rule — the registry's cleanFilterUrl and the wallet engine's clean_filter_base (v296).
 const FILTER_URL_RE = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
 function filterUrlOk(t) { return !!t && t.length <= 200 && !t.endsWith('/') && FILTER_URL_RE.test(t); }
+
+// 0.101.0: POST JSON to a URL, answer { status, json } (json null when the body is not JSON). 10 s limit, 64 KB answer.
+function httpsPostJson(endpoint, body) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    try {
+      const payload = JSON.stringify(body || {});
+      const req = https.request(endpoint, { method: 'POST', timeout: 10000, headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), 'Accept': 'application/json' } }, (res) => {
+        let data = '';
+        res.on('data', (c) => { data += c; if (data.length > 65536) req.destroy(); });
+        res.on('end', () => { let j = null; try { j = JSON.parse(data); } catch (_) {} finish({ status: res.statusCode, json: j }); });
+        res.on('error', (e) => finish({ status: 0, json: null, error: e.message }));
+      });
+      req.on('timeout', () => { req.destroy(new Error('no answer in 10 s')); });
+      req.on('error', (e) => finish({ status: 0, json: null, error: e.message }));
+      req.end(payload);
+    } catch (e) { finish({ status: 0, json: null, error: e.message }); }
+  });
+}
 
 // 0.87.0: GET a URL, answer { status, json } (json null when the body is not JSON). 10 s limit.
 function httpsGetJson(endpoint) {
@@ -4681,6 +4815,9 @@ async function registerWithRegistry() {
       console.log('[Registry] filter server ' + CONFIG.public.filter_url + ': ' + filterStatus.note);
       if (filterStatus.ok) { body.filter_url = CONFIG.public.filter_url; body.filter_sp = filterStatus.sp; }
     }
+    // 0.97.0 (S58): the Tatara block when the module is on (lijox-register:v3); off = v1/v2 as before
+    const tb = tatara.recordBlock();
+    if (tb) { body.tatara = tb; console.log('[Registry] tatara block: sizes ' + tb.sizes.join(',') + ' · relay ' + tb.relay_url); }
     const canonical = canonicalRegisterMsg(body);
     const signed = await lndPost('/v1/signmessage', {
       msg: Buffer.from(canonical, 'utf8').toString('base64'),
@@ -4782,6 +4919,10 @@ function settingsReport() {
     row('NWC', 'switch', 'NWC_ENABLED', nwc.settings().enabled ? 'on' : 'off', '', 'off by default; on = this provider keeps and relays NWC requests for its wallets (never pays, never reads one) — 0.86.0'),
     row('NWC', 'request ttl ceiling', 'NWC_REQUEST_TTL_CEILING_S', nwc.settings().request_ttl_ceiling_s, 's', 'the longest a waiting request is kept; the wallet\'s own dial governs within it'),
     row('NWC', 'relay', '', nwc.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /nwc'),
+    row('Tatara', 'switch', 'TATARA_ENABLED', tatara.settings().enabled ? (tatara.settings().ok ? 'on' : 'REFUSED') : 'off', '', tatara.settings().problems.length ? tatara.settings().problems.join(' · ') : 'off by default; on = this provider offers Mix pools and declares its limits in the registry record (0.97.0: slice 1 — declared only)'),
+    row('Tatara', 'sizes', 'TATARA_SIZES', (tatara.settings().sizes || []).join(', '), 'sats', ''),
+    row('Tatara', 'people', 'TATARA_MIN_PEOPLE / TATARA_MAX_PEOPLE', tatara.settings().min_people + '–' + tatara.settings().max_people, '', 'LiJ pools are 3 to 6'),
+    row('Tatara', 'relay', '', tatara.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /tatara/relay'),
     row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
     row('Lease', 'dry run', 'LEASE_DRY_RUN', Ls.dry_run, '', 'true = logs would_close, never closes'),
     row('Lease', 'silence before close', 'LEASE_DAYS', Ls.days, 'days', 'per-channel ttl overrides it (lease state)'),
@@ -4808,6 +4949,7 @@ function settingsReport() {
     row('Secrets', 'VAPID (web push)', 'VAPID_PRIVATE_KEY', E.VAPID_PRIVATE_KEY ? 'set' : 'unset', '', ''),
     row('Paths', 'data dir', 'LIJ_DATA_DIR', DATA_DIR, '', 'registries, tapes, lease state, notes, PL'),
     row('Paths', 'LND REST', 'LND_ENDPOINT', (CONFIG.lnd && CONFIG.lnd.endpoint) || '', '', ''),
+    row('Paths', 'LND REST certificate', 'LND_REST_CA_PATH', (CONFIG.lnd && CONFIG.lnd.rest_ca_path) || '(empty — not checked)', '', 'checked against this file when set (0.95.0)'),
   ];
   return rows;
 }
@@ -5268,7 +5410,9 @@ function leaseTtlDays(rec) {
 // channels the wallet opened since.
 const RECOVER_CLOSE_DOMAIN = 'lij-recover-close-v1:';
 async function handleRecoverClose(req, res, ip) {
-  if (isRateLimited(ip)) return errResponse(res, 'Rate limit exceeded', 429);
+  // 0.96.0 (S58): the wallet checks' own address ceiling, before LND is asked to check anything (was the channel-open's 3 an hour)
+  const ipLim = walletCheckIpLimit.hit(ip);
+  if (!ipLim.ok) { console.warn(`[Security] Wallet-check limit hit for ${ip} — resets in ${ipLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
   let body;
   try { body = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON'); }
   const pk = String(body.node_pubkey || '').toLowerCase().trim();
@@ -5296,6 +5440,9 @@ async function handleRecoverClose(req, res, ip) {
     console.warn(`[Recover] BAD_SIG from ${ip} for ${pk.slice(0, 16)}`);
     return jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401);
   }
+  // 0.96.0 (S58): this key's own limit, counted only now that the signature has proven the key; the nonce stays unspent
+  const keyLim = recoverCloseKeyLimit.hit(pk);
+  if (!keyLim.ok) { console.warn(`[Recover] ${pk.slice(0, 16)}: limit hit — resets in ${keyLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
   // 2. consume the nonce AFTER the signature check (same order as the registry)
   const nr = registryNonceStore.consume(nonce);
   if (!nr.ok) return jsonResponse(res, { ok: false, reason: nr.code }, 400);
@@ -5378,7 +5525,9 @@ async function handleRecoverClose(req, res, ip) {
 // A wallet that gets no answer starts as it always has (DP: the check must never lock up the device).
 const MY_CHANNELS_DOMAIN = 'lij-my-channels-v1:';
 async function handleMyChannels(req, res, ip) {
-  if (isRateLimited(ip)) return errResponse(res, 'Rate limit exceeded', 429);
+  // 0.96.0 (S58): the wallet checks' own address ceiling, before LND is asked to check anything (was the channel-open's 3 an hour)
+  const ipLim = walletCheckIpLimit.hit(ip);
+  if (!ipLim.ok) { console.warn(`[Security] Wallet-check limit hit for ${ip} — resets in ${ipLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
   let body;
   try { body = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON'); }
   const pk = String((body && body.node_pubkey) || '').toLowerCase().trim();
@@ -5406,6 +5555,9 @@ async function handleMyChannels(req, res, ip) {
     console.warn(`[MyChannels] BAD_SIG from ${ip} for ${pk.slice(0, 16)}`);
     return jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401);
   }
+  // 0.96.0 (S58): this key's own limit, counted only now that the signature has proven the key; the nonce stays unspent
+  const keyLim = myChannelsKeyLimit.hit(pk);
+  if (!keyLim.ok) { console.warn(`[MyChannels] ${pk.slice(0, 16)}: limit hit — resets in ${keyLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
   // 2. consume the nonce AFTER the signature check (same order as recover-close and the registry)
   const nr = registryNonceStore.consume(nonce);
   if (!nr.ok) return jsonResponse(res, { ok: false, reason: nr.code }, 400);
@@ -5752,6 +5904,10 @@ const server = http.createServer(async (req, res) => {
   // /push/ block above, so /v1/nwc/register fell through to the generic 404 ("Not found") and no [NWC] line was logged.
   if (path.startsWith('/v1/nwc/')) {
     if (await nwc.handle(req, res, path, method, ip, readBody, jsonResponse)) return;   // /v1/nwc/register | /v1/nwc/unregister
+  }
+  // 0.97.0 (S58): LIJOX's Tatara — public routes on their own prefix (404 when the module is off)
+  if (path === '/tatara' || path.startsWith('/tatara/')) {
+    if (await tatara.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
   }
 
   // v0.21: LEASE POLICY is a PUBLIC read (static JSON, zero I/O) — the
@@ -7002,6 +7158,9 @@ function requireIdentityConfig() {
   if (!CONFIG.public.wss_url)            missing.push('PUBLIC_WSS_URL — the public WSS URL fronting the browser peer proxy');
   if (!CONFIG.security.ws_allowed_origins.length) missing.push('WS_ALLOWED_ORIGINS — comma list of wallet web origins allowed to connect');
   if (!CONFIG.lnd.macaroon)              missing.push('LIJ_ADAPTER_MACAROON_HEX — the macaroon the adapter uses to talk to LND (baking recipe in config.env.example)');
+  // 0.95.0 (D3): asking for the REST certificate check with a file that cannot be read stops the start — always,
+  // LIJOX_DOCTOR=off or not
+  if (CONFIG.lnd.rest_ca_path && !LND_REST_CA) missing.push(`LND_REST_CA_PATH (${CONFIG.lnd.rest_ca_path}) — that file cannot be read; point it at the certificate authority LND's REST port answers with, or leave it empty`);
   if (missing.length) {
     console.error('This adapter will not start until it knows who it is. Missing required configuration:');
     for (const m of missing) console.error('  · ' + m);
@@ -7047,9 +7206,13 @@ async function runStartupDoctor() {
         problems.push(`NODE_PUBKEY in your config (${String(CONFIG.node.pubkey).slice(0,16)}…) is not the node LND reports (${lndPub.slice(0,16)}…). Fix NODE_PUBKEY — wallets and registries key on it.`);
       } else {
         console.log(`[Doctor] LND REST reachable, macaroon accepted, node identity matches (${lndPub.slice(0,16)}…).`);
+        console.log(`[Doctor] LND REST certificate: ${LND_REST_CA ? 'checked against ' + CONFIG.lnd.rest_ca_path : 'not checked (LND_REST_CA_PATH empty)'}.`);
       }
     } catch (e) {
-      problems.push(`Cannot reach LND REST at ${CONFIG.lnd.endpoint}: ${e.message}. Is lnd running? Are LND_ENDPOINT and LND_TLS_CERT_PATH right?`);
+      const caHint = CONFIG.lnd.rest_ca_path
+        ? ` LND_REST_CA_PATH is set (${CONFIG.lnd.rest_ca_path}): on a certificate error, either that file is not the authority LND's REST answers with, or LND's certificate does not name the host in LND_ENDPOINT.`
+        : '';
+      problems.push(`Cannot reach LND REST at ${CONFIG.lnd.endpoint}: ${e.message}. Is lnd running? Are LND_ENDPOINT and LND_TLS_CERT_PATH right?` + caHint);
     }
 
     // 5. LND gRPC port reachable (HTLC interception and the chain bridge need it)
@@ -7106,6 +7269,8 @@ async function main() {
   }
   console.log(`[Startup] Rate limit (channel-open): ${CONFIG.security.rate_limit_requests} req / ${CONFIG.security.rate_limit_window_ms / 60000} min`);
   console.log(`[Startup] Rate limit (admin):        ${CONFIG.security.admin_rate_limit_requests} req / ${CONFIG.security.admin_rate_limit_window_ms / 1000}s`);
+  for (const l of tatara.startupLines()) console.log(l);   // 0.97.0
+  console.log(`[Startup] Rate limit (wallet checks): ${CONFIG.security.wallet_check_ip_requests} req / ${CONFIG.security.wallet_check_ip_window_ms / 60000} min per address; per key ${CONFIG.security.my_channels_key_requests} my-channels, ${CONFIG.security.recover_close_key_requests} recover-close / ${CONFIG.security.wallet_check_key_window_ms / 60000} min`);   // 0.96.0
   console.log(`[Startup] Registry store:            in-memory (v0.18.7 — does not survive restart; SQLite backend deferred)`);
 
   // Start WebSocket proxy
@@ -7132,8 +7297,9 @@ async function main() {
         chainNotifierClient,
         walletKitClient,
         hostname: lndUrl.hostname,
-        port:     parseInt(lndUrl.port || '8080', 10),
+        port:     lndRestPort(),   // 0.95.0: a written :443 is kept (was 8080)
         macaroon: CONFIG.lnd.macaroon,
+        restTls:  lndRestTls(),   // 0.95.0 (D3): the same certificate rule as every other REST call
       });
       console.log('[Startup] Cooperative chain bridge: started');
     } catch (e) {
@@ -7255,6 +7421,14 @@ async function main() {
   }, 30000);
 
   nwc.attach(server);   // 0.86.0: the NWC relay rides the API server — an Upgrade at /nwc (refused when NWC_ENABLED is not true)
+  // 0.99.0: the Tatara relay rides it too (/tatara/relay); any other path's upgrade is refused here (nwc.js leaves them alone)
+  server.on('upgrade', (req, socket, head) => {
+    if (tatara.handleUpgrade(req, socket, head)) return;
+    let p = ''; try { p = new URL(req.url || '', 'http://lsp.local').pathname; } catch (_) {}
+    if (p === '/nwc') return;
+    try { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); } catch (_) {}
+    socket.destroy();
+  });
   setInterval(() => { try { nwc.sweep(); } catch (e) { console.error(`[NWC] sweep failed: ${e.message}`); } }, 5 * 60 * 1000);
   server.listen(CONFIG.adapter.port, () => {
     console.log(`[Startup] HTTP API listening on port ${CONFIG.adapter.port}`);

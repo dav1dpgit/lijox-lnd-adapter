@@ -20,7 +20,7 @@ const myIdx = src.indexOf("path === '/lsps/registry/my-channels'"), regIdx = src
 check(myIdx > 0 && regIdx > myIdx, 'it is dispatched before the registry router and the auth gate');
 
 const PK = '02' + 'aa'.repeat(32), OTHER = '03' + 'bb'.repeat(32), NONCE = 'cd'.repeat(32);
-function load({ recovered = PK, verifyDown = false, lndDown = false, nonceOk = true, otherSeen = null } = {}) {
+function load({ recovered = PK, verifyDown = false, lndDown = false, nonceOk = true, otherSeen = null, ipLimit = null, keyLimit = null } = {}) {
   const calls = { verify: [], get: [], consumed: [], registered: [] };
   const copyWatch = { register: (pk, sid) => { calls.registered.push([pk, sid]); return true; }, lastOtherSeenS: () => otherSeen };
   const answers = [];
@@ -44,10 +44,13 @@ function load({ recovered = PK, verifyDown = false, lndDown = false, nonceOk = t
     return {};
   };
   const registryNonceStore = { consume: (n) => { calls.consumed.push(n); return nonceOk ? { ok: true } : { ok: false, code: 'nonce_unknown' }; } };
-  const mk = new Function('isRateLimited', 'readBody', 'errResponse', 'jsonResponse', 'lndRequest', 'lndGet', 'registryNonceStore', 'console', 'copyWatch',
+  // 0.96.0: the wallet checks' own limits (wallet-limits.js); null = a limiter that never refuses
+  const { windowLimiter } = require('./wallet-limits');
+  const ipLim = ipLimit || windowLimiter(1e9, 1e9), keyLim = keyLimit || windowLimiter(1e9, 1e9);
+  const mk = new Function('walletCheckIpLimit', 'myChannelsKeyLimit', 'readBody', 'errResponse', 'jsonResponse', 'lndRequest', 'lndGet', 'registryNonceStore', 'console', 'copyWatch',
     block + '\n; return { handleMyChannels, MY_CHANNELS_DOMAIN };');
   const quiet = { log: () => {}, warn: () => {}, error: () => {} };
-  const api = mk(() => false, async (req) => req.body,
+  const api = mk(ipLim, keyLim, async (req) => req.body,
     (res, msg, code) => { answers.push({ code: code || 400, body: { error: msg } }); },
     (res, body, code) => { answers.push({ code: code || 200, body }); },
     lndRequest, lndGet, registryNonceStore, quiet, copyWatch);
@@ -102,8 +105,32 @@ const good = { node_pubkey: PK, nonce: NONCE, signature: 'd7sig' };
   s = load();
   a = await ask(s, good);
   check(s.calls.registered.length === 0 && !('other_copy_seen_s' in a.body), 'm8 no session sent: nothing registered, no copy field');
+  // m9 — 0.96.0 (DP's journal 18:35: a fourth start in an hour got "Rate limit hit"): the wallet checks' own limits
+  {
+    const { windowLimiter } = require('./wallet-limits');
+    check(!/isRateLimited/.test(block), 'm9 my-channels no longer uses the channel-open limit (3 an hour per address)');
+    let t = 0; const clock = () => t;
+    const ipLimit = windowLimiter(2, 600000, clock), keyLimit = windowLimiter(60, 3600000, clock);
+    s = load({ ipLimit, keyLimit });
+    for (let i = 0; i < 4; i++) a = await ask(s, good);
+    check(s.answers.filter(x => x.code === 200).length === 2 && a.code === 429 && s.calls.verify.length === 2, 'm9 past the address ceiling: 429 before LND is asked to check the signature');
+    t = 600001; a = await ask(s, good);
+    check(a.code === 200, 'm9 the address window ends: answered again');
+    t = 0;
+    const keyOnly = windowLimiter(3, 3600000, clock);
+    s = load({ keyLimit: keyOnly });
+    for (let i = 0; i < 5; i++) a = await ask(s, good);
+    check(s.answers.filter(x => x.code === 200).length === 3 && a.code === 429 && s.calls.verify.length === 5 && s.calls.consumed.length === 3,
+      'm9 past this key\'s limit: 429 after the signature check, the nonce left unspent');
+    const sOther = load({ keyLimit: keyOnly, recovered: OTHER });
+    a = await ask(sOther, Object.assign({}, good, { node_pubkey: OTHER }));
+    check(a.code === 200, 'm9 another key is not held back by this key\'s limit');
+    const sBad = load({ keyLimit: windowLimiter(1, 3600000, clock), recovered: OTHER });
+    for (let i = 0; i < 3; i++) a = await ask(sBad, good);
+    check(a.code === 401 && sBad.answers.every(x => x.code === 401), 'm9 bad signatures with someone\'s key never use up that key\'s limit');
+  }
   // m7 — read-only: the handler closes nothing and writes nothing
   check(!/leaseForceClose|closechannel|\/v1\/channels\/[^'"]*close|POST'?\s*,\s*'\/v1\/channels/.test(block.replace(/\/\/[^\n]*/g, '')), 'm7 the handler closes nothing (no close call in its code)');
-  console.log(fails ? 'FAIL · my-channels · ' + fails + ' failed' : 'PASS · my-channels (m1–m8)');
+  console.log(fails ? 'FAIL · my-channels · ' + fails + ' failed' : 'PASS · my-channels (m1–m9)');
   process.exit(fails ? 1 : 0);
 })();
