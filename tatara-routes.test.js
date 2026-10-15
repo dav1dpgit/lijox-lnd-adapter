@@ -171,8 +171,25 @@ const ANN = JSON.stringify(nostrEvent(poolSk, 2022, [], JSON.stringify({ type: '
   const n2 = (await postC('checkin', { seat_id: cs[1].id, ts: ts(), sig: sig(cs[1].k, 'checkin', [cs[1].id, ts()]) })).body.notices.map((n) => JSON.parse(n.body));
   const cr = n1.find((n) => n.type === 'create'), wa = n2.find((n) => n.type === 'wait_for_announcement');
   check(cr && cr.route === 'channel' && wa && wa.route === 'channel', 'R10 the create and wait_for_announcement notices name the channel route');
+  // R11 (0.105.1, DP 2026-10-14 16:19 — a channel's coin after its close sits in the on-chain pools): there is no close
+  // route — "close" is an unknown route (400) like any other word; the coin seats on the chain route; a stray
+  // TATARA_CLOSE_SIZES line adds no queue
+  check((await post('seat', { route: 'close', size: 50000, seat_pk: key(60).pk, node_pubkey: wallet(60), ts: ts(), signature: 'good:' + wallet(60) })).code === 400, 'R11 route "close": 400 — not a route');
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), 'tatara-d-'));
+  const TD = createTatara({
+    env: { TATARA_ENABLED: 'true', TATARA_SIZES: '50000,100000', TATARA_CLOSE_SIZES: '400000', TATARA_COUNTDOWN_S: '60' }, publicHttpsUrl: 'https://lsp.example.com', dataDir: dir3, now: clock.now,
+    verifyWalletSig: async (msg, sig) => { const m = /^good:(0[23][0-9a-f]{64})$/.exec(sig); return m && sig === 'good:' + m[1] && /^lij-tatara-seat:v1\|(chain|channel)\|/.test(msg) ? m[1] : '02' + '00'.repeat(32); },
+    signNotice: async (msg) => nodeSig(msg), sendWakePush: async () => {},
+  });
+  const postD = async (action, body) => { await TD.handle({ body }, {}, '/tatara/' + action, 'POST', '7.7.7.9', async (r) => r.body, jr); return answers.pop(); };
+  check((await postD('seat', { route: 'close', size: 400000, seat_pk: key(61).pk, node_pubkey: wallet(61), ts: ts(), signature: 'good:' + wallet(61) })).code === 400, 'R11 a stray TATARA_CLOSE_SIZES line opens no close route');
+  check((await postD('seat', { route: 'chain', size: 400000, seat_pk: key(61).pk, node_pubkey: wallet(61), ts: ts(), signature: 'good:' + wallet(61) })).body.reason === 'size_not_offered', 'R11 … and no chain queue of that size');
+  await TD.handle({}, {}, '/tatara/info', 'GET', '7.7.7.10', null, jr);
+  const infoD = answers.pop();
+  check(infoD.body.queues.length === 2 && infoD.body.queues.every((q) => q.route === 'chain') && !('close_sizes' in infoD.body.settings), 'R11 /tatara/info: the two chain queues, no close queue, no close_sizes in the settings');
+  fs.rmSync(dir3, { recursive: true, force: true });
   fs.rmSync(dir2, { recursive: true, force: true });
   fs.rmSync(dir, { recursive: true, force: true });
-  console.log(fails ? 'FAIL · tatara-routes · ' + fails + ' failed' : 'PASS · tatara-routes (R1–R10)');
+  console.log(fails ? 'FAIL · tatara-routes · ' + fails + ' failed' : 'PASS · tatara-routes (R1–R11)');
   process.exit(fails ? 1 : 0);
 })().catch((e) => { console.log('FAIL · tatara-routes threw: ' + (e && e.stack || e)); process.exit(1); });

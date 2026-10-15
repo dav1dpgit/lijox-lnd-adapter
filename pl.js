@@ -13,7 +13,14 @@
 //     interceptor settle) — nothing in LND records what an LSP charged
 //   - chain fees: LND GetTransactions (our own spends' total_fees), classified as
 //     open (txid is a channel point), close (a closed channel's closing tx —
-//     ClosedChannels, optional), sweep (LND's sweep label) or other
+//     ClosedChannels, optional), sweep (LND's sweep label) or other.
+//     0.104.0 (S59, DP): LND records 0 for closes and sweeps (their inputs are not
+//     wallet coins) — those fees now come from the transactions themselves: a
+//     close's = the channel's capacity − its outputs, counted only when THIS node
+//     funded the channel (the funder pays; ClosedChannels' open_initiator); a
+//     sweep's (or any spend LND priced at 0) = its inputs, valued from the
+//     transactions LND lists (a close's outputs), − its outputs. An input that
+//     cannot be valued → the tx is counted as "fee unknown", never guessed.
 //   - payment fees: LND ListPayments (every payment this node sent; the LNURL
 //     deliveries to wallets we serve carry fee 0 on the direct channel)
 //
@@ -36,7 +43,7 @@ function dayStartMs(key) { const [y, m, d] = key.split('-').map(Number); return 
 function nextDay(key) { return dayKey(dayStartMs(key) + 36 * 3600 * 1000); }
 function emptyRow(key) {
   return { date: key, routing_fee_msat: 0, routing_count: 0, routing_by_chan: {}, open_fee_msat: 0, open_count: 0, hold_fee_msat: 0, hold_count: 0,
-    chain_fee_open_sats: 0, chain_fee_close_sats: 0, chain_fee_sweep_sats: 0, chain_fee_other_sats: 0, chain_tx_count: 0,
+    chain_fee_open_sats: 0, chain_fee_close_sats: 0, chain_fee_sweep_sats: 0, chain_fee_other_sats: 0, chain_tx_count: 0, chain_fee_unknown_count: 0,
     payment_fee_msat: 0, payment_count: 0, delivery_count: 0, computed_at: 0, partial: [],
     // 0.76.0: the sats that moved for each fee line (msat where the fee is msat)
     routing_out_msat: 0, open_moved_msat: 0, open_moved_count: 0, open_moved_fee_msat: 0, hold_moved_msat: 0, hold_moved_count: 0, hold_moved_fee_msat: 0,
@@ -96,10 +103,10 @@ function createPL(deps) {
       const r = await deps.lndGet('/v1/transactions');
       if (r && Array.isArray(r.transactions)) txs = r.transactions; else if (r && r.message) throw new Error(r.message);
     } catch (e) { missing.push('chain fees: ' + shortErr(e, 'GetTransactions')); }
-    let closes = new Set();
+    let closes = new Map();   // 0.104.0: closing txid → { capacity, local (this node funded it), channel_point }
     try {
       const r = await deps.lndGet('/v1/channels/closed');
-      if (r && Array.isArray(r.channels)) closes = new Set(r.channels.map((c) => c.closing_tx_hash).filter(Boolean));
+      if (r && Array.isArray(r.channels)) closes = new Map(r.channels.filter((c) => c && c.closing_tx_hash).map((c) => [c.closing_tx_hash, { capacity: Number(c.capacity || 0), local: String(c.open_initiator || '') === 'INITIATOR_LOCAL', channel_point: String(c.channel_point || '') }]));
       else if (r && r.message) throw new Error(r.message);
     } catch (e) { missing.push('close classification: ' + shortErr(e, 'ClosedChannels') + ' (closes counted under other)'); }
     bulk = { at: Date.now(), fwd, payments, txs, closes, missing };
@@ -137,13 +144,32 @@ function createPL(deps) {
       row.payment_fee_msat += Number(p.fee_msat || 0); row.payment_count++; if (delivery) row.delivery_count++;
       row.payment_value_msat += Number(p.value_msat || 0) || Number(p.value_sat || 0) * 1000;   // 0.76.0: what was paid
     }
+    // 0.104.0: the transactions by id, so a spend's inputs can be valued from the outputs LND lists
+    const byId = new Map((b.txs || []).map((t) => [t.tx_hash, t]));
+    const outSum = (t) => (Array.isArray(t.output_details) ? t.output_details : []).reduce((s, o) => s + Number(o.amount || 0), 0);
+    const inputValue = (op) => { const i = String(op || '').lastIndexOf(':'); if (i < 0) return null; const src = byId.get(String(op).slice(0, i)); const o = src && Array.isArray(src.output_details) ? src.output_details.find((x) => Number(x.output_index) === Number(String(op).slice(i + 1))) : null; return o ? Number(o.amount || 0) : null; };
     for (const t of b.txs) {
       const ms = Number(t.time_stamp) * 1000;
       if (ms < start || ms >= end) continue;
-      const fee = Number(t.total_fees || 0);
-      if (fee <= 0) continue;                               // only fees WE paid
-      row.chain_tx_count++;
+      let fee = Number(t.total_fees || 0);
       const txid = t.tx_hash, label = String(t.label || '').toLowerCase();
+      if (fee <= 0) {
+        // 0.104.0: LND priced it 0 — a close or a sweep (its inputs are not wallet coins): the fee from the transaction itself
+        const close = b.closes.get ? b.closes.get(txid) : null;
+        const isClose = !!close || /closechannel|closing/.test(label), isSweep = /sweep/.test(label);
+        if (close && close.capacity > 0 && Array.isArray(t.output_details) && t.output_details.length) {
+          if (!close.local) continue;                       // the other side funded the channel: its fee, not ours
+          fee = close.capacity - outSum(t);
+        } else if (isClose || isSweep) {
+          const ins = Array.isArray(t.previous_outpoints) ? t.previous_outpoints : [];
+          let inSum = 0, unknown = !ins.length || !Array.isArray(t.output_details);
+          for (const po of ins) { const v = unknown ? null : inputValue(po && po.outpoint); if (v == null) { unknown = true; break; } inSum += v; }
+          if (unknown) { row.chain_fee_unknown_count++; continue; }
+          fee = inSum - outSum(t);
+        }
+        if (fee <= 0) continue;                             // not ours, or a receive
+      }
+      row.chain_tx_count++;
       // 0.76.0: the sats the tx moved — LND's amount is our net (fee included on a spend), so |amount| − fee
       const moved = Math.max(0, Math.abs(Number(t.amount || 0)) - fee);
       if (chanPoints.has(txid) || /openchannel|funding/.test(label)) { row.chain_fee_open_sats += fee; row.chain_moved_open_sats += moved; }
@@ -180,7 +206,7 @@ function createPL(deps) {
     let changed = false;
     for (let k = first; k <= sel; k = nextDay(k)) {
       const finished = k < today;
-      if (!finished || opts.recompute || !daily[k] || !('routing_out_msat' in daily[k]) || (daily[k].partial && daily[k].partial.length && b.missing.length === 0)) {   // 0.76.0: a row snapshotted before the moved fields existed is rebuilt once
+      if (!finished || opts.recompute || !daily[k] || !('routing_out_msat' in daily[k]) || !('chain_fee_unknown_count' in daily[k]) || (daily[k].partial && daily[k].partial.length && b.missing.length === 0)) {   // 0.76.0: a row snapshotted before the moved fields existed is rebuilt once; 0.104.0: and before the chain fees came from the bytes
         const row = computeRow(k, b, events, chanPoints);
         if (finished) { daily[k] = row; changed = true; }
         else daily[k] = row;
@@ -193,7 +219,7 @@ function createPL(deps) {
       const acc = emptyRow(from); acc.date = from + '…' + to; const byChan = {};
       for (let k = from; k <= to; k = nextDay(k)) {
         const r = daily[k]; if (!r) { if (k === to) break; continue; }
-        for (const f of ['routing_fee_msat', 'routing_count', 'open_fee_msat', 'open_count', 'hold_fee_msat', 'hold_count', 'chain_fee_open_sats', 'chain_fee_close_sats', 'chain_fee_sweep_sats', 'chain_fee_other_sats', 'chain_tx_count', 'payment_fee_msat', 'payment_count', 'delivery_count',
+        for (const f of ['routing_fee_msat', 'routing_count', 'open_fee_msat', 'open_count', 'hold_fee_msat', 'hold_count', 'chain_fee_open_sats', 'chain_fee_close_sats', 'chain_fee_sweep_sats', 'chain_fee_other_sats', 'chain_tx_count', 'chain_fee_unknown_count', 'payment_fee_msat', 'payment_count', 'delivery_count',
           'routing_out_msat', 'open_moved_msat', 'open_moved_count', 'open_moved_fee_msat', 'hold_moved_msat', 'hold_moved_count', 'hold_moved_fee_msat', 'payment_value_msat', 'chain_moved_open_sats', 'chain_moved_close_sats', 'chain_moved_sweep_sats', 'chain_moved_other_sats']) acc[f] += r[f] || 0;
         for (const [c, v] of Object.entries(r.routing_by_chan || {})) { const x = byChan[c] || (byChan[c] = { fee_msat: 0, count: 0 }); x.fee_msat += v.fee_msat; x.count += v.count; }
         if (k === to) break;

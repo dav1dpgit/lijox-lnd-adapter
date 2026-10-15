@@ -9,11 +9,16 @@ const now = Date.now(); const yday = now - 86400000; const lastMonth = now - 40 
 const S = (ms) => String(Math.floor(ms / 1000));
 const fwd = [{ timestamp: S(now - 3600e3), fee_msat: '1500', amt_out_msat: '1500000000', chan_id_out: '111', chan_id_in: '222' }, { timestamp: S(yday), fee_msat: '2500', chan_id_out: '111' }, { timestamp: S(lastMonth), fee_msat: '7000', chan_id_out: '333' }];
 const payments = [{ status: 'SUCCEEDED', creation_date: S(yday), fee_msat: '300', htlcs: [{ route: { hops: [{ pub_key: 'wallet1' }] } }] }, { status: 'SUCCEEDED', creation_date: S(now - 60e3), fee_msat: '900', value_msat: '9000000', htlcs: [{ route: { hops: [{ pub_key: 'other' }] } }] }, { status: 'FAILED', creation_date: S(now), fee_msat: '99999' }];
-const txs = [{ tx_hash: 'open1', time_stamp: S(yday), total_fees: '1200', label: '' }, { tx_hash: 'close1', time_stamp: S(now - 30e3), total_fees: '800', amount: '-500800', label: '' }, { tx_hash: 'sw', time_stamp: S(now), total_fees: '150', label: 'sweep' }, { tx_hash: 'recv', time_stamp: S(now), total_fees: '0', label: '' }];
+const txs = [{ tx_hash: 'open1', time_stamp: S(yday), total_fees: '1200', label: '' }, { tx_hash: 'close1', time_stamp: S(now - 30e3), total_fees: '800', amount: '-500800', label: '' }, { tx_hash: 'sw', time_stamp: S(now), total_fees: '150', label: 'sweep' }, { tx_hash: 'recv', time_stamp: S(now), total_fees: '0', label: '' },
+  // 0.104.0: LND prices closes and sweeps at 0 — the fee from the transaction itself
+  { tx_hash: 'close2', time_stamp: S(now - 20e3), total_fees: '0', amount: '599700', label: '', output_details: [{ output_index: 0, amount: '599700', is_our_address: true }] },                    // ours: capacity 600000 − 599700 = 300
+  { tx_hash: 'close3', time_stamp: S(now - 20e3), total_fees: '0', amount: '100000', label: '', output_details: [{ output_index: 0, amount: '100000', is_our_address: true }, { output_index: 1, amount: '299500' }] },   // the other side funded it: its fee
+  { tx_hash: 'sw2', time_stamp: S(now - 10e3), total_fees: '0', amount: '599500', label: 'sweep', previous_outpoints: [{ outpoint: 'close2:0', is_our_output: false }], output_details: [{ output_index: 0, amount: '599500', is_our_address: true }] },   // 599700 − 599500 = 200
+  { tx_hash: 'sw3', time_stamp: S(now - 10e3), total_fees: '0', amount: '1000', label: 'sweep', previous_outpoints: [{ outpoint: 'elsewhere:3', is_our_output: false }], output_details: [{ output_index: 0, amount: '1000', is_our_address: true }] }];   // an input nobody can value → unknown
 let denyFwd = false;
 const pl = createPL({ dataDir: dir, log: () => {},
   lndPost: async (p, b) => { if (denyFwd) return { message: 'permission denied' }; return { forwarding_events: fwd, last_offset_index: 3 }; },
-  lndGet: async (p) => p.startsWith('/v1/payments') ? { payments, last_index_offset: 3 } : p === '/v1/transactions' ? { transactions: txs } : p === '/v1/channels/closed' ? { channels: [{ closing_tx_hash: 'close1' }] } : {},
+  lndGet: async (p) => p.startsWith('/v1/payments') ? { payments, last_index_offset: 3 } : p === '/v1/transactions' ? { transactions: txs } : p === '/v1/channels/closed' ? { channels: [{ closing_tx_hash: 'close1' }, { closing_tx_hash: 'close2', capacity: '600000', open_initiator: 'INITIATOR_LOCAL', channel_point: 'fund2:0' }, { closing_tx_hash: 'close3', capacity: '400000', open_initiator: 'INITIATOR_REMOTE', channel_point: 'fund3:1' }] } : {},
   isWalletPubkey: (pk) => pk === 'wallet1', channelPoints: () => new Set(['open1']), rates: () => ({ USD: 100000 }) });
 pl.record('open_fee', { msat: 20000000, wallet: 'wallet1' }); pl.record('hold_fee', { msat: 0, wallet: 'wallet1' });
 pl.record('open_fee', { msat: 100000, moved_msat: 50000000, wallet: 'wallet1' });   // 0.76.0: an event that knows what moved
@@ -24,11 +29,12 @@ pl.record('open_fee', { msat: 100000, moved_msat: 50000000, wallet: 'wallet1' })
   t('day: routing fee = today only', d.routing_fee_msat === 1500 && d.routing_count === 1);
   t('day: open fee from the ledger', d.open_fee_msat === 20100000 && d.open_count === 2 && d.hold_count === 1);
   t('0.76.0: moved rides only from events that carry it (1 of 2 opens)', d.open_moved_msat === 50000000 && d.open_moved_count === 1 && d.open_moved_fee_msat === 100000 && d.hold_moved_msat === 0);
-  t('0.76.0: routing amt_out, payment value, chain |amount|-fee', d.routing_out_msat === 1500000000 && d.payment_value_msat === 9000000 && d.chain_moved_close_sats === 500000 && d.chain_moved_sweep_sats === 0);
+  t('0.76.0: routing amt_out, payment value, chain |amount|-fee', d.routing_out_msat === 1500000000 && d.payment_value_msat === 9000000 && d.chain_moved_close_sats === 500000 + 599400 && d.chain_moved_sweep_sats === 599300);
   t('day: payment fee counts only succeeded, today', d.payment_fee_msat === 900 && d.payment_count === 1 && d.delivery_count === 0);
-  t('day: chain fees classified close + sweep, received tx ignored', d.chain_fee_close_sats === 800 && d.chain_fee_sweep_sats === 150 && d.chain_fee_open_sats === 0 && d.chain_tx_count === 2);
+  t('day: chain fees classified close + sweep, received tx ignored', d.chain_fee_close_sats === 800 + 300 && d.chain_fee_sweep_sats === 150 + 200 && d.chain_fee_open_sats === 0 && d.chain_tx_count === 4);
+  t('0.104.0: a close LND priced at 0 = capacity − outputs when this node funded it; the other side\'s close is not ours; a sweep = inputs − outputs; an input nobody can value → fee unknown, counted, never guessed', d.chain_fee_unknown_count === 1 && d.chain_fee_close_sats === 1100 && d.chain_fee_sweep_sats === 350);
   t('mtd includes yesterday', m.routing_fee_msat === 4000 && m.chain_fee_open_sats === 1200 && m.delivery_count === 1);
-  t('0.76.0: moved fields sum across periods', l.routing_out_msat === 1500000000 && l.open_moved_msat === 50000000 && l.chain_moved_close_sats === 500000);
+  t('0.76.0: moved fields sum across periods', l.routing_out_msat === 1500000000 && l.open_moved_msat === 50000000 && l.chain_moved_close_sats === 500000 + 599400 && l.chain_fee_unknown_count === 1);
   t('ltd includes last month', l.routing_fee_msat === 11000 && Object.keys(l.routing_by_chan).length === 2 && l.routing_by_chan['333'].fee_msat === 7000);
   t('rates carried', r.rates_usd === 100000 && r.missing.length === 0);
   t('finished days snapshotted', Object.keys(JSON.parse(fs.readFileSync(path.join(dir, 'pl-daily.json')))).length >= 2);

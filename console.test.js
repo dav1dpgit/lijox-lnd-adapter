@@ -22,6 +22,9 @@ function req(method, p, body, cookie) {
   const h = (x) => crypto.createHash('sha256').update(x, 'utf8').digest('base64');
   t('CSP script hash matches served page', login.headers['content-security-policy'].includes(`'sha256-${h(sj)}'`));
   t('CSP style hash matches served page', login.headers['content-security-policy'].includes(`'sha256-${h(ss)}'`));
+  // 0.105.1: the served page script parses — 0.104.0's did not (a `\n` inside the JS template became a real newline
+  // inside a quoted string; the browser refused the whole script and the code field was never wired)
+  t('the served page script parses', (() => { try { new Function(sj); return true; } catch (e) { console.log('   ' + e.message); return false; } })());
   t('CSP default-src none, no unsafe-inline', /default-src 'none'/.test(CSP) && !/unsafe-inline/.test(CSP));
   t('events refused without session', (await req('GET', '/console/events')).status === 401);
   const bad = await req('POST', '/console/login', { code: '000000' });

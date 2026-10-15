@@ -27,11 +27,14 @@ check(ctx.canonicalRegisterMsg(Object.assign({}, b, { tatara: T })) === V3a, 'r1
 check(ctx.canonicalRegisterMsg(Object.assign({}, b, { filter_url: 'https://filters.example.com', filter_sp: true, tatara: T2 })) === V3b, 'r2 with a filter server, a coin-check address and a ring hash = the registry\'s v3 bytes');
 check(ctx.canonicalRegisterMsg(b) === V1, 'r3 without the block: v1, byte for byte as before');
 check(ctx.TATARA_FIELDS.map((x) => x[0]).join(',') === WORKER_FIELDS, 'r4 TATARA_FIELDS is the worker\'s list, in its order');
+// 0.105.1 (lij-worker 0.12.1): the block tatara.js builds signs v3, byte for byte as 0.97.0–0.104.0 did (0.105.0's
+// close_sizes / v4 came and went the same day — DP: a channel's coin after its close sits in the on-chain pools)
 const blk = createTatara({ env: { TATARA_ENABLED: 'true' }, publicHttpsUrl: 'https://lsp.example.com' }).recordBlock();
 check(JSON.stringify(blk) === JSON.stringify(T), 'r5 the block tatara.js builds from the defaults is exactly the worker-checked block (keys, order, values)');
 check(Object.keys(blk).join(',') === WORKER_FIELDS && ctx.canonicalRegisterMsg(Object.assign({}, b, { tatara: blk })) === V3a, 'r5 its keys are the worker\'s and it signs to the same bytes');
+check(!/TATARA_FIELDS_V4|close_sizes/.test(src.slice(from, to)) && !('close_sizes' in createTatara({ env: { TATARA_ENABLED: 'true', TATARA_CLOSE_SIZES: '400000' }, publicHttpsUrl: 'https://lsp.example.com' }).recordBlock()), 'r7 no v4, no close_sizes: a stray TATARA_CLOSE_SIZES line changes nothing in the record');
 const reg = src.slice(src.indexOf('async function registerWithRegistry()'), src.indexOf('// ── 0.73.0: console notes'));
 check(/const tb = tatara\.recordBlock\(\);\s*\n\s*if \(tb\) \{ body\.tatara = tb;/.test(reg) && reg.indexOf('body.tatara = tb') < reg.indexOf('canonicalRegisterMsg(body)'),
   'r6 the registration adds the block only when the module gives one, before the message is signed');
-console.log(fails ? 'FAIL · tatara-record · ' + fails + ' failed' : 'PASS · tatara-record (r1–r6)');
+console.log(fails ? 'FAIL · tatara-record · ' + fails + ' failed' : 'PASS · tatara-record (r1–r7)');
 process.exit(fails ? 1 : 0);

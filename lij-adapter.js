@@ -145,6 +145,17 @@
  *       retry's channels read from TATARA_LND_CONF; seats on the channel route; the pending channels of channel pools
  *       watched and abandoned when their pool can never fund (tatara-channels.js; the key gains AbandonChannel)
  *     0.103.1 the lnd.conf room reader moved into tatara.js (0.103.0's copy here named an undefined `fs` — every read failed)
+ *     0.103.2 channel-pool sizes checked against LND's own limits (minchansize/maxchansize from TATARA_LND_CONF, LND's
+ *       defaults when absent) instead of MIN/MAX_CHANNEL_SATS, which govern nothing live; a console Settings row for them
+ *     0.104.0 the JIT guard (jit-guard.js): every JIT open remembered with its payment's outcome; a funded-but-failed open
+ *       counted on a rolling 24 h — 1 red on Guardrails, 2 armed, 3 = JIT refused on every rail until released from the
+ *       Console (JIT_GUARD_ARM_AT / JIT_GUARD_HALT_AT); PL chain fees for closes and sweeps from the transactions
+ *       themselves (pl.js), a close counted when this node funded the channel, "fee unknown" never guessed
+ *     0.105.0 pools per route, each with its own sizes (DP's item 20): the channel sizes no longer need to be among the
+ *       on-chain sizes (it also added TATARA_CLOSE_SIZES, a "close" route and a v4 record — all gone in 0.105.1)
+ *     0.105.1 the Console's page script parses again (0.104.0's "Release the guard" confirm text broke it — the code
+ *       field never answered); the close pools gone (DP: a channel's coin after its close sits in the on-chain pools);
+ *       the record signs v3 (lij-worker 0.12.1)
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -401,7 +412,8 @@ const { WebSocketServer } = require('ws');
 const { startBridge } = require('./cooperative-chain-bridge');
 const { windowLimiter } = require('./wallet-limits');   // 0.96.0 (S58, proposal 1): the wallet checks' own limits
 const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
-const { createTatara, readLndRoom } = require('./tatara');   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
+const { createTatara, readLndRoom } = require('./tatara');
+const { createJitGuard } = require('./jit-guard');   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
 const { createKitHolder } = require('./kits.js');
 const { createNwc } = require('./nwc.js');   // 0.86.0 (S50, DP GO — NWC): the provider's half — registration, the relay at /nwc, the wake; see nwc.js
 const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
@@ -1655,7 +1667,7 @@ async function lnurlpClientChannel(clientPubkey) {
       const scid = (Array.isArray(c.alias_scids) && c.alias_scids.length)
         ? String(c.alias_scids[0]) : String(c.chan_id);
       if (!best || roomMsat > best.room_msat || (roomMsat === best.room_msat && localMsat > best.local_msat)) {
-        best = { chan_id: String(c.chan_id), scid: scid, local_msat: localMsat, room_msat: roomMsat, active: !!c.active };
+        best = { chan_id: String(c.chan_id), scid: scid, local_msat: localMsat, room_msat: roomMsat, active: !!c.active, channel_point: String(c.channel_point || '') };   // 0.104.0: the point, for the guard
       }
     }
     return best;
@@ -1713,6 +1725,7 @@ async function lnurlpProbeInflight(name, entry) {
 //   { kind: 'retry', reason }    — try again on the next sweep (open failed, no tip, channel unlisted)
 //   { kind: 'rejected', error }  — SendToRoute rejected before an attempt existed
 async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat: fixedFeeMsat, finalCltvDelta, tag, jitTag }) {
+  let guardCp = '';   // 0.104.0: set when THIS call opened the channel; its payment's outcome is reported to the guard below
   const amt = BigInt(amountMsat);
   const T = tag || 'deliver';
   let chan = await lnurlpClientChannel(client);
@@ -1725,6 +1738,10 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       return { kind: 'refuse', reason: 'amount under opening fee' };
     }
     const sizeSats = computeChannelSizeSats(String(amt));
+    if (jitGuard.halted()) {   // 0.104.0: JIT is off after three funded-but-failed opens in 24 h, until released
+      console.error(`[JIT-GUARD] JIT is OFF — no channel for ${client.slice(0,16)}… (${T}); release from the Console`);
+      return { kind: 'refuse', reason: 'JIT opens are halted by the guard' };
+    }
     if (!(await jitReserveOk(sizeSats, jitTag || T))) {
       return { kind: 'refuse', reason: 'LSP on-chain reserve floor' };
     }
@@ -1754,6 +1771,7 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
     }
     if (!chan) { console.error(`[${T}]: opened channel never listed — retry`); return { kind: 'retry', reason: 'opened channel never listed' }; }
     jitRecordOpen(client);   // v0.32.0: per-wallet open counter
+    guardCp = chan.channel_point || ''; jitGuard.recordOpen(guardCp, client, sizeSats, T.toLowerCase().split(' ')[0]);   // 0.104.0
   }
   const innerMsat = (amt - feeMsat).toString();
   const info = await lndGet('/v1/getinfo').catch(() => null);
@@ -1781,7 +1799,12 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
   try {
     attempt = await sendToRouteV2Hard(routerClient, Buffer.from(hashHex, 'hex'), route, CONFIG.lsps2.sendtoroute_timeout_ms, T);  /* F3 v0.37.0 */
   } catch (e) {
+    if (guardCp && !/DEADLINE_EXCEEDED|hard.?timeout|in flight|already/i.test(String(e.message || e))) jitGuard.fail(guardCp, 'reject: ' + String(e.message || e));   // 0.104.0
     return { kind: 'rejected', error: String(e.message || e) };
+  }
+  if (guardCp) {   // 0.104.0: this call's open — its payment's outcome (a hard timeout is LND's to finish, not a verdict)
+    if (attempt && attempt.status === 'SUCCEEDED' && attempt.preimage && attempt.preimage.length) jitGuard.settle(guardCp);
+    else if (attempt && attempt.status !== 'HARD_TIMEOUT') jitGuard.fail(guardCp, String((attempt.failure && attempt.failure.code) || attempt.status || 'failed'));
   }
   return { kind: 'attempt', attempt, innerMsat, feeMsat, chan };
 }
@@ -2208,7 +2231,29 @@ function tataraNotifier() {
   return tataraChainNotifier;
 }
 
-// 0.97.0 (S58): LIJOX's Tatara (tatara.js) — made here, after CONFIG, because it reads the operator's channel limits.
+// 0.104.0 (S59, DP's item 8): the JIT guard — see jit-guard.js. JIT_GUARD_ARM_AT / JIT_GUARD_HALT_AT are whole numbers
+// 0–100 (0 = that step off); anything else takes the defaults 2 / 3 and says so.
+function jitGuardSetting(name, dflt) {
+  const raw = String(process.env[name] || '').trim();
+  if (!raw) return dflt;
+  if (!/^[0-9]{1,3}$/.test(raw) || Number(raw) > 100) { console.warn(`[JIT-GUARD] ${name}=${raw} is not a whole number 0–100 — using ${dflt}`); return dflt; }
+  return Number(raw);
+}
+const JIT_GUARD_ARM_AT = jitGuardSetting('JIT_GUARD_ARM_AT', 2), JIT_GUARD_HALT_AT = jitGuardSetting('JIT_GUARD_HALT_AT', 3);
+const jitGuard = createJitGuard({ dataDir: DATA_DIR, log: (m) => console.log(m), armAt: JIT_GUARD_ARM_AT, haltAt: JIT_GUARD_HALT_AT });
+if (jitGuard.halted()) console.warn(`[JIT-GUARD] JIT is OFF (halted ${new Date(jitGuard.counts().halted.at).toISOString()} after ${jitGuard.counts().halted.count} funded-but-failed opens) — every JIT open is refused until released from the Console`);
+/// A channel point as "txid:index" from LND's gRPC ChannelPoint (funding_txid_bytes is little-endian; the display form
+/// — ListChannels, the Console — is the reverse). Empty when the bytes are not there.
+function channelPointStr(channelPoint) {
+  try {
+    const b = channelPoint && channelPoint.funding_txid_bytes;
+    if (!b || b.length !== 32) return '';
+    return Buffer.from(b).reverse().toString('hex') + ':' + Number(channelPoint.output_index || 0);
+  } catch (_) { return ''; }
+}
+
+// 0.97.0 (S58): LIJOX's Tatara (tatara.js) — made here, after CONFIG (the public URL, the node key, DATA_DIR). 0.103.2: the
+// channel-pool size check reads LND's limits (lndRoom), not the operator's MIN/MAX_CHANNEL_SATS (channelLimits is no longer read).
 const tatara = createTatara({
   log: (m) => console.log(m),
   publicHttpsUrl: () => CONFIG.public.https_url,
@@ -3316,6 +3361,13 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     action: 'FAIL',
     failure_code: 15,  // B-14: TEMPORARY_CHANNEL_FAILURE — LND rejects 7 and the rejection kills the interceptor stream (journal 18:17:19, 34 s blind)
   };
+  // 0.104.0: the JIT guard — JIT is off after three funded-but-failed opens in 24 h, until the operator releases it
+  if (jitGuard.halted()) {
+    trampolineForwardsFailed += 1;
+    console.error(`[JIT-GUARD] JIT is OFF — the open for ${promise.client_pubkey.slice(0,16)}… is refused (release from the Console)`);
+    return FAIL_TEMP;
+  }
+  let _guardCp = '';   // 0.104.0: the channel point the guard remembers, once the funding is published
 
   // D-1 2b: fresh peer-liveness gate. The chain-bridge registry that routed
   // us here can lag ~30 min, so confirm the wallet is a connected LND peer
@@ -3400,6 +3452,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
       ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
     }, CONFIG.lsps2.openchannel_timeout_ms);
     jitRecordOpen(promise.client_pubkey);   // v0.32.0: per-wallet open counter (success only)
+    _guardCp = channelPointStr(channelPoint); jitGuard.recordOpen(_guardCp, promise.client_pubkey, channelSizeSats, 'lsps2');   // 0.104.0: the funding is public from here
   } catch (e) {
     // B-13: mid-open peer-disconnect -> HOLD + retry-open-on-reconnect.
     // The wallet passed the D-1 2b liveness gate but dropped mid-negotiation
@@ -3501,11 +3554,13 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   } catch (e) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] findChannelScid failed: ${e.message}`);
+    jitGuard.fail(_guardCp, 'no scid: ' + e.message);   // 0.104.0
     return FAIL_TEMP;
   }
   if (!newChannelScid) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] new channel has no usable SCID yet — FAIL`);
+    jitGuard.fail(_guardCp, 'no usable scid');   // 0.104.0
     return FAIL_TEMP;
   }
 
@@ -3528,6 +3583,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   if (!paymentSecretBuf) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] no MPP payment_secret in incoming HTLC for scid=${scidHex} — FAIL`);
+    jitGuard.fail(_guardCp, 'no payment secret');   // 0.104.0
     return FAIL_TEMP;
   }
 
@@ -3558,6 +3614,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] sendToRouteV2 rejected for scid=${scidHex}: ${e.message}`);
     try { SM.emit('forward_result', { hash: paymentHashHex, ok: false, code: 'reject:' + ((e && e.message) || '?') }); } catch (_) {}  /* F3 v0.37.0 */
+    if (!/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(e && e.message || ''))) jitGuard.fail(_guardCp, 'reject: ' + (e && e.message || '?'));   // 0.104.0: an attempt LND still owns is not a failure yet
     return FAIL_TEMP;
   }
 
@@ -3565,6 +3622,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     const failCode = htlcAttempt.failure && htlcAttempt.failure.code;
     console.error(`[LSPS2] sendToRouteV2 did not succeed: status=${htlcAttempt.status} failure_code=${failCode}`);
+    if (htlcAttempt.status !== 'HARD_TIMEOUT') jitGuard.fail(_guardCp, String(failCode || htlcAttempt.status || 'failed'));   // 0.104.0: a hard timeout is LND's to finish, not a verdict
     /* v0.55.0 A2: a FINAL-NODE verdict means the recipient's wallet itself
        refused this payment's details — no retry can ever succeed. Latch. */
     try {
@@ -3580,6 +3638,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
 
   trampolineForwardsSucceeded += 1;
   console.log(`[LSPS2] sendToRouteV2 succeeded — preimage received, SETTLING inbound`);
+  jitGuard.settle(_guardCp);   // 0.104.0: the open earned its fee
   plRecord('open_fee', { msat: Number(promise.fee_msat || 0), moved_msat: Number(forwardAmountMsat), wallet: promise.client_pubkey, hash: paymentHashHex, scarcity_pct: promise.scarcity_mult_pct || 100 });   // 0.72.0 PL ledger · 0.76.0: moved_msat = what was forwarded
   leaseTouch(promise.client_pubkey, 'jit:settled');   // 0.73.0
   // B-16: payment settled — release the hash→promise binding.
@@ -3964,7 +4023,7 @@ const lndUrl = new url.URL(CONFIG.lnd.endpoint);
 // 0.95.0 (D3, DP 2026-10-10): the TLS of every REST call to LND, in one place (this file and the chain bridge).
 // LND_REST_CA_PATH set → the certificate LND's REST answers with is CHECKED against that file — on a Start9, REST
 // goes through StartOS's proxy on the internal network, so the file is StartOS's root CA. Unset → no check, as
-// before: on the UM890 and the Umbrel REST is 127.0.0.1, nothing else can answer there.
+// before: on a box where REST is 127.0.0.1, nothing else can answer there.
 let LND_REST_CA = null;
 if (CONFIG.lnd.rest_ca_path) {
   try { LND_REST_CA = require('fs').readFileSync(CONFIG.lnd.rest_ca_path); }
@@ -4920,7 +4979,8 @@ function settingsReport() {
     row('NWC', 'request ttl ceiling', 'NWC_REQUEST_TTL_CEILING_S', nwc.settings().request_ttl_ceiling_s, 's', 'the longest a waiting request is kept; the wallet\'s own dial governs within it'),
     row('NWC', 'relay', '', nwc.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /nwc'),
     row('Tatara', 'switch', 'TATARA_ENABLED', tatara.settings().enabled ? (tatara.settings().ok ? 'on' : 'REFUSED') : 'off', '', tatara.settings().problems.length ? tatara.settings().problems.join(' · ') : 'off by default; on = this provider offers Mix pools and declares its limits in the registry record (0.97.0: slice 1 — declared only)'),
-    row('Tatara', 'sizes', 'TATARA_SIZES', (tatara.settings().sizes || []).join(', '), 'sats', ''),
+    row('Tatara', 'sizes', 'TATARA_SIZES', (tatara.settings().sizes || []).join(', '), 'sats', 'on-chain → on-chain pools'),
+    row('Tatara', 'channel pools', 'TATARA_CHANNEL_POOLS / TATARA_CHANNEL_SIZES', tatara.settings().channel_pools ? ((tatara.settings().channel_sizes || []).join(', ') || 'on') : 'off', 'sats', tatara.settings().lnd_limits ? `sizes checked against LND's own limits ${tatara.settings().lnd_limits.min_chan_size}–${tatara.settings().lnd_limits.max_chan_size} sats (minchansize/maxchansize in TATARA_LND_CONF, LND's defaults where absent; 0.103.2)` : 'sizes are checked against LND\'s limits read from TATARA_LND_CONF (0.103.2)'),
     row('Tatara', 'people', 'TATARA_MIN_PEOPLE / TATARA_MAX_PEOPLE', tatara.settings().min_people + '–' + tatara.settings().max_people, '', 'LiJ pools are 3 to 6'),
     row('Tatara', 'relay', '', tatara.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /tatara/relay'),
     row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
@@ -5157,6 +5217,7 @@ async function consoleSnapshot() {
       ladder_sats: JIT_FEE_LADDER.slice(), grant: jitGrantTerms(), window_days: Math.round(JIT_WINDOW_MS / 86400000), floor_max_opens_per_day: JIT_FLOOR_MAX_OPENS_PER_DAY,   // 0.90.0: the ladder and the grant
       channel_min_sats: CONFIG.channel.min_sats, channel_size_sats: CONFIG.channel.size_sats, channel_max_sats: CONFIG.channel.max_sats,
       open_fee_min_sats: Math.round(CONFIG.lsps2.open_fee_min_msat / 1000), fee_ppm: CONFIG.node.fee_ppm, lease_days: CONFIG.lease.days, lease_enabled: !!(CONFIG.lease && CONFIG.lease.enabled), lease_dry_run: !!(CONFIG.lease && CONFIG.lease.dry_run), lease_cycle_min: CONFIG.lease.cycle_minutes,
+      jit_guard: jitGuard.counts(),   // 0.104.0
       lease_list_saved_at: leaseExclude.saved_at || 0, lease_excluded: (chans.channels || []).filter((c) => leaseIsExcluded(c.channel_point)).length, lease_leased: (chans.channels || []).filter((c) => !leaseIsExcluded(c.channel_point) && c.remote_pubkey !== LEASE_WORLD_PEER).length,
     },
     channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
@@ -5805,6 +5866,7 @@ const server = http.createServer(async (req, res) => {
             trampoline_forwards_attempted:    trampolineForwardsAttempted,
             trampoline_forwards_succeeded:    trampolineForwardsSucceeded,
             trampoline_forwards_failed:       trampolineForwardsFailed,
+            jit_guard:                        (() => { const c = jitGuard.counts(); return { level: c.level, failed_24h: c.failed_24h, halted: !!c.halted }; })(),   // 0.104.0
             in_flight_opens:                  inFlightOpens.size,
             watchdogs:                        htlcWatchdogs.size,
           }
@@ -7341,6 +7403,7 @@ async function main() {
     const con = createConsole({ version: ADAPTER_LOGIC_VERSION, lndGet, snapshot: consoleSnapshot, pl: (date, opts) => plEngine.report(date, opts), log: (l) => console.log(l),
       // 0.72.4: the one operator action so far — lease exclusions (safety-increasing, so behind the session only)
       setNote: async (kind, key, text) => consoleNoteSet(kind, key, text),   // 0.73.0 notes + labels
+      releaseJitGuard: async (by) => jitGuard.release(by),   // 0.104.0: the operator's hand on the guard (session + confirm, audited)
       setLeaseExclude: async (cp, excluded, peer) => {
         if (!/^[0-9a-f]{64}:\d+$/.test(cp)) throw new Error('bad channel point');
         const prev = leaseExclude.chan_points[cp] || {};

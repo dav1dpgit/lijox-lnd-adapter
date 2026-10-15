@@ -33,6 +33,9 @@
 //               LND for a retry's channels (maxpendingchannels ≥ retries + 1, read from TATARA_LND_CONF); seats on the
 //               channel route; the pending channels of channel pools watched and, when their pool can never fund, abandoned
 //               (tatara-channels.js).
+//   SLICE 7     (0.105.0, DP's item 20) the channel pools' sizes are the provider's own — no longer "one of TATARA_SIZES".
+//               (0.105.0 also added TATARA_CLOSE_SIZES and a "close" route for a channel's coin after its close; DP ruled
+//               the same day that such a coin sits in the on-chain pools, so 0.105.1 removed them — the record signs v3.)
 'use strict';
 
 const fs = require('fs');
@@ -61,8 +64,9 @@ const HTTPS_RE = /^https:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-
 
 /// The adapter's settings (spec v0.10 §11.1), read and bounds-checked. Answers { enabled, ok, problems, s }: `enabled`
 /// = the operator turned it on; `ok` = every value is within bounds (the module runs only when both hold).
-/// `ctx`: { minChannelSats, maxChannelSats } — the operator's channel limits; 0.103.0: { maxPendingChannels, lndConf } — LND's
-/// maxpendingchannels as read from the lnd.conf TATARA_LND_CONF names (null = not read), and that path.
+/// `ctx` (0.103.0/0.103.2, from readLndRoom): { maxPendingChannels, minChanSize, maxChanSize, lndConf } — LND's own room and
+/// channel limits as read from the lnd.conf TATARA_LND_CONF names (null = not read), and that path. MIN/MAX_CHANNEL_SATS
+/// play no part since 0.103.2: they govern nothing live, and LND is what accepts or refuses a pool's channel.
 function readSettings(env, ctx = {}) {
   const problems = [];
   const s = {
@@ -100,23 +104,30 @@ function readSettings(env, ctx = {}) {
   whole('max_fee_rate', 1, 1000, 'whole sat/vB from 1 to 1,000');
   if (Number.isSafeInteger(s.max_pools_per_size) && Number.isSafeInteger(s.max_pools_total) && s.max_pools_total < s.max_pools_per_size) problems.push('TATARA_MAX_POOLS_TOTAL is below TATARA_MAX_POOLS_PER_SIZE');
   if (Number.isSafeInteger(s.max_list_per_size) && Number.isSafeInteger(s.max_people) && s.max_list_per_size < s.max_people) problems.push('TATARA_MAX_LIST_PER_SIZE is below TATARA_MAX_PEOPLE');
-  const sizesOk = Array.isArray(s.sizes) && s.sizes.length >= 1 && s.sizes.length <= 12 && s.sizes.every((x) => Number.isSafeInteger(x) && x >= 10000 && x <= 2100000000000000);
-  if (!sizesOk) problems.push(`TATARA_SIZES=${env.TATARA_SIZES} — 1 to 12 whole sat amounts, each at least 10,000`);
-  else {
-    const sorted = s.sizes.slice().sort((a, b) => a - b);
-    if (sorted.some((x, i) => i > 0 && x === sorted[i - 1])) problems.push('TATARA_SIZES names a size twice');
-    s.sizes = sorted;   // the record's order: ascending
-  }
+  // 0.105.0: one rule for every list — whole sats, at least 10,000, at most 12, none twice; kept ascending (the record's order)
+  const sizeList = (k, lo) => {
+    const v = s[k];
+    if (!Array.isArray(v) || v.length < lo || v.length > 12 || !v.every((x) => Number.isSafeInteger(x) && x >= 10000 && x <= 2100000000000000)) { problems.push(`TATARA_${k.toUpperCase()}=${env['TATARA_' + k.toUpperCase()]} — ${lo ? '1' : '0'} to 12 whole sat amounts, each at least 10,000`); return false; }
+    const sorted = v.slice().sort((a, b) => a - b);
+    if (sorted.some((x, i) => i > 0 && x === sorted[i - 1])) { problems.push(`TATARA_${k.toUpperCase()} names a size twice`); return false; }
+    s[k] = sorted;
+    return true;
+  };
+  const sizesOk = sizeList('sizes', 1);
   for (const k of ['channel_pools', 'forward_payouts', 'relay_for_others', 'forward_coin_checks']) if (s[k] === null) problems.push(`TATARA_${k.toUpperCase()} must be true or false`);
   if (!Array.isArray(s.channel_sizes) || s.channel_sizes.some((x) => !Number.isSafeInteger(x))) problems.push('TATARA_CHANNEL_SIZES must be whole sat amounts');
   else if (s.channel_pools !== true && s.channel_sizes.length) problems.push('TATARA_CHANNEL_SIZES is set but TATARA_CHANNEL_POOLS is not true');
   else if (s.channel_pools === true) {
-    const cs = s.channel_sizes.slice().sort((a, b) => a - b);
-    if (!cs.length) problems.push('TATARA_CHANNEL_POOLS=true needs TATARA_CHANNEL_SIZES');
-    if (sizesOk && cs.some((x) => !s.sizes.includes(x))) problems.push('every TATARA_CHANNEL_SIZES amount must be one of TATARA_SIZES');
-    const lo = Number(ctx.minChannelSats) || 0, hi = Number(ctx.maxChannelSats) || Infinity;
-    if (cs.some((x) => x < lo || x > hi)) problems.push(`a channel pool size is outside this provider's channel limits (${lo}–${hi === Infinity ? 'no limit' : hi} sats)`);
+    if (!s.channel_sizes.length) problems.push('TATARA_CHANNEL_POOLS=true needs TATARA_CHANNEL_SIZES');
+    else sizeList('channel_sizes', 1);   // 0.105.0: its own list — no longer "one of TATARA_SIZES" (DP's item 20: the routes' pools are sized apart)
+    const cs = s.channel_sizes.slice();
+    // 0.103.2: the sizes against LND's OWN limits (minchansize / maxchansize from the lnd.conf, LND's defaults when the lines
+    // are absent) — the only limits a pool's channel meets. Read with the room below; when the file was not read, the
+    // room check speaks and this check stays quiet.
+    const lo = ctx.minChanSize, hi = ctx.maxChanSize;
+    if (Number.isSafeInteger(lo) && Number.isSafeInteger(hi) && cs.some((x) => x < lo || x > hi)) problems.push(`a channel pool size is outside LND's channel limits (${lo}–${hi} sats: minchansize/maxchansize in ${ctx.lndConf || 'lnd.conf'}, LND's defaults where the line is absent)`);
     s.channel_sizes = cs;
+    s.lnd_limits = (Number.isSafeInteger(lo) && Number.isSafeInteger(hi)) ? { min_chan_size: lo, max_chan_size: hi } : null;
     // 0.103.0 (§6.3.6): room for a retry's channels — LND holds one pending inbound channel per peer unless lnd.conf says more
     const need = (Number.isSafeInteger(s.max_retries) ? s.max_retries : 2) + 1;
     const mp = ctx.maxPendingChannels;
@@ -129,14 +140,29 @@ function readSettings(env, ctx = {}) {
 
 /// 0.103.1 (§6.3.6): LND's room for pending inbound channels, read from the lnd.conf at `path` — { maxPendingChannels (null
 /// when the path is empty, the file is not readable or has no maxpendingchannels line), lndConf }.
+/// 0.103.2: and LND's own channel limits from the same file — { minChanSize, maxChanSize } (null when the file was not
+/// read): minchansize, else LND's default 20,000 (funding.MinChanFundingSize); maxchansize, else 16,777,215
+/// (funding.MaxBtcFundingAmount, BOLT 2) or 1,000,000,000 when protocol.wumbo-channels=true (MaxBtcFundingAmountWumbo) —
+/// lnd v0.21.4-beta config.go ValidateConfig. A maxchansize of 0 means "not set", as in LND.
+const LND_MIN_CHAN_SIZE_DEFAULT = 20000, LND_MAX_CHAN_SIZE_DEFAULT = 16777215, LND_MAX_CHAN_SIZE_WUMBO = 1000000000;
 function readLndRoom(path) {
   const p = String(path || '').trim();
-  if (!p) return { maxPendingChannels: null, lndConf: '' };
+  const none = { maxPendingChannels: null, minChanSize: null, maxChanSize: null, lndConf: p };
+  if (!p) return none;
   try {
     const txt = fs.readFileSync(p, 'utf8');
-    const m = /^\s*maxpendingchannels\s*=\s*([0-9]+)\s*$/mi.exec(txt);
-    return { maxPendingChannels: m ? Number(m[1]) : null, lndConf: p };
-  } catch (_) { return { maxPendingChannels: null, lndConf: p }; }
+    const line = (key) => { const m = new RegExp('^\\s*' + key.replace(/[.-]/g, '\\$&') + '\\s*=\\s*([^\\s;#]+)\\s*$', 'mi').exec(txt); return m ? m[1] : null; };
+    const num = (v) => (v !== null && /^[0-9]+$/.test(v)) ? Number(v) : null;
+    const mp = num(line('maxpendingchannels'));
+    const minc = num(line('minchansize')), maxc = num(line('maxchansize'));
+    const wumbo = /^(true|1)$/i.test(line('protocol.wumbo-channels') || '');
+    return {
+      maxPendingChannels: mp,
+      minChanSize: minc !== null ? minc : LND_MIN_CHAN_SIZE_DEFAULT,
+      maxChanSize: (maxc !== null && maxc > 0) ? maxc : (wumbo ? LND_MAX_CHAN_SIZE_WUMBO : LND_MAX_CHAN_SIZE_DEFAULT),
+      lndConf: p,
+    };
+  } catch (_) { return none; }
 }
 
 /// The relay's address: the API server's public host, path /tatara/relay (no new ingress — as /nwc).
@@ -186,7 +212,7 @@ function createTatara(deps) {
     postJson = async () => ({ status: 0, json: null }),   // 0.101.0: an https POST (provider ↔ provider)
     selfPubkey = () => '',                 // 0.101.0: this provider's node key
     onRecordChanged = () => {},            // 0.101.0: the record's ring hash changed (a new week) — register again
-    lndRoom = () => ({}),                  // 0.103.0: { maxPendingChannels, lndConf } — LND's room for pending channels, from lnd.conf
+    lndRoom = () => ({}),                  // 0.103.0: { maxPendingChannels, lndConf } — LND's room for pending channels, from lnd.conf; 0.103.2: + { minChanSize, maxChanSize }
     pendingChannels = null,                // 0.103.0: async () => ["txid:vout"…] — LND's pending open channels
     abandonChannel = null,                 // 0.103.0: async (txid, vout) → { ok, error } — LND AbandonChannel (i_know_what_i_am_doing)
     watchSpend = null,                     // 0.103.0: ({ txid, vout }, cb) → handle — a ChainNotifier spend stream
@@ -310,12 +336,16 @@ function createTatara(deps) {
     const s = st.s;
     if (!relayUrlOf(httpsUrl())) return ['[Tatara] REFUSED — PUBLIC_HTTPS_URL is not an https:// address, so there is no relay address to declare'];
     return [`[Tatara] on (the arrangement follows the registry: v0.8's below three providers, doors 1 and 2 at three; ring signatures checked by ${ringSig.backend()}) — sizes ${s.sizes.join(', ')} sats · ${s.min_people}–${s.max_people} people · countdown ${s.countdown_s} s · wake window ${s.wake_window_s} s · retries ${s.max_retries} · strikes ${s.strikes} · fee cap ${s.max_fee_rate} sat/vB · relay ${relayUrlOf(httpsUrl())}` +
-      (s.channel_pools ? ` · channel pools ${s.channel_sizes.join(', ')} sats` : '') + ` · forwards payouts ${s.forward_payouts ? 'yes' : 'no'}, coin checks ${s.forward_coin_checks ? 'yes' : 'no'} · relays for others ${s.relay_for_others ? 'yes' : 'no'} · coin checks answered ${s.coin_check_url ? 'at ' + s.coin_check_url : 'no'}`];
+      (s.channel_pools ? ` · channel pools ${s.channel_sizes.join(', ')} sats${s.lnd_limits ? ` (LND allows ${s.lnd_limits.min_chan_size}–${s.lnd_limits.max_chan_size})` : ''}` : '') + ` · forwards payouts ${s.forward_payouts ? 'yes' : 'no'}, coin checks ${s.forward_coin_checks ? 'yes' : 'no'} · relays for others ${s.relay_for_others ? 'yes' : 'no'} · coin checks answered ${s.coin_check_url ? 'at ' + s.coin_check_url : 'no'}`];
   }
 
   const ACTIONS = { leave: (id) => list.leave(id), pause: (id) => list.pause(id), resume: (id) => list.resume(id) };
   /// 0.103.0: a channel pool of this size is offered.
   const channelOffered = (size) => !!(st.s.channel_pools && Array.isArray(st.s.channel_sizes) && st.s.channel_sizes.includes(size));
+  /// 0.105.0: a pool of this size and route is offered — "chain" among TATARA_SIZES, "channel" among the channel sizes
+  /// (a channel's coin after its close is an on-chain coin: it seats on the chain route — DP 2026-10-14 16:19).
+  const ROUTES = ['chain', 'channel'];
+  const routeOffered = (route, size) => route === 'chain' ? st.s.sizes.includes(size) : route === 'channel' ? channelOffered(size) : false;
 
   /// The routes. GET /tatara/info is public; every POST is signed (the seat by the node key, the rest by the seat key).
   async function handle(req, res, pathname, method, ip, readBody, jsonResponse) {
@@ -401,8 +431,8 @@ function createTatara(deps) {
       const size = Number(b.size), seatPk = String(b.seat_pk || ''), wakeJson = String(b.wake_json || ''), ringHash = String(b.ring_hash || '');
       let sub = null; try { sub = JSON.parse(wakeJson); } catch (_) {}
       const route = String(b.route || '');
-      if (!['chain', 'channel'].includes(route) || !Number.isSafeInteger(size) || !isHex(seatPk, 64) || !isHex(ringHash, 64) || !sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || wakeJson.length > 2048) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; }
-      if (route === 'channel' && !channelOffered(size)) { jsonResponse(res, { ok: false, reason: 'route_not_offered' }, 409); return true; }   // 0.103.0
+      if (!ROUTES.includes(route) || !Number.isSafeInteger(size) || !isHex(seatPk, 64) || !isHex(ringHash, 64) || !sub || typeof sub.endpoint !== 'string' || !/^https:\/\//.test(sub.endpoint) || wakeJson.length > 2048) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; }
+      if (!routeOffered(route, size)) { jsonResponse(res, { ok: false, reason: route === 'chain' ? 'size_not_offered' : 'route_not_offered' }, 409); return true; }   // 0.103.0 · 0.105.0: each route by its own list
       const rf = rings.ringForSeat(ringHash, ts * 1000);
       if (!rf.ok) { jsonResponse(res, rf, 409); return true; }
       const wakeHash = crypto.createHash('sha256').update(wakeJson, 'utf8').digest('hex');
@@ -410,20 +440,20 @@ function createTatara(deps) {
       let image;
       try { image = ringSig.verify(rf.ring, m, b.ring_sig); } catch (e) { jsonResponse(res, { ok: false, reason: 'bad_ring_signature' }, 401); return true; }
       const r = list.seat({ owner: 'img:' + image, size, route, seatPk, wake: { kind: 'sub', sub }, week: rf.week });
-      if (r.ok) log(`[Tatara] ring-signed seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'channel' ? ' · channel' : ''} · one of ${rf.ring.list.length} Mix-on wallets (${rf.week})`);
+      if (r.ok) log(`[Tatara] ring-signed seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'chain' ? '' : ' · ' + route} · one of ${rf.ring.list.length} Mix-on wallets (${rf.week})`);
       jsonResponse(res, r, r.ok ? 200 : 409);
       return true;
     }
     if (action === 'seat') {
       if (arr.mode === 'doors') { jsonResponse(res, { ok: false, reason: 'arrangement_doors' }, 409); return true; }
       const route = String(b.route || ''), size = Number(b.size), seatPk = String(b.seat_pk || ''), pk = String(b.node_pubkey || '').toLowerCase();
-      if (!['chain', 'channel'].includes(route) || !Number.isSafeInteger(size) || !isHex(seatPk, 64) || !/^0[23][0-9a-f]{64}$/.test(pk) || !b.signature) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; }
-      if (route === 'channel' && !channelOffered(size)) { jsonResponse(res, { ok: false, reason: 'route_not_offered' }, 409); return true; }   // 0.103.0
+      if (!ROUTES.includes(route) || !Number.isSafeInteger(size) || !isHex(seatPk, 64) || !/^0[23][0-9a-f]{64}$/.test(pk) || !b.signature) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; }
+      if (!routeOffered(route, size)) { jsonResponse(res, { ok: false, reason: route === 'chain' ? 'size_not_offered' : 'route_not_offered' }, 409); return true; }   // 0.103.0 · 0.105.0
       let recovered = '';
       try { recovered = await verifyWalletSig(seatSignedMsg(route, size, seatPk, ts), String(b.signature)); } catch (e) { jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503); return true; }
       if (!recovered || recovered !== pk) { jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401); return true; }
       const r = list.seat({ owner: pk, size, route, seatPk, wake: { kind: 'node', pk } });
-      if (r.ok) log(`[Tatara] seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'channel' ? ' · channel' : ''} · wallet ${pk.slice(0, 8)}`);
+      if (r.ok) log(`[Tatara] seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'chain' ? '' : ' · ' + route} · wallet ${pk.slice(0, 8)}`);
       jsonResponse(res, r, r.ok ? 200 : 409);
       return true;
     }

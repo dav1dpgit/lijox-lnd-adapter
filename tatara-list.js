@@ -91,8 +91,11 @@ function createList(opts) {
 
   // ── seats ──
   function seat({ owner, size, route = 'chain', seatPk, wake = null, week = null }) {
-    if (!S.sizes.includes(size)) return { ok: false, reason: 'size_not_offered' };
-    if (route === 'channel' ? !(S.channel_pools && Array.isArray(S.channel_sizes) && S.channel_sizes.includes(size)) : route !== 'chain') return { ok: false, reason: 'route_not_offered' };   // 0.103.0: the channel route where offered
+    // 0.105.0: each route by its own list — "chain" TATARA_SIZES, "channel" the channel sizes (a channel's coin after its
+    // close is an on-chain coin and seats on the chain route — DP 2026-10-14; 0.105.0's "close" route is gone)
+    if (route === 'chain') { if (!S.sizes.includes(size)) return { ok: false, reason: 'size_not_offered' }; }
+    else if (route === 'channel') { if (!(S.channel_pools && Array.isArray(S.channel_sizes) && S.channel_sizes.includes(size))) return { ok: false, reason: 'route_not_offered' }; }   // 0.103.0: the channel route
+    else return { ok: false, reason: 'route_not_offered' };
     const q = st.queues[qkey(route, size)] || (st.queues[qkey(route, size)] = []);
     if (Object.values(st.seats).some((x) => x.owner === owner && x.size === size && x.route === route && x.state !== 'removed')) return { ok: false, reason: 'already_seated' };
     if (Object.values(st.seats).some((x) => x.seat_pk === seatPk && x.state !== 'removed')) return { ok: false, reason: 'seat_key_used' };
