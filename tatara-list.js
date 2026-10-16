@@ -13,6 +13,15 @@
 // removed. After a restart, every start and attempt in progress is ended — never continued.
 //
 // What a seat is told comes as notices, read at its next check-in (tatara.js signs the ones the spec says are signed).
+//
+// 0.106.0 (S59 Thu, Phase 2b — docs/design/mix/tatara-public-r1.md): THE HOSTED ROOM's hooks. The host (tatara-host.js)
+// opens a public room for a queue short of MIN_PEOPLE; the seats it may take are `eligibleFor` (waiting, unpaused, the
+// wallet free, the seat's "public pools" switch on, not holding back after a missed room wake); while the room has
+// strangers in it the seats it will take are `reserve`d — the head group skips them, so no LIJOX pool starts with them;
+// `roomStart` wakes them with a "room" notice (the announcement, the public relay, the reserved-seat token); a missed
+// room wake is NOT a missed start (DP 2026-10-15: no penalty, no re-seating — the seat holds back until the app opens
+// once: `room_hold`, cleared at the next check-in); the host decides the outcome (`roomOutcome`): signed → the seats
+// are done; stopped → back to the front, no retry (a public room cannot be retried).
 'use strict';
 
 const ONLINE_S = 30;                 // "online now": a check-in in the last 30 s (§4.2)
@@ -36,6 +45,7 @@ function createList(opts) {
     if (seat.notices.length > NOTICES_MAX) seat.notices.splice(0, seat.notices.length - NOTICES_MAX);
   };
   const ownerBusy = (owner) => Object.values(st.seats).some((x) => x.owner === owner && (x.state === 'starting' || x.state === 'in_attempt'));
+  const reserved = new Map();   // 0.106.0: queue key → seat ids a hosted room will take (never persisted: rooms end with a restart)
   const running = (size) => {
     const live = Object.values(st.starts).concat(Object.values(st.attempts).filter((a) => a.phase !== 'signed'));
     return { size: live.filter((x) => x.size === size).length, total: live.length };
@@ -61,14 +71,29 @@ function createList(opts) {
   function headGroup(route, size) {
     const q = st.queues[qkey(route, size)] || [];
     const g = [], owners = new Set();
+    const held = reserved.get(qkey(route, size)) || [];
     for (const id of q) {
       const s = st.seats[id];
-      if (!s || s.state !== 'waiting' || s.paused || owners.has(s.owner) || ownerBusy(s.owner)) continue;
+      if (!s || s.state !== 'waiting' || s.paused || owners.has(s.owner) || ownerBusy(s.owner) || held.includes(id)) continue;
       g.push(id); owners.add(s.owner);
       if (g.length === S.max_people) break;
     }
     return g;
   }
+  /// 0.106.0: the seats a hosted room may take, in queue order — the head group's rules, plus the seat's own "public
+  /// pools" switch and no hold-back after a missed room wake. Seats reserved for a room are included (they are its own).
+  function eligibleFor(route, size) {
+    const q = st.queues[qkey(route, size)] || [];
+    const g = [], owners = new Set();
+    for (const id of q) {
+      const s = st.seats[id];
+      if (!s || s.state !== 'waiting' || s.paused || !s.public_ok || s.room_hold || owners.has(s.owner) || ownerBusy(s.owner)) continue;
+      g.push(id); owners.add(s.owner);
+    }
+    return g;
+  }
+  function reserve(route, size, ids) { const k = qkey(route, size); if (ids && ids.length) reserved.set(k, ids.slice()); else reserved.delete(k); }
+  const headCount = (route, size) => headGroup(route, size).length;
 
   // ── restore: anything in progress is over (§8.0, §8.8) ──
   try {
@@ -90,7 +115,7 @@ function createList(opts) {
   if (!st.countdowns) st.countdowns = {};
 
   // ── seats ──
-  function seat({ owner, size, route = 'chain', seatPk, wake = null, week = null }) {
+  function seat({ owner, size, route = 'chain', seatPk, wake = null, week = null, publicOk = false, feeCap = null }) {
     // 0.105.0: each route by its own list — "chain" TATARA_SIZES, "channel" the channel sizes (a channel's coin after its
     // close is an on-chain coin and seats on the chain route — DP 2026-10-14; 0.105.0's "close" route is gone)
     if (route === 'chain') { if (!S.sizes.includes(size)) return { ok: false, reason: 'size_not_offered' }; }
@@ -101,7 +126,8 @@ function createList(opts) {
     if (Object.values(st.seats).some((x) => x.seat_pk === seatPk && x.state !== 'removed')) return { ok: false, reason: 'seat_key_used' };
     if (q.length >= S.max_list_per_size) return { ok: false, reason: 'list_full' };
     const id = newId();
-    st.seats[id] = { id, owner, size, route, seat_pk: seatPk, wake, week, joined_at: nowS(), last_checkin: nowS(), paused: false, missed: 0, state: 'waiting', attempt_id: null, notices: [] };
+    st.seats[id] = { id, owner, size, route, seat_pk: seatPk, wake, week, joined_at: nowS(), last_checkin: nowS(), paused: false, missed: 0, state: 'waiting', attempt_id: null, notices: [],
+      public_ok: publicOk === true, fee_cap_milli: Number.isSafeInteger(feeCap) && feeCap > 0 ? feeCap : null, room_hold: false };   // 0.106.0: the seat's "public pools" switch; its fee cap (thousandths of a sat/vB — the phone's own limit) for a hosted room's rate
     q.push(id);
     persist();
     return { ok: true, seat_id: id };
@@ -123,6 +149,7 @@ function createList(opts) {
     const s = st.seats[id];
     if (!s) return { ok: false, reason: 'no_such_seat' };
     s.last_checkin = nowS();
+    s.room_hold = false;   // 0.106.0: the app is open — the seat may take a hosted room again
     const notices = s.notices.splice(0);
     if (s.state === 'removed') { delete st.seats[id]; persist(); return { ok: true, state: 'removed', notices }; }
     persist();
@@ -160,11 +187,31 @@ function createList(opts) {
     return wakes;
   }
 
-  function open(id, attemptId) {
+  /// 0.106.0: the hosted room's wake — the promised seats are told the room (the announcement, the public relay, the
+  /// reserved-seat token) and have WAKE_WINDOW_S to open and join by the public handshake. One try: a public room has no
+  /// retry.
+  function roomStart(route, size, ids, room) {
+    const attemptId = room.attempt_id;
+    reserve(route, size, null);
+    st.starts[attemptId] = { attempt_id: attemptId, route, size, seats: ids.slice(), opened: [], deadline: nowS() + S.wake_window_s, try: 1, retry_of: null, room: true, join_pks: {} };
+    const wakes = [];
+    for (const id of ids) {
+      const s = st.seats[id];
+      s.state = 'starting'; s.attempt_id = attemptId;
+      tell(s, { type: 'room', attempt_id: attemptId, route, size, peers: room.peers, relay: room.relay, event: room.event, open_within_s: S.wake_window_s });   // no token (review 2b #4/#5): the phone names its join key at `open`
+      if (s.wake) wakes.push({ seat_id: id, wake: s.wake, attempt_id: attemptId, size });
+    }
+    log(`[Tatara] room ${attemptId.slice(0, 8)} · ${size} sats · ${ids.length} seat(s) woken · ${S.wake_window_s} s to open and join`);
+    persist();
+    return wakes;
+  }
+
+  function open(id, attemptId, joinPk = null) {
     const s = st.seats[id];
     const sp = st.starts[attemptId];
     if (!s || !sp || s.attempt_id !== attemptId || !sp.seats.includes(id)) return { ok: false, reason: 'not_in_this_start' };
     if (nowS() > sp.deadline) return { ok: false, reason: 'too_late' };
+    if (sp.room) { if (!joinPk) return { ok: false, reason: 'join_pk_needed' }; sp.join_pks[id] = joinPk; }   // 0.106.0: a room's open names the phone's join key (the host answers it)
     if (!sp.opened.includes(id)) sp.opened.push(id);
     persist();
     return { ok: true, opened: sp.opened.length };
@@ -174,6 +221,17 @@ function createList(opts) {
     delete st.starts[sp.attempt_id];
     const opened = sp.opened.filter((id) => st.seats[id]);
     const missed = sp.seats.filter((id) => st.seats[id] && !opened.includes(id));
+    if (sp.room) {
+      // 0.106.0: a missed room wake is no strike and no re-seating — the seat holds back until the app opens once
+      for (const id of missed) { const s = st.seats[id]; s.state = 'waiting'; s.attempt_id = null; s.room_hold = true; tell(s, { type: 'missed_room', attempt_id: sp.attempt_id }); }
+      if (opened.length) {
+        const seatPks = {}; for (const id of opened) seatPks[id] = st.seats[id].seat_pk;
+        st.attempts[sp.attempt_id] = { attempt_id: sp.attempt_id, route: sp.route, size: sp.size, seats: opened, creator: null, try: 1, phase: 'running', announcement: null, reports: {}, created_at: nowS(), token: null, seat_pks: seatPks, room: true, join_pks: sp.join_pks || {} };
+        for (const id of opened) { const s = st.seats[id]; s.state = 'in_attempt'; }
+        log(`[Tatara] room ${sp.attempt_id.slice(0, 8)}: ${opened.length} of ${sp.seats.length} seat(s) opened — they join the room`);
+      } else log(`[Tatara] room ${sp.attempt_id.slice(0, 8)}: no seat opened — the room runs short`);
+      return;
+    }
     for (const id of missed) {
       const s = st.seats[id];
       s.state = 'waiting'; s.attempt_id = null;
@@ -217,11 +275,34 @@ function createList(opts) {
     return { ok: true };
   }
 
+  /// 0.106.0: the host's verdict on a hosted room — 'funding_signed' (the seats are done) or 'stopped' (back to the
+  /// front; no retry). A seat's own report on a room attempt lands here too.
+  function roomOutcome(attemptId, outcome) {
+    const a = st.attempts[attemptId];
+    if (!a || !a.room) return { ok: false, reason: 'no_such_room' };
+    if (a.phase === 'signed' || a.phase === 'stopped') return { ok: true, phase: a.phase };
+    if (outcome === 'funding_signed') {
+      a.phase = 'signed'; a.signed_at = nowS();
+      for (const sid of a.seats) { const s = st.seats[sid]; if (!s) continue; st.strikes[s.owner] = 0; removeSeat(sid, 'done'); }
+      log(`[Tatara] room ${attemptId.slice(0, 8)}: funding signed — its seats leave the list`);
+      persist();
+      return { ok: true, phase: 'signed' };
+    }
+    delete st.attempts[attemptId];
+    const left = [];
+    for (const sid of a.seats) { const s = st.seats[sid]; if (!s) continue; s.state = 'waiting'; s.attempt_id = null; tell(s, { type: 'stopped', attempt_id: attemptId, reason: 'room_stopped' }); left.push(sid); }
+    toFront(left);
+    log(`[Tatara] room ${attemptId.slice(0, 8)} stopped — its seats back to the front`);
+    persist();
+    return { ok: true, phase: 'stopped' };
+  }
+
   /// A phone's outcome: 'funding_signed' | 'stopped' | 'stopped_at_payouts'. The first stop decides; later ones are noted.
   function report(id, attemptId, outcome) {
     const a = st.attempts[attemptId];
     if (!a || !a.seats.includes(id)) return { ok: false, reason: 'not_in_this_attempt' };
     if (!['funding_signed', 'stopped', 'stopped_at_payouts'].includes(outcome)) return { ok: false, reason: 'bad_outcome' };
+    if (a.room) { a.reports[id] = outcome; return roomOutcome(attemptId, outcome === 'funding_signed' ? 'funding_signed' : 'stopped'); }   // 0.106.0
     a.reports[id] = outcome;
     if (a.phase === 'signed' || a.phase === 'stopped') { persist(); return { ok: true, phase: a.phase }; }
     if (outcome === 'funding_signed') {
@@ -324,7 +405,8 @@ function createList(opts) {
   function attemptOf(attemptId) { return st.attempts[attemptId] || null; }
   function seatOf(id) { return st.seats[id] || null; }
 
-  return { seat, endWeek, checkin, leave, pause: (id) => pause(id, true), resume: (id) => pause(id, false), open, announce, report, tick, counts, attemptOf, seatOf, state: () => st };
+  return { seat, endWeek, checkin, leave, pause: (id) => pause(id, true), resume: (id) => pause(id, false), open, announce, report, tick, counts, attemptOf, seatOf, state: () => st,
+    eligibleFor, reserve, headCount, roomStart, roomOutcome, startOf: (id) => st.starts[id] || null };   // 0.106.0: the hosted room's hooks
 }
 
 module.exports = { createList, ONLINE_S, MISSED_STARTS_MAX, SEAT_IDLE_MAX_S, CREATE_MAX_S, ATTEMPT_MAX_S };

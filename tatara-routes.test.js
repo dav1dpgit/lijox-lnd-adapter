@@ -74,7 +74,7 @@ const ANN = JSON.stringify(nostrEvent(poolSk, 2022, [], JSON.stringify({ type: '
   check(seatSignedMsg('chain', 50000, k0.pk, 5) === `lij-tatara-seat:v1|chain|50000|${k0.pk}|5`, 'R1 the seat message: "lij-tatara-seat:v1|route|size|seat_pk|ts"');
   // R2 — check-ins: the seat key's signature, never older than the last
   r = await act(s0, 'checkin');
-  check(r.code === 200 && r.body.count.joined === 1 && r.body.state === 'waiting', 'R2 a check-in signed by the seat key: the count');
+  check(r.code === 200 && r.body.count.joined === 1 && r.body.state === 'waiting' && !('room' in r.body), 'R2 a check-in signed by the seat key: the count (0.107.0: no public room open — no room field)');
   const forged = await post('checkin', { seat_id: s0.id, ts: ts(), sig: sig(key(5), 'checkin', [s0.id, ts()]) });
   check(forged.code === 401, 'R2 a check-in signed by another key: 401');
   const old = ts() - 5;

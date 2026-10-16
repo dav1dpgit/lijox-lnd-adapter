@@ -156,6 +156,9 @@
  *     0.105.1 the Console's page script parses again (0.104.0's "Release the guard" confirm text broke it — the code
  *       field never answered); the close pools gone (DP: a channel's coin after its close sits in the on-chain pools);
  *       the record signs v3 (lij-worker 0.12.1)
+ *     0.105.2 the security review's two adapter fixes: readBody caps a request body (256 KB; the pool backup 2 MB) —
+ *       it buffered without limit; getClientIp takes x-forwarded-for only when TRUST_FORWARDED_FOR=true (its last hop),
+ *       otherwise cf-connecting-ip or the socket — it took the header verbatim, so a client named its own "IP"
  *     reservation_validity_hours    default 24     (LSPS2_RESERVATION_HOURS)
  *     htlc_safety_blocks            default 10     (LSPS2_HTLC_SAFETY_BLOCKS)
  *     reconnect_poll_secs           default 5      (LSPS2_RECONNECT_POLL_SECS)
@@ -2303,6 +2306,12 @@ const tatara = createTatara({
     } catch (e) { console.error(`[Tatara] spend stream for ${txid.slice(0, 12)}…:${vout} could not be opened: ${e.message}`); return null; }
   },
   tipHeight: async () => Number((await lndGet('/v1/getinfo').catch(() => null))?.block_height || 0),
+  // 0.106.0 (Phase 2b): the node's fee estimate for a hosted room's rate — LND's 6-block estimate, sat/vB to one decimal
+  feeRateSatVb: async () => {
+    const r = await lndGet('/v2/wallet/estimatefee/6').catch(() => null);
+    const kw = Number(r && r.sat_per_kw);
+    return kw > 0 ? Math.ceil(kw * 4 / 100) / 10 : null;
+  },
   // 0.100.0: the backup sender — LND PublishTransaction (REST /v2/wallet/tx; the transaction's bytes base64)
   publishTx: async (hex) => {
     try {
@@ -4616,9 +4625,7 @@ function startWebSocketProxy() {
   });
 
   wss.on('connection', (ws, req) => {
-    const clientIp = req.headers['cf-connecting-ip'] // Cloudflare real IP
-      || req.headers['x-forwarded-for']
-      || req.socket.remoteAddress;
+    const clientIp = getClientIp(req);   // 0.105.2: the same rule as the API (cf-connecting-ip, else the socket; x-forwarded-for only when trusted)
     const origin = req.headers.origin || 'unknown';
 
     console.log(`[WS] Peer connection from ${clientIp} (origin: ${origin})`);
@@ -4983,6 +4990,7 @@ function settingsReport() {
     row('Tatara', 'channel pools', 'TATARA_CHANNEL_POOLS / TATARA_CHANNEL_SIZES', tatara.settings().channel_pools ? ((tatara.settings().channel_sizes || []).join(', ') || 'on') : 'off', 'sats', tatara.settings().lnd_limits ? `sizes checked against LND's own limits ${tatara.settings().lnd_limits.min_chan_size}–${tatara.settings().lnd_limits.max_chan_size} sats (minchansize/maxchansize in TATARA_LND_CONF, LND's defaults where absent; 0.103.2)` : 'sizes are checked against LND\'s limits read from TATARA_LND_CONF (0.103.2)'),
     row('Tatara', 'people', 'TATARA_MIN_PEOPLE / TATARA_MAX_PEOPLE', tatara.settings().min_people + '–' + tatara.settings().max_people, '', 'LiJ pools are 3 to 6'),
     row('Tatara', 'relay', '', tatara.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /tatara/relay'),
+    row('Tatara', 'public rooms', 'TATARA_PUBLIC_ROOMS / TATARA_PUBLIC_RELAY / TATARA_ROOM_WINDOW_S', tatara.settings().public_rooms ? `on · ${tatara.settings().public_relay} · ${tatara.settings().room_window_s} s` : 'off', '', '0.106.0 (Phase 2b): a size with seats waiting but fewer than the minimum gets a room on the public Joinstr relay, N = the minimum; the LIJOX pool wins if the list fills by itself before a stranger is in. Rooms now: ' + ((tatara.rooms && tatara.rooms()) || []).map((r) => `${r.size} sats ${r.phase} (${r.strangers} stranger(s), ${r.registered} registered, ${r.ends_in_s} s)`).join(' · ')),
     row('Lease', 'enabled', 'LEASE_ENABLE', Ls.enabled, '', ''),
     row('Lease', 'dry run', 'LEASE_DRY_RUN', Ls.dry_run, '', 'true = logs would_close, never closes'),
     row('Lease', 'silence before close', 'LEASE_DAYS', Ls.days, 'days', 'per-channel ttl overrides it (lease state)'),
@@ -5243,11 +5251,16 @@ function authOk(req) {
   );
 }
 
+// 0.105.2 (S59 security review, M2): the client's address for the per-IP limiters. Cloudflare's edge sets cf-connecting-ip
+// (it fronts the tunnel and strips what a client sent); otherwise the socket's own address — x-forwarded-for is trusted
+// only when the operator says the front proxy overwrites it (TRUST_FORWARDED_FOR=true), and then its LAST hop. It used
+// to take x-forwarded-for verbatim, so a client could name a fresh "IP" per request and walk past every limiter.
+const TRUST_XFF = String(process.env.TRUST_FORWARDED_FOR || '').toLowerCase() === 'true';
 function getClientIp(req) {
-  return req.headers['cf-connecting-ip']
-    || req.headers['x-forwarded-for']
-    || req.socket.remoteAddress
-    || 'unknown';
+  const cf = String(req.headers['cf-connecting-ip'] || '').trim();
+  if (cf) return cf;
+  if (TRUST_XFF) { const xff = String(req.headers['x-forwarded-for'] || '').split(',').map((s) => s.trim()).filter(Boolean); if (xff.length) return xff[xff.length - 1]; }
+  return (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
 function jsonResponse(res, data, status = 200) {
@@ -5259,11 +5272,21 @@ function errResponse(res, msg, status = 400) {
   jsonResponse(res, { error: msg }, status);
 }
 
-function readBody(req) {
+// 0.105.2 (S59 security review, H1): a body is buffered only up to `maxBytes` (256 KB unless the route says otherwise —
+// the pool backup takes 2 MB); past it the request is destroyed and the body refused. It used to buffer without limit.
+const READ_BODY_MAX = 256 * 1024;
+function readBody(req, maxBytes) {
+  const cap = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : READ_BODY_MAX;
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => body += chunk);
+    let body = '', size = 0, over = false;
+    req.on('data', chunk => {
+      if (over) return;
+      size += chunk.length;
+      if (size > cap) { over = true; body = ''; try { req.destroy(); } catch (_) {} reject(new Error('Body too large')); return; }
+      body += chunk;
+    });
     req.on('end', () => {
+      if (over) return;
       try {
         const parsed = body ? JSON.parse(body) : {};
         // 0.73.0: any POST that names its wallet is proof of life for the lease

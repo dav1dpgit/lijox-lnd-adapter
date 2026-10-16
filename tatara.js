@@ -48,6 +48,8 @@ const { createRelay } = require('./tatara-relay');
 const { createForward } = require('./tatara-forward');
 const { createRingStore } = require('./tatara-ringstore');
 const { createChannelWatch } = require('./tatara-channels');   // 0.103.0
+const { createHost } = require('./tatara-host');               // 0.106.0: the provider as host of a public room (Phase 2b)
+const { createNostrClient } = require('./tatara-nostr');
 const ringSig = require('./tatara-ring');
 const secp = require('secp256k1');
 const { checkEvent } = require('./nwc.js');
@@ -88,6 +90,10 @@ function readSettings(env, ctx = {}) {
     relay_for_others: bool(env.TATARA_RELAY_FOR_OTHERS, true),
     forward_coin_checks: bool(env.TATARA_FORWARD_COIN_CHECKS, true),
     coin_check_url: String(env.TATARA_COIN_CHECK_URL || '').trim(),
+    // 0.106.0 (Phase 2b): a queue short of MIN_PEOPLE gets a room on the public Joinstr relay (docs/design/mix/tatara-public-r1.md)
+    public_rooms: bool(env.TATARA_PUBLIC_ROOMS, true),
+    public_relay: String(env.TATARA_PUBLIC_RELAY || 'wss://relay.primal.net').trim(),
+    room_window_s: int(env.TATARA_ROOM_WINDOW_S, 1200),
   };
   const whole = (k, lo, hi, why) => { if (!Number.isSafeInteger(s[k]) || s[k] < lo || s[k] > hi) problems.push(`TATARA_${k.toUpperCase()}=${env['TATARA_' + k.toUpperCase()]} — ${why}`); };
   if (s.enabled === null) problems.push('TATARA_ENABLED must be true or false');
@@ -134,6 +140,10 @@ function readSettings(env, ctx = {}) {
     if (!Number.isSafeInteger(mp)) problems.push(`TATARA_CHANNEL_POOLS=true needs LND's maxpendingchannels confirmed at ${need} or more — set TATARA_LND_CONF to the lnd.conf path so the adapter can read it${ctx.lndConf ? ` (${ctx.lndConf}: not readable, or no maxpendingchannels line)` : ''}`);
     else if (mp < need) problems.push(`TATARA_CHANNEL_POOLS=true needs maxpendingchannels ≥ ${need} (retries + 1) in lnd.conf — it is ${mp}`);
   }
+  if (s.public_rooms === null) problems.push('TATARA_PUBLIC_ROOMS must be true or false');
+  whole('room_window_s', 300, 3600, 'a whole number of seconds from 300 to 3,600');
+  if (Number.isSafeInteger(s.room_window_s) && Number.isSafeInteger(s.wake_window_s) && s.room_window_s < 2 * s.wake_window_s) problems.push('TATARA_ROOM_WINDOW_S must be at least twice TATARA_WAKE_WINDOW_S');
+  if (!/^wss:\/\/[a-z0-9.-]+(:[0-9]+)?(\/[^\s]*)?$/i.test(s.public_relay) || s.public_relay.length > 200) problems.push('TATARA_PUBLIC_RELAY must be a wss:// address');
   if (s.coin_check_url && (s.coin_check_url.length > 200 || s.coin_check_url.endsWith('/') || !HTTPS_RE.test(s.coin_check_url))) problems.push('TATARA_COIN_CHECK_URL must be a plain https:// address (no trailing slash), or empty');
   return { enabled: s.enabled === true, ok: problems.length === 0, problems, s };
 }
@@ -186,6 +196,8 @@ function recordBlock(st, publicHttpsUrl, ringHash = null) {
     channel_pools: !!s.channel_pools, channel_sizes: s.channel_pools ? s.channel_sizes.slice() : [], relay_url: relay,   // 0.103.0: the channel route, when offered
     relay_for_others: !!s.relay_for_others, forward_payouts: !!s.forward_payouts, forward_coin_checks: !!s.forward_coin_checks,
     coin_check_url: s.coin_check_url || null, ring_hash: ringHash || null,
+    // 0.106.0: the public rooms are NOT in the record (the worker signs this block field by field — lij-worker 0.12.1's
+    // TATARA_FIELDS); a seat learns the room's relay from its wake notice. A record field waits for a worker release.
   };
 }
 
@@ -196,6 +208,8 @@ const sha256 = (str) => crypto.createHash('sha256').update(str, 'utf8').digest()
 function seatMsg(action, fields) { return sha256(`lij-tatara-${action}:v1|` + fields.map(String).join('|')); }
 function seatSigOk(seatPk, action, fields, sig) { return isHex(sig, 128) && schnorr.verify(sig, seatMsg(action, fields), seatPk); }
 const seatSignedMsg = (route, size, seatPk, ts) => `lij-tatara-seat:v1|${route}|${size}|${seatPk}|${ts}`;
+// 0.106.0 (engine v344): a seat that may take a hosted room signs the provider it is for, its switch and its fee cap (thousandths)
+const seatSignedMsgV3 = (providerPk, route, size, seatPk, publicOk, feeCapMilli, ts) => `lij-tatara-seat:v3|${providerPk}|${route}|${size}|${seatPk}|${publicOk ? 'true' : 'false'}|${feeCapMilli}|${ts}`;
 const noticeMsg = (seatId, body) => `lij-tatara-notice:v1|${seatId}|${body}`;
 
 function createTatara(deps) {
@@ -217,6 +231,8 @@ function createTatara(deps) {
     abandonChannel = null,                 // 0.103.0: async (txid, vout) → { ok, error } — LND AbandonChannel (i_know_what_i_am_doing)
     watchSpend = null,                     // 0.103.0: ({ txid, vout }, cb) → handle — a ChainNotifier spend stream
     tipHeight = null,                      // 0.103.0: async () => the chain tip
+    feeRateSatVb = async () => null,       // 0.106.0: the node's fee estimate (sat/vB, fractions allowed) for a hosted room's rate
+    connectPublicRelay = null,             // 0.106.0: (url) → a nostr client (tatara-nostr.js unless the tests hand one in)
   } = deps || {};
   const httpsUrl = () => { try { return String((typeof publicHttpsUrl === 'function' ? publicHttpsUrl() : publicHttpsUrl) || ''); } catch (_) { return ''; } };
   let st = readSettings(env, Object.assign({}, channelLimits() || {}, lndRoom() || {}));
@@ -281,6 +297,12 @@ function createTatara(deps) {
     return attemptRelay.get(attemptId);
   }
   let lastBackupTick = 0;
+  // 0.106.0 (Phase 2b): the host of public rooms — a queue short of MIN_PEOPLE announces a room on the public relay
+  const host = on() && st.s.public_rooms && list
+    ? createHost({ settings: () => st.s, now, log, list, publicRelayUrl: st.s.public_relay, feeRateSatVb, network: 'mainnet',   // 0.106.1: the public joinstr v2 code's word for Bitcoin (peer.rs network_name); 'bitcoin' was refused by it as another network
+        coinCheck: async (q) => { const r = await fwd.forwardCoin(q); return r && r.code === 200 ? r.body : null; },   // the provider's own coin check (its filter server, or a registered provider's)
+        connect: (url) => (connectPublicRelay ? connectPublicRelay(url) : createNostrClient({ url, log, now })) })
+    : null;
 
   /// The pool's public key from the creator's announcement: a signed nostr event (its author), or the bare pool event.
   function poolKeyOf(announcement) {
@@ -308,6 +330,7 @@ function createTatara(deps) {
       if (!a) relay.close(token, 'the attempt ended');
       else if (a.phase === 'signed' && nowS() - (a.signed_at || 0) > ROOM_GRACE_S) relay.close(token, 'funding signed');
     }
+    if (host) { try { const hw = await host.tick(); if (hw && hw.wakes) wakes.push(...hw.wakes); } catch (e) { log(`[Tatara] the host: ${e.message}`); } }   // 0.106.0
     for (const w of wakes) {
       try {
         if (w.wake && w.wake.kind === 'node') await sendWakePush(w.wake.pk, 'tatara');
@@ -336,7 +359,7 @@ function createTatara(deps) {
     const s = st.s;
     if (!relayUrlOf(httpsUrl())) return ['[Tatara] REFUSED — PUBLIC_HTTPS_URL is not an https:// address, so there is no relay address to declare'];
     return [`[Tatara] on (the arrangement follows the registry: v0.8's below three providers, doors 1 and 2 at three; ring signatures checked by ${ringSig.backend()}) — sizes ${s.sizes.join(', ')} sats · ${s.min_people}–${s.max_people} people · countdown ${s.countdown_s} s · wake window ${s.wake_window_s} s · retries ${s.max_retries} · strikes ${s.strikes} · fee cap ${s.max_fee_rate} sat/vB · relay ${relayUrlOf(httpsUrl())}` +
-      (s.channel_pools ? ` · channel pools ${s.channel_sizes.join(', ')} sats${s.lnd_limits ? ` (LND allows ${s.lnd_limits.min_chan_size}–${s.lnd_limits.max_chan_size})` : ''}` : '') + ` · forwards payouts ${s.forward_payouts ? 'yes' : 'no'}, coin checks ${s.forward_coin_checks ? 'yes' : 'no'} · relays for others ${s.relay_for_others ? 'yes' : 'no'} · coin checks answered ${s.coin_check_url ? 'at ' + s.coin_check_url : 'no'}`];
+      (s.channel_pools ? ` · channel pools ${s.channel_sizes.join(', ')} sats${s.lnd_limits ? ` (LND allows ${s.lnd_limits.min_chan_size}–${s.lnd_limits.max_chan_size})` : ''}` : '') + (s.public_rooms ? ` · public rooms on ${s.public_relay} (${s.room_window_s} s each)` : ' · no public rooms') + ` · forwards payouts ${s.forward_payouts ? 'yes' : 'no'}, coin checks ${s.forward_coin_checks ? 'yes' : 'no'} · relays for others ${s.relay_for_others ? 'yes' : 'no'} · coin checks answered ${s.coin_check_url ? 'at ' + s.coin_check_url : 'no'}`];
   }
 
   const ACTIONS = { leave: (id) => list.leave(id), pause: (id) => list.pause(id), resume: (id) => list.resume(id) };
@@ -419,7 +442,7 @@ function createTatara(deps) {
     if (!['seat', 'checkin', 'leave', 'pause', 'resume', 'open', 'announce', 'report', 'backup'].includes(action)) { jsonResponse(res, { ok: false, reason: 'not_found' }, 404); return true; }
     if (!limiter.hit(ip).ok) { jsonResponse(res, { ok: false, reason: 'rate_limited' }, 429); return true; }
     let b;
-    try { b = await readBody(req); } catch (_) { jsonResponse(res, { ok: false, reason: 'bad_json' }, 400); return true; }
+    try { b = await readBody(req, action === 'backup' ? 2 * 1024 * 1024 : undefined); } catch (_) { jsonResponse(res, { ok: false, reason: 'bad_json' }, 400); return true; }   // 0.105.2 (H1): the backup carries the pool's transactions; every other seat action is small
     b = b || {};
     const ts = Number(b.ts);
     if (!Number.isSafeInteger(ts) || Math.abs(nowS() - ts) > SKEW_S) { jsonResponse(res, { ok: false, reason: 'stale' }, 400); return true; }
@@ -449,11 +472,16 @@ function createTatara(deps) {
       const route = String(b.route || ''), size = Number(b.size), seatPk = String(b.seat_pk || ''), pk = String(b.node_pubkey || '').toLowerCase();
       if (!ROUTES.includes(route) || !Number.isSafeInteger(size) || !isHex(seatPk, 64) || !/^0[23][0-9a-f]{64}$/.test(pk) || !b.signature) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; }
       if (!routeOffered(route, size)) { jsonResponse(res, { ok: false, reason: route === 'chain' ? 'size_not_offered' : 'route_not_offered' }, 409); return true; }   // 0.103.0 · 0.105.0
+      // 0.106.0 (engine v344): a body with `public` signs the v3 message — the provider it is for (this one, or the request
+      // was made for another: review 2b #7), the switch and the fee cap (thousandths) are the wallet's word, not the request's
+      const v3 = b.public !== undefined || b.fee_cap_milli !== undefined || b.provider_pk !== undefined;
+      const publicOk = b.public === true, feeCap = Number(b.fee_cap_milli), forPk = String(b.provider_pk || '').toLowerCase();
+      if (v3 && (typeof b.public !== 'boolean' || !Number.isSafeInteger(feeCap) || feeCap < 1000 || feeCap > 100000000 || forPk !== String(selfPubkey() || '').toLowerCase())) { jsonResponse(res, { ok: false, reason: forPk && forPk !== String(selfPubkey() || '').toLowerCase() ? 'for_another_provider' : 'bad_request' }, 400); return true; }
       let recovered = '';
-      try { recovered = await verifyWalletSig(seatSignedMsg(route, size, seatPk, ts), String(b.signature)); } catch (e) { jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503); return true; }
+      try { recovered = await verifyWalletSig(v3 ? seatSignedMsgV3(forPk, route, size, seatPk, publicOk, feeCap, ts) : seatSignedMsg(route, size, seatPk, ts), String(b.signature)); } catch (e) { jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503); return true; }
       if (!recovered || recovered !== pk) { jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401); return true; }
-      const r = list.seat({ owner: pk, size, route, seatPk, wake: { kind: 'node', pk } });
-      if (r.ok) log(`[Tatara] seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'chain' ? '' : ' · ' + route} · wallet ${pk.slice(0, 8)}`);
+      const r = list.seat({ owner: pk, size, route, seatPk, wake: { kind: 'node', pk }, publicOk: v3 && publicOk, feeCap: v3 ? feeCap : null });
+      if (r.ok) log(`[Tatara] seat ${r.seat_id.slice(0, 8)} · ${size} sats${route === 'chain' ? '' : ' · ' + route} · wallet ${pk.slice(0, 8)}${v3 && publicOk ? ' · public rooms ok (cap ' + (feeCap / 1000) + ' sat/vB)' : ''}`);
       jsonResponse(res, r, r.ok ? 200 : 409);
       return true;
     }
@@ -479,6 +507,8 @@ function createTatara(deps) {
     if (!seat) { jsonResponse(res, { ok: false, reason: 'no_such_seat' }, 404); return true; }
     const attemptId = String(b.attempt_id || '');
     const fields = action === 'open' || action === 'report' || action === 'announce' ? [seatId, attemptId] : [seatId];
+    const joinPk = action === 'open' && b.join_pk !== undefined ? String(b.join_pk || '') : null;   // 0.106.0: a room's open names the join key, signed
+    if (joinPk !== null) { if (!isHex(joinPk, 64)) { jsonResponse(res, { ok: false, reason: 'bad_request' }, 400); return true; } fields.push(joinPk); }
     if (action === 'report') fields.push(String(b.outcome || ''));
     if (action === 'announce') fields.push(crypto.createHash('sha256').update(String(b.announcement || ''), 'utf8').digest('hex'));
     fields.push(ts);
@@ -489,12 +519,15 @@ function createTatara(deps) {
     let r;
     if (action === 'checkin') {
       r = list.checkin(seatId);
+      // 0.107.0 (DP 20:48): the seat's queue's public room, when this node hosts one — strangers in, N, the seconds left —
+      // so the phone's seat view can say who is in it (the room's joins are sealed to the room's key; only the host reads them)
+      if (r.ok && host && seat && (seat.route || 'chain') === 'chain') { try { const ro = host.roomOf('chain', seat.size); if (ro) r.room = ro; } catch (e) { log(`[Tatara] roomOf: ${e.message}`); } }
       if (r.ok && r.notices && r.notices.length) {
         try { r.notices = await signed(seatId, r.notices); }
         catch (e) { log(`[Tatara] ${e.message} — notices kept for the next check-in`); for (const n of r.notices.reverse()) seat.notices.unshift(n); r.notices = []; r.retry_s = 2; }
       }
     } else if (ACTIONS[action]) r = ACTIONS[action](seatId);
-    else if (action === 'open') r = list.open(seatId, attemptId);
+    else if (action === 'open') { r = list.open(seatId, attemptId, joinPk); if (r.ok && joinPk && host) host.noteJoinKey(attemptId, joinPk); }   // 0.106.0: the host answers that key
     else if (action === 'announce') {
       const ann = String(b.announcement || '');
       const poolPk = poolKeyOf(ann);
@@ -529,8 +562,10 @@ function createTatara(deps) {
     relayRooms: () => relay.rooms(),
     backups: () => fwd.backups(),
     channelWatch: () => (channels ? channels.watched() : null),   // 0.103.0
-    summary: () => (list ? { queues: list.counts(), attempts: Object.keys(list.state().attempts).length, starts: Object.keys(list.state().starts).length } : null),
+    summary: () => (list ? { queues: list.counts(), attempts: Object.keys(list.state().attempts).length, starts: Object.keys(list.state().starts).length, rooms: host ? host.summary() : [] } : null),
+    rooms: () => (host ? host.summary() : []),   // 0.106.0
+    publicRelay: () => (host ? host.relayStats() : null),
   };
 }
 
-module.exports = { createTatara, readSettings, readLndRoom, recordBlock, relayUrlOf, seatMsg, seatSignedMsg, noticeMsg, RELAY_PATH };
+module.exports = { createTatara, readSettings, readLndRoom, recordBlock, relayUrlOf, seatMsg, seatSignedMsg, seatSignedMsgV3, noticeMsg, RELAY_PATH };
