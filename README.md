@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.74.0). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with the file hashes in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the file hash to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.107.0, 2026-10-15). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -52,11 +52,15 @@ WHAT YOU NEED BEFORE STARTING
 
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
-       git checkout v0.52.0          # latest release tag
-   Verify integrity (see RELEASES.md for the checksum table):
-       git archive --format=tar --prefix=lijox-adapter-0.52.0/ v0.52.0 | gzip -n | sha256sum
-   The output must equal the sha256 listed in RELEASES.md for this
-   version. Then:
+       git fetch --tags
+       git checkout v0.107.0         # the newest tag — the last row of RELEASES.md
+   Verify integrity against that row (since 0.57.0 every row lists
+   each file's own sha256; a file the row calls unchanged keeps the
+   hash of the last row that named it):
+       sha256sum lij-adapter.js tatara.js tatara-list.js tatara-host.js tatara-nostr.js nip04.js config.env.example package.json
+   Every printed hash must equal the one RELEASES.md gives for that
+   file at this version. (Rows up to 0.56.4 hashed a tarball instead —
+   RELEASES.md explains both.) Then:
        npm ci
    (npm ci installs the exact locked dependencies, including a small
    native build for better-sqlite3.)
@@ -122,8 +126,16 @@ WHAT YOU NEED BEFORE STARTING
 8. OPERATING NOTES
    - Privacy defaults: client IPs are not logged; no registry is
      contacted unless you set one; nothing phones home.
-   - Update (until signed releases land): git pull in /opt, then
-     systemctl restart lijox-adapter. Read the changelog first.
+   - Update (until signed releases land): in /opt/lijox-adapter,
+     git fetch --tags && git checkout v<NEW> (never a bare git pull),
+     sha256sum the files the new row names and compare, then
+     systemctl restart lijox-adapter. Read the row first — it is the
+     changelog — and the boot banner must show the new version.
+   - The JIT guard (0.104+): a JIT open that was funded and then
+     failed counts against a rolling 24 h; at JIT_GUARD_ARM_AT the
+     console reads "shutdown ARMED", at JIT_GUARD_HALT_AT every JIT
+     open is refused until released from the console. Set both
+     deliberately or leave the defaults.
    - Your money exposure: JIT opens spend YOUR onchain funds within
      the limits you set (CHANNEL_SIZE/MIN/MAX, JIT_MIN_ONCHAIN_
      RESERVE_SATS). Set them deliberately.
@@ -197,6 +209,25 @@ silent-payment index), and only then puts `filter_url` and `filter_sp` into the 
 plain sentence in the journal — wallets are never pointed at a dead server. Unset = nothing offered; the record is
 v1 as before and wallets read the default server. `/health` carries `filter_server`; the console shows it.
 `node registry-filter.test.js` checks the record and the check.
+
+## Mix pools — LIJOX's Tatara (0.97+; public rooms 0.106+)
+
+With `TATARA_ENABLED=true` the adapter offers its wallets coinjoin pools built on the public joinstr v2
+code: the provider keeps the waiting list (seats signed by a per-seat key), starts a pool when
+`TATARA_MIN_PEOPLE` have joined (3–6 people; `TATARA_SIZES`, each at least 10,000 sats), wakes the
+seats by push, relays the pool's messages (`/tatara/relay`) and forwards coin checks and payouts to
+other providers so that no wallet's payout ever passes through its own provider. Channel pools
+(0.103+, `TATARA_CHANNEL_POOLS`, `TATARA_CHANNEL_SIZES`) pay a pool's exit straight into a new
+channel; the sizes are checked against LND's own channel limits read from `TATARA_LND_CONF`. From
+0.106.0 a pool size with seats waiting but fewer than the minimum gets a room on a public nostr
+relay (`TATARA_PUBLIC_ROOMS`, `TATARA_PUBLIC_RELAY`, `TATARA_ROOM_WINDOW_S`): a joinstr v2 pool
+announcement signed by a key the host makes for the room, open to anyone with a joinstr wallet, and
+honoured only once a stranger has registered a coin whose ownership proof verifies and whose coin
+is on the chain as registered; the outcome is never read off the relay — the seats' signed reports
+decide. 0.107.0 adds the room's stranger count to a seat's check-in. The registry record carries the
+`tatara` block (`lijox-register:v3`, signed field by field). The design and its security reviews are
+in the wallet repo under `docs/design/mix/` and `docs/security-review-*.md`; the tests are
+`tatara-*.test.js`. Nothing in a room announcement names LIJOX.
 
 ## The operator console (0.71+)
 
