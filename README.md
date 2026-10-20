@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.108.1, 2026-10-19). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.109.1, 2026-10-19). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.108.1         # the newest tag — the last row of RELEASES.md
+       git checkout v0.109.1         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -168,6 +168,12 @@ returns the record (ciphertext) or 404. Records live in `DATA_DIR/kits/<npub>.js
 KIT_MAX_BYTES (65,536) each; the store evicts the oldest untouched record beyond 20,000, never one
 touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the LiJ repo's
 docs/black-start-standard.md.
+
+**The Black start page at `/recover` (0.109+).** Every LIJOX adapter also serves the wallet site's own recovery
+page — the one self-contained file `recover/index.html` shipped with each release, its hash in RELEASES.md — at
+`GET /recover`. A user with only the 12 words reaches it at any provider when lightninginajar.xyz does not open;
+the page asks the providers and the chain servers only, and this box learns nothing from it. `/health` carries
+`recover_page` (the page's build). This is a LIJOX standard like the watchtower: a provider serves the page.
 
 ## NWC — the provider's half (0.86+)
 A Nostr app (Nostur, Damus, Primal, Amethyst …) asks the LiJ wallet to pay a zap. The request is a

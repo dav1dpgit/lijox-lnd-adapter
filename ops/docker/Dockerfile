@@ -1,7 +1,7 @@
-# LIJOX adapter — the Docker image (ops/docker, adapter 0.108.1).
+# LIJOX adapter — the Docker image (ops/docker, adapter 0.109.1).
 #
 # Build from the repository root, never from this folder:
-#     docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.108.1 .
+#     docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.109.1 .
 # (ops/docker/README.md has the full build / run / update steps.)
 #
 # What the image holds: Node.js 22 (the engine the adapter is developed on; README: "Node.js 20 or newer"),
@@ -72,6 +72,8 @@ COPY lightning.proto \
      router.proto \
      walletkit.proto \
      ./
+# 0.109.0: the Black start page served at /recover (one file; its hash in RELEASES.md)
+COPY recover/index.html ./recover/index.html
 
 # 3. a non-root user owning the state root. uid 1000 is the image's "node" user; LND's tls.cert mount must be
 #    readable by uid 1000 (ops/docker/README.md explains the one chmod).

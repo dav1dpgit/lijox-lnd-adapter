@@ -33,7 +33,7 @@ first operator who builds it is the first build; the runbook says what to look f
 
 From the repository root, at a release tag, after the hash check (next section):
 
-    docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.108.1 .
+    docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.109.1 .
 
 The tag in the image name is the adapter's tag. `docker-compose.yml` names the same tag in `image:` — change both
 together on an update.
@@ -63,7 +63,7 @@ Every release row names the files that changed and their sha256; a file the row 
 the last row that named it. Before building, at the checked-out tag:
 
     git fetch --tags
-    git checkout v0.108.1
+    git checkout v0.109.1
     sha256sum lij-adapter.js tatara.js tatara-list.js tatara-host.js tatara-nostr.js nip04.js config.env.example package.json
 
 Compare each line with the row for the tag in `RELEASES.md` (the row is also the changelog). A mismatch = do not

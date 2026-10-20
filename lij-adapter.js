@@ -590,6 +590,9 @@ function oiRateLimited(ip) {
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 // 0.79.0: the kit holder's store, DATA_DIR/kits/<npub>.json (ciphertext the box cannot read)
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+// 0.109.0: the Black start page (recover/index.html beside this file), read once; absent = the route answers 404 and the console's health says so
+const RECOVER_PAGE = (() => { try { return require('fs').readFileSync(require('path').join(__dirname, 'recover', 'index.html'), 'utf8'); } catch (_) { return null; } })();
+const RECOVER_BUILD = RECOVER_PAGE ? ((RECOVER_PAGE.match(/const RECOVER_BUILD = '(v\d+)'/) || [])[1] || 'unknown') : null;
 // 0.93.0 (S57): one open copy at a time — sessions registered by a signed my-channels request, kept in memory
 const { CopyWatch } = require('./copies');
 const copyWatch = new CopyWatch();
@@ -5953,6 +5956,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 0.109.0 (S61, DP 2026-10-19 — the Black start page at every provider, a LIJOX standard like the watchtower): GET
+  // /recover serves the wallet site's own /recover page, the one self-contained file, shipped with this release (its hash
+  // in RELEASES.md). A user with only the 12 words reaches it at any provider when lightninginajar.xyz does not open. The
+  // page asks the providers and the chain servers only; this box learns nothing from it. Same CSP as the site's.
+  if ((path === '/recover' || path === '/recover/' || path === '/recover/index.html') && method === 'GET') {
+    if (!RECOVER_PAGE) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('no Black start page in this release'); return; }
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache, must-revalidate', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+      'Content-Security-Policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https: wss:; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'" });
+    res.end(RECOVER_PAGE); return;
+  }
+
   // Health check — no auth required
   if (path === '/health' && method === 'GET') {
     /* v0.55.4: scope-free heartbeat parse. 0.55.1 referenced an
@@ -6021,6 +6035,7 @@ const server = http.createServer(async (req, res) => {
                                        : { enabled: !!htlcInterceptor,
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
+        recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
         nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
         filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it

@@ -1,4 +1,4 @@
-# LIJOX adapter — docker compose (ops/docker, adapter 0.108.1). Run from THIS folder:
+# LIJOX adapter — docker compose (ops/docker, adapter 0.109.1). Run from THIS folder:
 #     docker compose up -d
 #
 # WHY THE HOST NETWORK (network_mode: host), not a bridge network with port mappings:
@@ -26,7 +26,7 @@
 
 services:
   lijox-adapter:
-    image: lijox-adapter:v0.108.1
+    image: lijox-adapter:v0.109.1
     build:
       context: ../..
       dockerfile: ops/docker/Dockerfile

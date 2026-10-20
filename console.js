@@ -70,13 +70,14 @@ header{display:flex;align-items:center;gap:12px;padding:10px 14px;border-bottom:
 header h1{font-size:16px;margin:0;font-weight:600}header .sub{color:#8b949e;font-size:12px}header .sp{flex:1}
 button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}button:hover{background:#30363d}
 main{padding:12px;display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 12px 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;max-height:56vh}.card>div{min-width:0;flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch}.card>div>*{flex:0 0 auto}.card>div>.tbl{flex:1 1 auto;min-height:0}.card>div:last-child{padding-bottom:12px}.card>div:last-child:has(>.tbl:last-child){padding-bottom:0}.card .tbl{overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:0}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 12px 0;min-width:0;overflow:hidden;display:flex;flex-direction:column;max-height:56vh}.card.wide{grid-column:1/-1}.card[hidden]{display:none}.card>div{min-width:0;flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch}.card>div>*{flex:0 0 auto}.card>div>.tbl{flex:1 1 auto;min-height:0}.card>div:last-child{padding-bottom:12px}.card>div:last-child:has(>.tbl:last-child){padding-bottom:0}.card .tbl{overflow:auto;-webkit-overflow-scrolling:touch;margin:0;padding:0}
 td button{padding:1px 6px;font-size:11px;line-height:1.3;border-radius:5px;white-space:nowrap}td{line-height:1.3}
 input.note{background:transparent;color:#e6edf3;border:1px solid transparent;border-radius:4px;padding:1px 4px;font:inherit;font-size:12px;width:16em;max-width:100%}input.note:hover,input.note:focus{border-color:#30363d;background:#0d1117;outline:none}
 textarea.note{width:100%;min-height:2.6em;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px 8px;font:inherit;font-size:13px;resize:vertical;margin-bottom:8px}
 tr.grp td{background:#1c2129;font-weight:600}tr.grp td .tri{display:inline-block;width:1em;color:#8b949e}tr.sub td:first-child{padding-left:22px}.card h2{font-size:13px;margin:0 0 8px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}.card h2:after{content:' ⤢';opacity:.35;font-size:12px}.card.full h2:after{content:' ⤡'}.card h2:hover{color:#e6edf3}
 .card.full{position:fixed;z-index:50;margin:0;border-radius:0;box-shadow:0 0 0 100vmax #0d1117;overflow:auto;transition:top .32s cubic-bezier(.2,.7,.2,1),left .32s cubic-bezier(.2,.7,.2,1),width .32s cubic-bezier(.2,.7,.2,1),height .32s cubic-bezier(.2,.7,.2,1),border-radius .32s}.card.full{max-height:none}.card.placeholder{visibility:hidden}
 .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px;margin-bottom:10px}.kpi{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;min-width:0}.kpi .t{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.04em}.kpi .v{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;margin:2px 0;overflow-wrap:anywhere}.kpi .s{font-size:11px;color:#8b949e}.kpi.warn .v{color:#d29922}.kpi.bad .v{color:#f85149}.kpi.good .v{color:#3fb950}
+.flow{display:block;margin:4px 0 12px;background:#0d1117;border:1px solid #30363d;border-radius:6px}.flow .fb{fill:#161b22;stroke:#30363d}.flow .fb.hub{stroke:#8b949e}.flow .ft{fill:#8b949e;font-size:10px;letter-spacing:.04em}.flow .fv{fill:#e6edf3;font-size:12px;font-weight:600}.flow .fs{fill:#8b949e;font-size:10px}.flow .fl{fill:#e6edf3;font-size:11px}.flow .fl.off{fill:#8b949e}.flow .fn{fill:#8b949e;font-size:10px;font-variant-numeric:tabular-nums}.flow .fe{fill:none;stroke-linecap:butt}.flow .fe.them{stroke:#3d3a5c}.flow .fe.us{stroke:#7c6cf0}.flow .fe.dash{stroke:#8b949e;stroke-width:2;stroke-dasharray:4 6}
 .kv{display:grid;grid-template-columns:minmax(0,auto) minmax(0,1fr);gap:4px 12px}.kv div{min-width:0;overflow-wrap:anywhere;word-break:break-word}.kv div:nth-child(odd){color:#8b949e}.kv div:nth-child(even){font-variant-numeric:tabular-nums}
 table{width:100%;border-collapse:collapse;font-size:13px;min-width:max-content}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid #21262d;vertical-align:top}th{color:#8b949e;font-weight:500;cursor:pointer;user-select:none;white-space:nowrap}th.sorted:after{content:' ▴';opacity:.7}th.sorted.desc:after{content:' ▾'}td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 .ok{color:#3fb950}.warn{color:#d29922}.bad{color:#f85149}.dim{color:#8b949e}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;overflow-wrap:anywhere;word-break:break-all}
@@ -92,6 +93,53 @@ function fmt(n){n=Number(n||0);return n.toLocaleString('en-US')}
 function ago(ms){if(!ms)return '\\u2014';var s=Math.max(0,(Date.now()-ms)/1000);if(s<90)return Math.round(s)+' s ago';if(s<5400)return Math.round(s/60)+' min ago';if(s<172800)return (s/3600).toFixed(1)+' h ago';return (s/86400).toFixed(1)+' d ago'}
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function jitGuardLine(j){if(!j)return '<span class="dim">no report</span>';var n=Number(j.failed_24h||0),lv=Number(j.level||0);var w=n+' funded-but-failed JIT open'+(n===1?'':'s')+' in the last 24 h';var tail=' <span class="dim">a channel opened and the payment then failed \u00b7 red at 1, armed at '+j.arm_at+', JIT off at '+j.halt_at+' \u00b7 JIT_GUARD_ARM_AT / JIT_GUARD_HALT_AT</span>';if(j.halted){return '<span class="bad">JIT OFF since '+new Date(j.halted.at).toLocaleString()+' \u2014 '+j.halted.count+' funded-but-failed opens in 24 h</span>'+(j.last_failed?'<br><span class="dim">last: '+esc(String(j.last_failed.cp||'').slice(0,20))+'\u2026 '+esc(j.last_failed.code||'')+' '+ago(j.last_failed.at)+'</span>':'')+'<br><button class="jr">Release the guard \u2014 JIT opens again</button>'+tail}if(lv>=2)return '<span class="bad">'+w+' \u2014 JIT shutdown ARMED</span>'+(j.last_failed?' <span class="dim">last '+ago(j.last_failed.at)+'</span>':'')+tail;if(lv>=1)return '<span class="bad">'+w+'</span>'+(j.last_failed?' <span class="dim">'+esc(String(j.last_failed.cp||'').slice(0,20))+'\u2026 '+esc(j.last_failed.code||'')+' '+ago(j.last_failed.at)+'</span>':'')+tail;return '<span class="ok">'+w+'</span>'+(j.last_release?' <span class="dim">released '+ago(j.last_release)+'</span>':'')+tail}
+// 0.109.0 (S61, DP 2026-10-19 — the console graphic, live mode): the money as it sits now. Left: the on-chain balance and
+// the LiJ wallets (their sendable / receivable summed); middle: this node; right: every peer channel (ex-wallet), one
+// band per channel, width by capacity, the band split where the balance sits (this side left, the peer's side right).
+// Numbers only from the snapshot (channels, balances); nothing is replayed or predicted — the replay and the plan are
+// their own project.
+function flowSvg(d){
+  var ch=(d.channels||[]),b=d.balances||{},bx=b.boxes||{},pr=b.principles||{};
+  var peers=ch.filter(function(c){return !c.wallet}).sort(function(a,c){return c.capacity-a.capacity});
+  var wal=ch.filter(function(c){return c.wallet});
+  if(!peers.length&&!wal.length)return '';
+  var W=760,rowH=30,n=Math.max(peers.length,1),H=Math.max(190,n*rowH+70),top=Math.max(20,H/2-n*rowH/2);
+  var maxCap=Math.max.apply(null,peers.map(function(c){return c.capacity}).concat([1]));
+  var hubX=330,hubW=130,hubH=88,hubTop=H/2-hubH/2,rightX=500,rightW=W-rightX-10;
+  var leftX=12,leftW=170;
+  var M=function(v){v=Number(v||0);var a=Math.abs(v);return a>=1e6?(a/1e6).toFixed(2)+'M':a>=1e3?Math.round(a/1e3)+'k':String(Math.round(a))};
+  function box(x,y,w,h,title,line1,line2,cls){return '<rect x="'+x+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="6" class="fb '+(cls||'')+'"/>'
+    +'<text x="'+(x+10)+'" y="'+(y+17)+'" class="ft">'+esc(title)+'</text>'+(line1?'<text x="'+(x+10)+'" y="'+(y+35)+'" class="fv">'+esc(line1)+'</text>':'')+(line2?'<text x="'+(x+10)+'" y="'+(y+50)+'" class="fs">'+esc(line2)+'</text>':'')}
+  var out='<svg class="flow" viewBox="0 0 '+W+' '+H+'" width="100%" role="img" aria-label="liquidity now">';
+  /* left: on-chain, the wallets */
+  var ocY=Math.max(20,hubTop-6),walY=Math.min(H-66,hubTop+hubH-52+40);
+  out+=box(leftX,ocY,leftW,56,'ON-CHAIN',fmt(bx.onchain_total)+' sats',fmt(bx.anchor_reserve)+' anchor reserve');
+  out+=box(leftX,walY,leftW,56,'LiJ WALLETS \u00b7 '+fmt(wal.length),'send '+M(pr.wallet_out)+' \u00b7 receive '+M(pr.wallet_in),(wal.filter(function(c){return c.active}).length)+' online now');
+  /* middle: this node */
+  out+=box(hubX,hubTop,hubW,hubH,'THIS NODE','can send '+M(bx.can_send),'can receive '+M(bx.can_receive),'hub');
+  /* edges: on-chain (dashed) and the wallets (one band, width by their capacity) into the hub */
+  var walCap=wal.reduce(function(a,c){return a+c.capacity},0),walLocal=wal.reduce(function(a,c){return a+c.local_balance},0);
+  out+='<path d="M'+(leftX+leftW)+','+(ocY+28)+' C'+(hubX-40)+','+(ocY+28)+' '+(leftX+leftW+40)+','+(hubTop+22)+' '+hubX+','+(hubTop+22)+'" class="fe dash"/>';
+  var ww=Math.max(2.5,Math.min(20,walCap/maxCap*20));
+  out+=band(leftX+leftW,walY+28,hubX,hubTop+hubH-22,ww,walCap?walLocal/walCap:0.5,'wallets · '+M(walCap));
+  /* right: one band per peer channel */
+  peers.forEach(function(c,i){
+    var y=top+i*rowH+rowH/2,w=Math.max(2.5,c.capacity/maxCap*20),lbl=c.label||c.alias||c.remote_pubkey.slice(0,12)+'\u2026';
+    var hubY=hubTop+8+(i+0.5)*(hubH-16)/n;
+    out+=band(hubX+hubW,hubY,rightX,y,w,c.capacity?c.local_balance/c.capacity:0.5,'');
+    out+='<text x="'+(rightX+6)+'" y="'+(y+4)+'" class="fl'+(c.active?'':' off')+'">'+esc(lbl.slice(0,22))+(c.active?'':' \u00b7 offline')+'</text>';
+    out+='<text x="'+(W-12)+'" y="'+(y+4)+'" class="fn" text-anchor="end">'+esc(M(c.local_balance))+' / '+esc(M(c.remote_balance))+'</text>';
+  });
+  out+='<text x="'+(rightX+6)+'" y="'+(H-8)+'" class="fs">peer channels \u00b7 this side / their side \u00b7 width = capacity</text>';
+  return out+'</svg>';
+  function band(x1,y1,x2,y2,w,share,label){
+    var cx=(x2-x1)/2,d='M'+x1+','+y1+' C'+(x1+cx)+','+y1+' '+(x2-cx)+','+y2+' '+x2+','+y2;
+    share=Math.max(0,Math.min(1,share||0));
+    var html='<path d="'+d+'" pathLength="100" class="fe them" stroke-width="'+w.toFixed(1)+'"/>'
+      +'<path d="'+d+'" pathLength="100" class="fe us" stroke-width="'+w.toFixed(1)+'" stroke-dasharray="'+(share*100).toFixed(1)+' 100"/>';
+    if(label)html+='<text x="'+((x1+x2)/2)+'" y="'+((y1+y2)/2-w/2-4)+'" class="fs" text-anchor="middle">'+esc(label)+'</text>';
+    return html}
+}
 function kv(rows){return '<div class="kv">'+rows.map(function(r){return '<div>'+esc(r[0])+'</div><div>'+(r[2]?r[1]:esc(r[1]))+'</div>'}).join('')+'</div>'}
 function net(addr){if(!addr)return '<span class="pill dim">?</span>';return /\\.onion/i.test(addr)?'<span class="pill tor">Tor</span>':'<span class="pill clear">clearnet</span>'}
 var lastPane={},expanded={},sortState={};
@@ -154,8 +202,13 @@ function render(d){
     +kpi('On-chain',fmt(bx.onchain_total)+' sats',fmt(bx.anchor_reserve)+' anchor reserve',bx.onchain_total<2e6?'bad':bx.onchain_total<5e6?'warn':'')
     +kpi('Can send',fmt(bx.can_send)+' sats',fmt(bx.n_active)+' active channels')
     +kpi('Can receive',fmt(bx.can_receive)+' sats','inbound capacity',bx.can_receive<1e6?'warn':'')
+    +kpi('Wallets\u2019 sendable',fmt(pr.wallet_out)+' sats',fmt(pr.wallet_n)+' wallet channel'+(pr.wallet_n===1?'':'s')+' \u00b7 their side, gross of reserves')
+    +kpi('Wallets\u2019 receivable',fmt(pr.wallet_in)+' sats','this node\u2019s side of those channels \u00b7 gross of reserves')
     +kpi('Top inbound peer',ti?(ti.pct*100).toFixed(1)+'%':'\\u2014',ti?esc(ti.alias)+' \\u00b7 '+fmt(ti.sats)+' sats':'no peer channels',ti?(ti.pct>0.8?'bad':ti.pct>0.5?'warn':'good'):'')
     +'</div>';
+  /* 0.109.1 (DP 2026-10-19 23:15): the Liquidity · now graphic is OFF THE SCREEN — "looks poor and needs improvement" — the card
+     stays in the markup hidden and the drawing code stays; it comes back when the graphic is redone. */
+  if(window.LIJ_SHOW_FLOW){var fc=document.getElementById('flowcard');if(fc)fc.hidden=false;setPane('flow',flowSvg(d)||'<span class="dim">no channels yet \u2014 the graphic draws once this node has one</span>')}
   setPane('bal',boxesHtml+kv([['on-chain confirmed',fmt(b.onchain_confirmed)+' sats'+(b.reserved_anchor?' <span class="dim">('+fmt(b.reserved_anchor)+' reserved for anchors)</span>':''),1],['on-chain unconfirmed',fmt(b.onchain_unconfirmed)+' sats'],['channel local',fmt(b.local)+' sats'+(b.unsettled?' <span class="dim">('+fmt(b.unsettled)+' in flight)</span>':''),1],['channel remote',fmt(b.remote)+' sats'],['pending open local',fmt(b.pending_open_local)+' sats'],
     ['P1 outbound cover',cov(pr.p1_cover),1],
     ['P2 inbound cover',cov(pr.p2_cover),1],
@@ -292,6 +345,7 @@ function pageConsole() {
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>
 <section class="card"><h2>Node</h2><div id="node" class="dim">\u2026</div></section>
 <section class="card"><h2>Balances</h2><div id="bal" class="dim">\u2026</div></section>
+<section class="card wide" id="flowcard" hidden><h2>Liquidity \u00b7 now</h2><div id="flow" class="dim">\u2026</div></section>
 <section class="card"><h2>Channels</h2><div id="sumnote"></div><div id="chan" class="dim">\u2026</div></section>
 <section class="card"><h2>Wallets served</h2><div id="wal" class="dim">\u2026</div></section>
 <section class="card"><h2>Pending channels</h2><div id="pend" class="dim">\u2026</div></section>
