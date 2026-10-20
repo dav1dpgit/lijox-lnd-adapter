@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.107.0, 2026-10-15). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.108.1, 2026-10-19). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.107.0         # the newest tag — the last row of RELEASES.md
+       git checkout v0.108.1         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -209,6 +209,27 @@ silent-payment index), and only then puts `filter_url` and `filter_sp` into the 
 plain sentence in the journal — wallets are never pointed at a dead server. Unset = nothing offered; the record is
 v1 as before and wallets read the default server. `/health` carries `filter_server`; the console shows it.
 `node registry-filter.test.js` checks the record and the check.
+
+## The doors into the box — `routes` and `reach` (0.108+)
+
+A wallet reaches a provider through the three addresses in its registry record: the API (`endpoint`), the
+browser's Lightning peer link (`wss_url`) and the block-filter server (`filter_url`). What sits between the
+wallet and the box on those addresses is the operator's business, and the record now says it: `PUBLIC_REACH`
+is signed into the record as route 1's `reach` — `cloudflare` when a Cloudflare tunnel ends TLS at
+Cloudflare's edge (the default when unset; the honest word for every box set up with the tunnel), `direct`
+when TLS ends on the operator's own machine (a blind TCP relay such as `ops/relay`, or a port forward).
+Wallets show the word as a badge and may prefer or refuse a reach. A second door into the same box goes in as
+`ROUTE_2_REACH` / `ROUTE_2_HTTPS_URL` / `ROUTE_2_WSS_URL` / `ROUTE_2_FILTER_URL` (a third as `ROUTE_3_*`) —
+for example the direct names as route 1 and the Cloudflare names as route 2, so a wallet that loses one door
+takes the other. The record is signed as `lijox-register:v4` (registry 0.13.0+; an older registry gets the first
+door alone, as v3). Two checks keep the word honest without the operator's say: a door that claims `direct` but
+answers with Cloudflare's own header (`cf-ray`) is registered as `cloudflare` and the journal says so; an unset
+`PUBLIC_REACH` on a door that answers without that header gets a hint to set `direct`. A second door's filter
+server is offered only when it answers `/tip`, as route 1's is; a malformed second door is skipped with a line,
+never refused. `/health` carries `routes` and `routes_notes`; the console's Front doors rows show them.
+The doors are asked once this box itself is listening (0.108.1 — until then the boot asked before its own port
+was open, and every door read `HTTP 502` in the journal; the reach reading was right regardless).
+`node routes.test.js` checks the record against the registry's bytes and every case of the checks.
 
 ## Mix pools — LIJOX's Tatara (0.97+; public rooms 0.106+)
 

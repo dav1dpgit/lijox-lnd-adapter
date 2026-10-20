@@ -1,0 +1,64 @@
+# LIJOX adapter — docker compose (ops/docker, adapter 0.108.1). Run from THIS folder:
+#     docker compose up -d
+#
+# WHY THE HOST NETWORK (network_mode: host), not a bridge network with port mappings:
+#   1. The adapter dials LND at LND_ENDPOINT (https://localhost:8080) and LND_GRPC_ENDPOINT (localhost:10009), and
+#      pipes the wallets' websocket to LND's peer port (LND_PEER_HOST localhost:9735). On the host network those
+#      are the box's own ports, exactly as when the adapter runs under systemd — no address rewriting, and the
+#      gRPC TLS check (lnd-grpc.js createSsl with LND's own tls.cert) sees the name the certificate carries.
+#      On a bridge network "localhost" would be the container itself; the operator would have to set every LND_*
+#      line to the Docker gateway address AND add that address to LND's tlsextraip — a second thing to get wrong.
+#   2. The front door (cloudflared, or Caddy behind the ops/relay kit) reaches the adapter at 127.0.0.1:7000 and
+#      :7001 on the box, the same as the systemd install the runbooks describe.
+#   3. The operator console (7004) binds 127.0.0.1 and tailscale* interfaces ONLY (console.js). On the host network
+#      that is the box's loopback: reachable over ssh -L, never from the LAN or the internet. A bridge network with
+#      "7004:7004" would have put the console on every interface — the one thing the console must never be.
+#   What the host network costs: no port isolation between the container and the box. The adapter listens on
+#   0.0.0.0:7000 and :7001 (as it does under systemd); the box's firewall decides who reaches them from outside.
+#
+# THE .env FILE: the one in this folder is the adapter's config (copy env.example to .env, fill it, chmod 600).
+# It is bind-mounted to /data/.env, which is where the adapter reads it (WORKDIR /data; dotenv reads .env from the
+# working directory). Compose also reads the same file for the ${...} values below — that is compose's standard
+# behaviour for a .env beside docker-compose.yml. It is NOT passed as env_file on purpose: env_file would copy
+# ADAPTER_SECRET, the macaroon hex and the console TOTP secret into the container's environment, where
+# `docker inspect` shows them to anyone in the docker group. Mounted, they stay in the file (mode 600) and in the
+# adapter's own process.
+
+services:
+  lijox-adapter:
+    image: lijox-adapter:v0.108.1
+    build:
+      context: ../..
+      dockerfile: ops/docker/Dockerfile
+    container_name: lijox-adapter
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # inside the container the certificate is always at this path (the mount below puts it there); the adapter's
+      # dotenv never overrides a value that is already in the environment, so an LND_TLS_CERT_PATH line in .env
+      # (a host path) is ignored here
+      LND_TLS_CERT_PATH: /lnd/tls.cert
+      LIJ_DATA_DIR: /data
+      # the ports, read from .env so the Dockerfile's HEALTHCHECK asks the right one (7000 when the line is absent)
+      ADAPTER_PORT: "${ADAPTER_PORT:-7000}"
+      WS_PROXY_PORT: "${WS_PROXY_PORT:-7001}"
+    volumes:
+      # the state root: registries, kits, tapes, PL ledger, console notes — everything the adapter keeps
+      - "${LIJOX_DATA_HOST:?set LIJOX_DATA_HOST in .env — the host folder for the adapter's state}:/data"
+      # the adapter's config, read from /data/.env. A single-file mount follows the file's inode: edit it in place (nano)
+      # or append (>>) and `docker compose restart`; a tool that writes a new file under the old name (sed -i) needs
+      # `docker compose up -d --force-recreate` instead
+      - "./.env:/data/.env:ro"
+      # LND's TLS certificate, read-only. The HOST path differs per platform — see env.example.
+      - "${LND_TLS_CERT_HOST:?set LND_TLS_CERT_HOST in .env — the host path of LND's tls.cert}:/lnd/tls.cert:ro"
+    # Logs: docker's json-file driver, capped, so the box's disk is never filled by the adapter's journal.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "10"
+    # 0.57.0's systemd watchdog does not exist under Docker: there is no NOTIFY_SOCKET, so the adapter's petting is a
+    # no-op (lij-adapter.js: "No NOTIFY_SOCKET ⇒ no-op"). The HEALTHCHECK in the Dockerfile marks the container
+    # unhealthy when /health stops answering; Docker does not restart on unhealthy by itself — see README.md for
+    # the autoheal line if you want that.
+    stop_grace_period: 20s

@@ -368,6 +368,12 @@
  *   PUBLIC_HTTPS_URL=https://lsp.example.com   (REQUIRED: public HTTPS front of the adapter HTTP API)
  *   PUBLIC_WSS_URL=wss://ws.example.com         (REQUIRED: public WSS front of the browser peer proxy)
  *   LIJOX_FILTER_URL=https://filters.example.com (0.87.0, optional: this box's block-filter server, offered to wallets in the LIJOX record)
+ *   PUBLIC_REACH=cloudflare|direct|tor          (0.108.0, optional: what sits between the wallet and this box on the three
+ *                                                public addresses above — `cloudflare` when a Cloudflare tunnel ends TLS
+ *                                                (the default), `direct` when TLS ends on this machine (a blind relay such
+ *                                                as ops/relay, or a port forward); signed into the LIJOX record as route 1)
+ *   ROUTE_2_REACH / ROUTE_2_HTTPS_URL / ROUTE_2_WSS_URL / ROUTE_2_FILTER_URL (0.108.0, optional: a second door into the
+ *                                                same box — e.g. the Cloudflare names beside direct ones; ROUTE_3_* a third)
  *
  * v0.5 changes (from v0.4):
  *   - New cooperative chain-data bridge subsystem
@@ -887,6 +893,17 @@ const CONFIG = {
     // 0.87.0 (S52, DP): this box's block-filter server (ops/lij-tier2-filters.py), offered to wallets in the signed
     // LIJOX record when it answers. Unset = none offered; wallets read the default server.
     filter_url: String(process.env.LIJOX_FILTER_URL || '').trim().replace(/\/+$/, ''),
+    // 0.108.0 (S61, Step A — docs/design/routes/routes-r1.md): the operator's signed word for what sits between the wallet
+    // and this box on the addresses above (route 1 of the LIJOX record): '' = unset (registered as cloudflare, with a boot
+    // hint read from the front door itself), 'cloudflare', 'direct', 'tor'. Further doors as ROUTE_2_* / ROUTE_3_*.
+    reach: String(process.env.PUBLIC_REACH || '').trim().toLowerCase(),
+    routes_extra: [2, 3].map((i) => ({
+      n: i,
+      reach: String(process.env['ROUTE_' + i + '_REACH'] || '').trim().toLowerCase(),
+      https_url: String(process.env['ROUTE_' + i + '_HTTPS_URL'] || '').trim().replace(/\/+$/, ''),
+      wss_url: String(process.env['ROUTE_' + i + '_WSS_URL'] || '').trim().replace(/\/+$/, ''),
+      filter_url: String(process.env['ROUTE_' + i + '_FILTER_URL'] || '').trim().replace(/\/+$/, ''),
+    })).filter((r) => r.reach || r.https_url || r.wss_url || r.filter_url),
   },
   // v0.11: critical peers we must stay connected to for outbound routing.
   // Each entry is "pubkey@host:port". Adapter reconnects any that drop out
@@ -4710,6 +4727,9 @@ function httpsPost(endpoint, body) {
 // change there changes here in the same release, or registration 403s.
 // 0.87.0 (lij-worker 0.8.0): a record that offers a block-filter server is signed as
 // 'lijox-register:v2:' + the v1 fields + filter_url + filter_sp ('1'/'0'); one without is v1, byte for byte.
+// 0.108.0 (lij-worker 0.13.0, S61 — Step A): a record that carries a `routes` list is signed as 'lijox-register:v4:' +
+// the v1 fields + filter_url ('' when none) + filter_sp + every tatara field ('' / '0' when no block) + ONE field holding
+// every route as reach|endpoint|wss_url|filter_url, routes joined by ';' (percent-encoded with the field).
 function canonicalRegisterMsg(f) {
   const s = (v) => (v === null || v === undefined) ? '' : String(v);
   const n = (v) => String(Number(v) || 0);
@@ -4719,6 +4739,13 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.routes && f.routes.length) {
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = f.routes.map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    return 'lijox-register:v4:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf]).map(encodeURIComponent).join(':');
+  }
   if (f.tatara) {
     const t = f.tatara;
     const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
@@ -4774,7 +4801,7 @@ function httpsGetJson(endpoint) {
       const req = https.get(endpoint, { timeout: 10000, headers: { 'Accept': 'application/json' } }, (res) => {
         let data = '';
         res.on('data', (c) => { data += c; if (data.length > 65536) req.destroy(); });
-        res.on('end', () => { let j = null; try { j = JSON.parse(data); } catch (_) {} finish({ status: res.statusCode, json: j }); });
+        res.on('end', () => { let j = null; try { j = JSON.parse(data); } catch (_) {} finish({ status: res.statusCode, json: j, headers: res.headers || {} }); });   // 0.108.0: the headers ride along (the reach check reads cf-ray)
         res.on('error', (e) => finish({ status: 0, json: null, error: e.message }));
       });
       req.on('timeout', () => { req.destroy(new Error('no answer in 10 s')); });
@@ -4805,6 +4832,68 @@ async function checkFilterServer() {
   filterStatus.sp = info.status === 200 && !!info.json && info.json.format === 'spcommit-v1';
   filterStatus.note = 'answers at block ' + Number(tip.json.height) + (filterStatus.sp ? '; serves the silent-payment index' : '; no silent-payment index');
   return filterStatus;
+}
+
+// ── 0.108.0 (S61, Step A — docs/design/routes/routes-r1.md §2): the record's `routes` ──────────────────────────────────
+// Every door into this box, in the operator's order: route 1 = PUBLIC_HTTPS_URL / PUBLIC_WSS_URL / LIJOX_FILTER_URL with
+// PUBLIC_REACH; routes 2 and 3 from ROUTE_n_*. `reach` is the operator's signed statement — `direct` (TLS ends on this
+// machine; a relay in between sees ciphertext), `cloudflare` (Cloudflare's edge ends TLS), `tor` (a slot). Two checks keep
+// the record honest without the operator's word: a route that CLAIMS direct but answers with Cloudflare's own header
+// (cf-ray) is registered as cloudflare and the journal says so (a positive Cloudflare mark cannot be false; a failed probe
+// proves nothing and leaves the claim as stated); an UNSET PUBLIC_REACH is registered as cloudflare — the honest default
+// for every box set up with the tunnel — with a hint when the front door does not answer through Cloudflare. A secondary
+// route's filter server is offered only when it answers /tip, as route 1's is. A malformed secondary route is skipped
+// with a line, never refused: the box keeps registering its first door. The address rules are the registry's.
+const ROUTE_REACH = ['direct', 'cloudflare', 'tor'];
+const WSS_URL_RE = /^wss:\/\/[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/;
+function wssUrlOk(t) { return !!t && t.length <= 200 && !t.endsWith('/') && WSS_URL_RE.test(t); }
+const routesStatus = { routes: [], notes: [], checked_ms: 0 };   // the registration, /health and the console read it
+async function probeReach(httpsUrl) {
+  // answers { cf: true } when the door answers with Cloudflare's header, { cf: false } when it answers without it,
+  // { cf: null } when it does not answer (nothing proven)
+  const r = await httpsGetJson(httpsUrl + '/health');
+  if (!r || !r.status) return { cf: null, note: 'no answer (' + ((r && r.error) || 'unknown') + ')' };
+  const h = r.headers || {};
+  const cf = !!(h['cf-ray'] || h['CF-RAY']);
+  return { cf, note: 'HTTP ' + r.status + (cf ? ' through Cloudflare (cf-ray)' : ' without Cloudflare\'s header') };
+}
+async function buildRoutes() {
+  const notes = [];
+  const out = [];
+  // route 1
+  const r1 = { reach: CONFIG.public.reach || '', endpoint: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter_url: (filterStatus.ok ? CONFIG.public.filter_url : '') || null };
+  if (r1.reach && !ROUTE_REACH.includes(r1.reach)) { notes.push('PUBLIC_REACH=' + r1.reach + ' is not one of ' + ROUTE_REACH.join('|') + ' — registered as cloudflare'); r1.reach = 'cloudflare'; }
+  const p1 = await probeReach(r1.endpoint);
+  if (!r1.reach) {
+    r1.reach = 'cloudflare';
+    notes.push('PUBLIC_REACH is unset — route 1 registered as cloudflare' + (p1.cf === false ? '; the front door answers WITHOUT Cloudflare\'s header (' + p1.note + ') — set PUBLIC_REACH=direct if TLS ends on this machine' : p1.cf === true ? ' (the front door answers through Cloudflare)' : ' (the front door ' + p1.note + ')'));
+  } else if (r1.reach === 'direct' && p1.cf === true) {
+    notes.push('PUBLIC_REACH=direct but ' + r1.endpoint + ' answers through Cloudflare (' + p1.note + ') — registered as cloudflare, not as claimed');
+    r1.reach = 'cloudflare';
+  } else notes.push('route 1 ' + r1.reach + ': ' + r1.endpoint + ' — ' + p1.note);
+  out.push(r1);
+  // routes 2 and 3
+  for (const x of (CONFIG.public.routes_extra || [])) {
+    const r = { reach: x.reach, endpoint: x.https_url, wss_url: x.wss_url, filter_url: null };
+    if (!ROUTE_REACH.includes(r.reach)) { notes.push('ROUTE_' + x.n + '_REACH=' + (x.reach || '(unset)') + ' is not one of ' + ROUTE_REACH.join('|') + ' — route ' + x.n + ' skipped'); continue; }
+    if (!filterUrlOk(r.endpoint)) { notes.push('ROUTE_' + x.n + '_HTTPS_URL is not a plain https:// address — route ' + x.n + ' skipped'); continue; }
+    if (!wssUrlOk(r.wss_url)) { notes.push('ROUTE_' + x.n + '_WSS_URL is not a plain wss:// address — route ' + x.n + ' skipped'); continue; }
+    if (out.some((o) => o.endpoint === r.endpoint)) { notes.push('ROUTE_' + x.n + '_HTTPS_URL repeats another route\'s address — route ' + x.n + ' skipped'); continue; }
+    if (x.filter_url) {
+      if (!filterUrlOk(x.filter_url)) notes.push('ROUTE_' + x.n + '_FILTER_URL is not a plain https:// address — not offered on route ' + x.n);
+      else {
+        const tip = await httpsGetJson(x.filter_url + '/tip');
+        if (tip.status === 200 && tip.json && Number(tip.json.height) > 0) r.filter_url = x.filter_url;
+        else notes.push('route ' + x.n + '\'s filter server did not answer /tip (' + (tip.error || ('HTTP ' + tip.status)) + ') — not offered on route ' + x.n);
+      }
+    }
+    const p = await probeReach(r.endpoint);
+    if (r.reach === 'direct' && p.cf === true) { notes.push('ROUTE_' + x.n + '_REACH=direct but ' + r.endpoint + ' answers through Cloudflare (' + p.note + ') — registered as cloudflare, not as claimed'); r.reach = 'cloudflare'; }
+    else notes.push('route ' + x.n + ' ' + r.reach + ': ' + r.endpoint + ' — ' + p.note);
+    out.push(r);
+  }
+  routesStatus.routes = out; routesStatus.notes = notes; routesStatus.checked_ms = Date.now();
+  return out;
 }
 
 // 0.71.0: verbatim twin of the worker's canonicalUnregisterMsg (lij-worker/src/index.js).
@@ -4884,18 +4973,31 @@ async function registerWithRegistry() {
     // 0.97.0 (S58): the Tatara block when the module is on (lijox-register:v3); off = v1/v2 as before
     const tb = tatara.recordBlock();
     if (tb) { body.tatara = tb; console.log('[Registry] tatara block: sizes ' + tb.sizes.join(',') + ' · relay ' + tb.relay_url); }
-    const canonical = canonicalRegisterMsg(body);
-    const signed = await lndPost('/v1/signmessage', {
-      msg: Buffer.from(canonical, 'utf8').toString('base64'),
-    });
-    if (!signed || !signed.signature) {
-      // 0.59.0 (b, docketed S41): quote LND VERBATIM — the macaroon abort
-      // took an inference to diagnose; a constant-string log convicts
-      // nothing. Next time the journal names the cause itself.
-      throw new Error('LND signmessage returned no signature — registration aborted; LND said: ' + JSON.stringify(signed).slice(0, 300));
+    // 0.108.0 (S61, Step A): every door into this box, signed (lijox-register:v4); route 1 repeats the fields above
+    const routes = await buildRoutes();
+    for (const ln of routesStatus.notes) console.log('[Registry] ' + ln);
+    body.routes = routes;
+    const signAndPost = async () => {
+      const canonical = canonicalRegisterMsg(body);
+      const signed = await lndPost('/v1/signmessage', {
+        msg: Buffer.from(canonical, 'utf8').toString('base64'),
+      });
+      if (!signed || !signed.signature) {
+        // 0.59.0 (b, docketed S41): quote LND VERBATIM — the macaroon abort
+        // took an inference to diagnose; a constant-string log convicts
+        // nothing. Next time the journal names the cause itself.
+        throw new Error('LND signmessage returned no signature — registration aborted; LND said: ' + JSON.stringify(signed).slice(0, 300));
+      }
+      body.signature = signed.signature;
+      return httpsPost(`${CONFIG.registry}/lsps/register`, body);
+    };
+    let result = await signAndPost();
+    if (result && !result.ok && body.routes && /signature does not verify/i.test(String(result.error || ''))) {
+      // a registry older than lij-worker 0.13.0 does not know routes (its canonical is v3): register the first door alone
+      console.log('[Registry] this registry does not know routes (its answer: ' + result.error + ') — registering the first door alone (v3)');
+      delete body.routes; delete body.signature;
+      result = await signAndPost();
     }
-    body.signature = signed.signature;
-    const result = await httpsPost(`${CONFIG.registry}/lsps/register`, body);
     console.log('[Registry] Registered:', result);
     if (result && result.ok) { registryStatus.last_ok = Date.now(); registryStatus.last_error = ''; }
     else registryStatus.last_error = (result && (result.error || JSON.stringify(result))) || 'unknown';
@@ -5007,6 +5109,8 @@ function settingsReport() {
     row('Front doors', 'WS proxy port', 'WS_PROXY_PORT', CONFIG.adapter.ws_port, '', ''),
     row('Front doors', 'public HTTPS', 'PUBLIC_HTTPS_URL', CONFIG.public.https_url, '', ''),
     row('Front doors', 'public WSS', 'PUBLIC_WSS_URL', CONFIG.public.wss_url, '', ''),
+    row('Front doors', 'reach (route 1)', 'PUBLIC_REACH', CONFIG.public.reach || '(unset — registered as cloudflare)', 'cloudflare', (routesStatus.notes[0] || '')),   // 0.108.0
+    ...((CONFIG.public.routes_extra || []).map((x) => row('Front doors', 'route ' + x.n, 'ROUTE_' + x.n + '_*', (x.reach || '?') + ' · ' + (x.https_url || '?') + ' · ' + (x.wss_url || '?') + (x.filter_url ? ' · ' + x.filter_url : ''), '', (routesStatus.notes.find((n) => n.indexOf('route ' + x.n) >= 0 || n.indexOf('ROUTE_' + x.n) >= 0) || '')))),
     row('Front doors', 'allowed origins', 'WS_ALLOWED_ORIGINS', E.WS_ALLOWED_ORIGINS || '(default)', '', ''),
     row('Console', 'port', 'CONSOLE_PORT', E.CONSOLE_PORT || 7004, '', 'loopback + Tailscale only'),
     row('Console', 'session', 'CONSOLE_SESSION_HOURS', E.CONSOLE_SESSION_HOURS || 12, 'h', ''),
@@ -5233,7 +5337,7 @@ async function consoleSnapshot() {
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
-    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus) },   // 0.87.0: the filter server as last checked
+    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
     backups, loops, watchdog: !!process.env.NOTIFY_SOCKET, uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
   };
 }
@@ -7405,12 +7509,7 @@ async function main() {
     catch (e) { console.error('[Registry] Unregister failed:', e.message); process.exit(1); }
   }
 
-  // Register with LIJOX registry, then re-register on a cadence (0.71.0: the
-  // worker marks a record stale after 24h without one).
-  await registerWithRegistry();
-  if (CONFIG.registry && registryStatus.every_h > 0) {
-    registryTimer = setInterval(() => { registerWithRegistry().catch(() => {}); stampLoop('registry', registryStatus.every_h * 3600 * 1000); }, registryStatus.every_h * 3600 * 1000);
-  }
+  // (The registry registration moved below server.listen in 0.108.1 — the doors are probed once this box answers.)
 
   // 0.71.0: the operator console (loopback + Tailscale, TOTP). Disabled until
   // CONSOLE_TOTP_SECRET is set — see --totp-enroll.
@@ -7516,11 +7615,22 @@ async function main() {
     socket.destroy();
   });
   setInterval(() => { try { nwc.sweep(); } catch (e) { console.error(`[NWC] sweep failed: ${e.message}`); } }, 5 * 60 * 1000);
-  server.listen(CONFIG.adapter.port, () => {
+  await new Promise((resolve) => server.listen(CONFIG.adapter.port, () => {
     console.log(`[Startup] HTTP API listening on port ${CONFIG.adapter.port}`);
     console.log(`[Startup] Health: http://localhost:${CONFIG.adapter.port}/health`);
     console.log(`[Startup] Ready to open channels for LiJ wallets`);
-  });
+    resolve();
+  }));
+
+  // Register with the LIJOX registry, then re-register on a cadence (0.71.0: the
+  // worker marks a record stale after 24h without one). 0.108.1: AFTER the listener
+  // is up — buildRoutes asks this box's own doors at /health, and until 0.108.1 it
+  // asked before :ADAPTER_PORT answered, so every door said HTTP 502 at boot (the
+  // reach reading — cf-ray or not — was right regardless; the journal line was not).
+  await registerWithRegistry();
+  if (CONFIG.registry && registryStatus.every_h > 0) {
+    registryTimer = setInterval(() => { registerWithRegistry().catch(() => {}); stampLoop('registry', registryStatus.every_h * 3600 * 1000); }, registryStatus.every_h * 3600 * 1000);
+  }
 
   // v0.21: LEASE startup — dormant unless LEASE_ENABLE=true. State loads
   // either way so /lease/status can answer; the cycle timer runs only

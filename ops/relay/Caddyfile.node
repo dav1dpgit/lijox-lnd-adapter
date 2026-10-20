@@ -1,0 +1,58 @@
+# Caddyfile — the HOME NODE (template). TLS ends HERE, on the node, with certificates Caddy gets itself from
+# Let's Encrypt over the relay (the TLS-ALPN challenge on :443 — no port 80 needed). The rented server only passes
+# bytes. Replace the three names (<LSP_HOST>, <WS_HOST>, <FILTERS_HOST> — e.g. lsp.example.net); keep them in step with the
+# adapter's advertised URLs and the registry record.
+#
+# Install: https://caddyserver.com/docs/install (the Debian/Ubuntu apt repository). Put this file at /etc/caddy/Caddyfile
+# after a dated backup of the distribution's, then `caddy validate --config /etc/caddy/Caddyfile` and
+# `systemctl restart caddy`. Caddy keeps its certificates under /var/lib/caddy.
+{
+	# no port-80 listener at all (the relay forwards 443 and 9735 only; certificates come by the TLS-ALPN challenge)
+	auto_https disable_redirects
+	servers {
+		listener_wrappers {
+			# the relay speaks PROXY protocol v2 first, so each request carries the client's real address
+			proxy_protocol {
+				timeout 5s
+				allow 10.9.0.1/32
+			}
+			tls
+		}
+	}
+}
+
+# Only the tunnel address listens: nothing on the home network can reach these ports, and the ACME challenge
+# arrives the same way the wallets do.
+(front) {
+	bind 10.9.0.2
+	encode zstd gzip
+	header {
+		-Server
+	}
+}
+
+# the LSP API (the adapter)
+<LSP_HOST> {
+	import front
+	reverse_proxy 127.0.0.1:7000 {
+		# the adapter reads cf-connecting-ip when present; off Cloudflare a client could set it itself — strip it,
+		# and run the adapter with TRUST_FORWARDED_FOR=true so it takes the address Caddy writes (the last hop).
+		header_up -Cf-Connecting-Ip
+	}
+}
+
+# the wallet's websocket tunnel
+<WS_HOST> {
+	import front
+	reverse_proxy 127.0.0.1:7001 {
+		header_up -Cf-Connecting-Ip
+	}
+}
+
+# the block-filter / silent-payment index server
+<FILTERS_HOST> {
+	import front
+	reverse_proxy 127.0.0.1:7002 {
+		header_up -Cf-Connecting-Ip
+	}
+}
