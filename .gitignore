@@ -8,6 +8,14 @@
 *.key
 # Operator state — user-linked data stays on the operator's box
 push-subs.json
+floorgov.json
+lease-state.json
+lease-exclude.json
+console-notes.json
+wallet-contact.json
+pl-events.ndjson
+pl-daily.json
+kits/
 delegate-slips.json
 client-prefs.json
 attempt-journal.json

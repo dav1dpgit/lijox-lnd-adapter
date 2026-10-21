@@ -1,4 +1,4 @@
-// tatara-host.js — 0.107.0 (roomOf: the room's stranger count for a seat's check-in — the phone's "People in it") · 0.106.1 (the announcement names the network 'mainnet' — the public joinstr v2 code's wire name; 0.106.0 said 'bitcoin' and the public code refused the room as another network) · 0.106.0 (S59 Thu 2026-10-15, Phase 2b: THE PROVIDER AS HOST OF A PUBLIC ROOM; the design is
+// tatara-host.js — 0.110.0 (the wait after empty rooms clears when the queue has no seats left; roomOf answers the next room's earliest moment through a wait) · 0.107.0 (roomOf: the room's stranger count for a seat's check-in — the phone's "People in it") · 0.106.1 (the announcement names the network 'mainnet' — the public joinstr v2 code's wire name; 0.106.0 said 'bitcoin' and the public code refused the room as another network) · 0.106.0 (S59 Thu 2026-10-15, Phase 2b: THE PROVIDER AS HOST OF A PUBLIC ROOM; the design is
 // docs/design/mix/tatara-public-r1.md in the wallet repository, DP's decisions of 12:50–13:14; the 2b security pass's
 // findings folded in before the tag — review 2b, two independent reviewers).
 //
@@ -360,6 +360,14 @@ function createHost(deps) {
       for (const size of s.sizes || []) {
         const route = 'chain';   // the channel route has no public room: the public code knows no channel payout
         const key = qkey(route, size);
+        // 0.110.0 (DP 2026-10-20 14:06 "resetting the wait period … when a pool fully closes and subsequently reopens"): the
+        // doubling wait after empty rooms belongs to the seats that waited through them — once the queue has no seats left,
+        // it clears, and a fresh seat gets its first room within ROOM_GAP_S of joining. A pool that runs clears it as before.
+        const last0 = lastRoom.get(key);
+        if (last0 && last0.backoff_s && (typeof list.queueSize === 'function' ? list.queueSize(route, size) : list.headCount(route, size)) === 0) {
+          lastRoom.set(key, { closed_at: last0.closed_at, backoff_s: 0 });
+          log(`[Tatara] the ${size} queue is empty — the wait after its empty rooms clears (was ${last0.backoff_s} s)`);
+        }
         if (rooms.has(key) || rooms.size >= ROOMS_MAX) continue;
         const last = lastRoom.get(key);
         if (last && t - last.closed_at < Math.max(ROOM_GAP_S, last.backoff_s)) continue;
@@ -375,7 +383,13 @@ function createHost(deps) {
   /// N, the seconds until it closes. Nothing secret: the count the host already logs; no coin, no key.
   function roomOf(route, size) {
     const room = rooms.get(qkey(route, size));
-    if (!room || room.closed_at) return null;
+    if (!room || room.closed_at) {
+      // 0.110.0 (DP 14:06 — "1 is good but keep brevity in mind"): no room open — the next one's earliest moment, so the
+      // phone's line can say "next in N min" instead of nothing through the wait; null once the wait has passed
+      const last = lastRoom.get(qkey(route, size)); if (!last) return null;
+      const next = last.closed_at + Math.max(ROOM_GAP_S, last.backoff_s) - nowS();
+      return next > 0 ? { next_in_s: next } : null;
+    }
     const strangers = Array.from(room.regs.values()).filter((r) => r.checked && !r.seat).length;
     return { strangers, peers: room.peers, closes_in_s: Math.max(0, room.timeout - nowS()), phase: room.phase };
   }

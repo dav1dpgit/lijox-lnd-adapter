@@ -94,6 +94,7 @@ function createList(opts) {
   }
   function reserve(route, size, ids) { const k = qkey(route, size); if (ids && ids.length) reserved.set(k, ids.slice()); else reserved.delete(k); }
   const headCount = (route, size) => headGroup(route, size).length;
+  const queueSize = (route, size) => (st.queues[qkey(route, size)] || []).filter((id) => st.seats[id]).length;   // 0.110.0: every seat in the queue, paused or not — "no seats left" is this at zero
 
   // ── restore: anything in progress is over (§8.0, §8.8) ──
   try {
@@ -406,7 +407,7 @@ function createList(opts) {
   function seatOf(id) { return st.seats[id] || null; }
 
   return { seat, endWeek, checkin, leave, pause: (id) => pause(id, true), resume: (id) => pause(id, false), open, announce, report, tick, counts, attemptOf, seatOf, state: () => st,
-    eligibleFor, reserve, headCount, roomStart, roomOutcome, startOf: (id) => st.starts[id] || null };   // 0.106.0: the hosted room's hooks
+    eligibleFor, reserve, headCount, queueSize, roomStart, roomOutcome, startOf: (id) => st.starts[id] || null };   // 0.106.0: the hosted room's hooks · 0.110.0: queueSize
 }
 
 module.exports = { createList, ONLINE_S, MISSED_STARTS_MAX, SEAT_IDLE_MAX_S, CREATE_MAX_S, ATTEMPT_MAX_S };

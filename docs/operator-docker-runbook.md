@@ -178,24 +178,24 @@ git -C /opt/lijox fetch --tags
 ```
 
 ```
-git -C /opt/lijox checkout v0.109.1
+git -C /opt/lijox checkout v0.110.0
 ```
 
 ```
 sha256sum /opt/lijox/lij-adapter.js /opt/lijox/tatara.js /opt/lijox/tatara-list.js /opt/lijox/tatara-host.js /opt/lijox/tatara-nostr.js /opt/lijox/nip04.js /opt/lijox/config.env.example /opt/lijox/package.json
 ```
 
-Open `RELEASES.md`, find the row `0.109.1`, and compare every hash. A file the row calls "unchanged" keeps the hash of the last row that named it. One mismatch = stop and ask.
+Open `RELEASES.md`, find the row `0.110.0`, and compare every hash. A file the row calls "unchanged" keeps the hash of the last row that named it. One mismatch = stop and ask.
 
 ### 4b. Build the image
 
 **[NODE]** (a few minutes; it downloads the Node.js base image and the adapter's dependencies):
 
 ```
-docker build -f /opt/lijox/ops/docker/Dockerfile -t lijox-adapter:v0.109.1 /opt/lijox
+docker build -f /opt/lijox/ops/docker/Dockerfile -t lijox-adapter:v0.110.0 /opt/lijox
 ```
 
-The last line is `naming to docker.io/library/lijox-adapter:v0.109.1`. If `npm ci` fails inside the build, send back the last twenty lines; nothing is on your box yet.
+The last line is `naming to docker.io/library/lijox-adapter:v0.110.0`. If `npm ci` fails inside the build, send back the last twenty lines; nothing is on your box yet.
 
 ### 4c. The state folder
 
@@ -294,7 +294,7 @@ What a good first start prints, in order (Ctrl-C leaves the log; the adapter kee
 1. `[Doctor] LND REST reachable, macaroon accepted, node identity matches (03…).` — the baked key works and `NODE_PUBKEY` is right.
 2. `[Doctor] LND gRPC port reachable at localhost:10009.`
 3. `[Doctor] all checks passed.`
-4. The banner: `LIJOX Adapter v0.109.1`.
+4. The banner: `LIJOX Adapter v0.110.0`.
 5. `[Startup] LND connected: <alias> (N active channels, pubkey 03…)`
 6. `[Startup] HtlcInterceptor: subscribed` — the JIT path is live.
 7. `[Registry] no registry configured — running registry-free` (until §6c), or `[Registry] Registered: { ok: true … }`.
@@ -653,7 +653,7 @@ cp /opt/lijox/ops/docker/docker-compose.yml /opt/lijox/ops/docker/docker-compose
 ```
 
 ```
-sed -i "s|image: lijox-adapter:v0.109.1|image: lijox-adapter:v<NEW>|" /opt/lijox/ops/docker/docker-compose.yml
+sed -i "s|image: lijox-adapter:v0.110.0|image: lijox-adapter:v<NEW>|" /opt/lijox/ops/docker/docker-compose.yml
 ```
 
 ```

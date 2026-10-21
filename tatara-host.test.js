@@ -318,6 +318,32 @@ const announced = (relay) => relay.published.filter((e) => e.kind === 2022);
   relay.deliver(msgFrom(other, ann2.pubkey, registration(other, id2, 50000), nowS(clock))); await settle(); await tick();
   check(H.summary()[0].registered === 1, 'H10 a fresh coin registers');
 }
-console.log(fails ? `FAIL ×${fails}` : 'PASS · tatara-host (H1–H10)');
+// H11 (0.110.0, DP 2026-10-20 14:06) — the wait after empty rooms clears when the queue has no seats left; through a wait
+// roomOf answers the next room's earliest moment; a fresh seat gets its first room within ROOM_GAP_S
+{
+  const { L, H, relay, clock, tick, logs } = mk();
+  const s1 = seatOf(L, 1); await tick();
+  const first = announced(relay)[0]; let w = JSON.parse(first.content).timeout - nowS(clock);
+  clock.go(w - 180); await tick();   // empty → closed, the wait 60 s
+  clock.go(61); await tick();         // the second room
+  const second = announced(relay)[1]; w = JSON.parse(second.content).timeout - nowS(clock);
+  clock.go(w - 180); await tick();   // empty again → the wait 120 s
+  check(announced(relay).length === 2 && /next room for this size in 120 s/.test(logs.join('\n')), 'H11 two empty rooms: the wait is 120 s');
+  const g = H.roomOf('chain', 50000);
+  check(!!g && g.next_in_s === 120 && g.strangers === undefined && g.closes_in_s === undefined, 'H11 through the wait, roomOf answers the next room\'s earliest moment (120 s) and nothing of a room');
+  clock.go(30); check(H.roomOf('chain', 50000).next_in_s === 90, 'H11 the moment counts down (90 s)');
+  clock.go(31); await tick();
+  check(announced(relay).length === 2 && H.roomOf('chain', 50000).next_in_s === 59, 'H11 the seat still waits: no room at 61 s, the wait holds (59 s left)');
+  L.leave(s1); await tick();
+  check(/the 50000 queue is empty — the wait after its empty rooms clears \(was 120 s\)/.test(logs.join('\n')) && H.roomOf('chain', 50000) === null, 'H11 the seat leaves: the queue is empty — the wait clears, roomOf answers nothing');
+  const s2 = seatOf(L, 2); await tick();
+  check(announced(relay).length === 3 && announced(relay)[2].pubkey !== second.pubkey, 'H11 a fresh seat: its room opens at once (ROOM_GAP_S long passed) — not after the old wait');
+  const third = announced(relay)[2]; w = JSON.parse(third.content).timeout - nowS(clock);
+  clock.go(w - 180); await tick();
+  check(/next room for this size in 60 s at the earliest/.test(logs.join('\n').split('queue is empty')[1] || ''), 'H11 its empty close starts the doubling afresh (60 s), not from 240 s');
+  const r = L.checkin(s2);
+  check(r.ok && (H.roomOf('chain', 50000) || {}).next_in_s === 60, 'H11 the check-in\'s room field would carry next_in_s 60 through this wait');
+}
+console.log(fails ? `FAIL ×${fails}` : 'PASS · tatara-host (H1–H11)');
 process.exit(fails ? 1 : 0);
 })();

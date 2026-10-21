@@ -1,7 +1,7 @@
-# LIJOX adapter — the Docker image (ops/docker, adapter 0.109.1).
+# LIJOX adapter — the Docker image (ops/docker, adapter 0.110.0).
 #
 # Build from the repository root, never from this folder:
-#     docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.109.1 .
+#     docker build -f ops/docker/Dockerfile -t lijox-adapter:v0.110.0 .
 # (ops/docker/README.md has the full build / run / update steps.)
 #
 # What the image holds: Node.js 22 (the engine the adapter is developed on; README: "Node.js 20 or newer"),
