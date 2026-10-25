@@ -118,3 +118,55 @@ records) was served on the public API behind that token, i.e. to anyone.
 Wallets pane (loopback + Tailscale, TOTP). Docs corrected: there is no admin secret
 on the public API and nothing must ever be gated by the route token alone. The console
 remains the only management surface and never reaches the internet.
+
+## 2026-10-24 — the external review (Kimi K3 via OpenRouter; S63): four adapter findings fixed in 0.111.0
+
+**Seen:** the review package built from f9312fb (the public-API extracts of lij-adapter.js plus the modules); every
+finding checked against the whole tree before anything changed.
+
+- **Anyone could force-close every idle wallet channel.** `POST /lease/ttl` sat behind the published route token and
+  accepted 0.0001 days; `GET /lease/status` listed every channel point; the next hourly cycle closed. `/health/jit`
+  (the operator's float, every wallet's balances, live promises, held payments) and `/ops/loops` (backup staleness)
+  answered the same token. **Fix:** the four routes answer 410; the data and the setter are on the console (loopback +
+  Tailscale, TOTP): GET /console/lease, the lease setter on each channel row (floor one day, arm + confirm), the JIT · now
+  pane. The lease was put into dry run on both boxes the night the finding landed and comes off with this ride.
+- **Anyone shown a JIT invoice could make the payment fail.** `/lsps2/register_secret` let any caller overwrite a
+  promise's payment secret (the scid is in the invoice's route hints); the forward then carried the wrong secret, the
+  wallet refused it after the channel had opened, and the failure counted toward the guard. The hash-keyed store (plain
+  invoices) overwrote too and its 500-entry FIFO could be flushed with junk. **Fix:** the first registration wins (the
+  wallet registers before it shows the invoice; the same values again are fine; other values are refused 409); the hash
+  store is bounded by count (5000) and age (nothing younger than two hours is evicted; full = 503).
+- **A payment larger than its promise opened a channel that could never carry it.** The fixed-promise path had no
+  branch for an HTLC above size + fee: the channel was sized from the promise, LND refused the bigger forward after the
+  funding was published, the operator paid the open's chain fee, the payee paid nothing. The open-amount flush capped the
+  sizing and forwarded the full sum (the same outcome). **Fix:** an HTLC above the promise is failed back at the door
+  (TEMPORARY_CHANNEL_FAILURE), nothing opens; an open-amount set above the ceiling is refused whole, on the live path and
+  on the replay. A payer who overpays a fixed-amount JIT invoice is refused now — rare, and the right side to err on.
+- **One wallet could switch JIT off for everyone, for free, as often as it liked.** The guard counted funded-but-failed
+  opens; three from one wallet (a wrong secret for its own promise suffices) halted JIT on every rail until released.
+  **Fix (DP's ruling):** the halt counts DISTINCT WALLETS — his failsafe for a griefer with a million wallets stands, wallet
+  number three still halts JIT for everyone; a single wallet's repeat failures block THAT wallet alone at
+  JIT_GUARD_WALLET_AT (default 2; not 1 — S46's Register-QR incident was a wallet refusing payments because its block
+  height lagged), for 24 h after its last failure or until released from the Console's Guardrails, which lists the
+  blocked wallets. What remains, stated plainly: three throwaway wallets can still halt JIT at no cost — the price of
+  zero-conf JIT; the guard is the answer until a wallet pays something before an open.
+
+Still open from the same review, in order of weight: unsigned `/client/prefs` (any wallet's hold dial set to 0); the chit
+refund's double pay on a transport error; the held-HTLC pool with no ceiling; the route-lookup, Push claim and kit-store
+limits; `cf-connecting-ip` trusted from any socket (harmless behind the relay kit's Caddy, which strips it — other setups
+must).
+
+## 2026-10-24 — the external review, item 3: the Lightning address is signed (0.112.0)
+
+- **Anyone holding the published route token could take a wallet's Lightning address.** `POST /lnurl/register` and
+  `POST /lnurl/release` sat behind the route token (published to every wallet, i.e. anyone) and checked only that the
+  pubkey STRING in the body matched the record — and a wallet's node pubkey is in every invoice it hands out. A stranger
+  could release `alice@…` and register it again under his own key with his own hashes; every payer who kept the address
+  would then pay him. **Fix (DP: "3 is a go, no grace period"):** both calls carry the push-subscribe proof — a
+  single-use challenge from `GET /lsps/registry/challenge`, signed by the wallet's node key over the action and the
+  record asked for: `<name>:<count>:<sha256 of the hash fields>` to register (a probe signs over the empty list), the
+  name to release. The adapter rebuilds the record from the body it received, so a proof for one body is no proof for
+  another; the signer must be the record's key; the nonce is spent only after the signature held. Unsigned calls are
+  refused (401) from 0.112.0 — wallet engine v352 / page v1061 shipped first and sign both. `lnurlp-auth.test.js`
+  (a1–a2) pins the record rule with the engine's own vectors and the refusals.
+

@@ -1039,7 +1039,10 @@ const pendingHtlcsForOfflineWallets = new Map();
 // hex. JIT secrets live on the promise; plain invoices register here (engine
 // v168+) so held forwards can settle via trampoline with the sender offline.
 // Acceptance gates only, never claims -- the preimage stays recipient-only.
+// 0.111.0 (S63): first registration wins; bounded by count and by age (see /lsps2/register_secret).
 const invoiceSecretsByHash = new Map();
+const INVOICE_SECRETS_MAX = 5000;              // entries kept (was a 500 FIFO anyone could flush)
+const INVOICE_SECRETS_KEEP_MS = 2 * 3600 * 1000;   // an entry younger than this is never evicted to make room
 
 // B-16: payment_hash -> { promise, scidHex }. Set the moment ANY shard binds
 // a promise; real-channel HTLCs whose hash is promise-bound DIVERT into that
@@ -1440,6 +1443,46 @@ async function lnurlpNameAt(kind, name) {
     return 'unavailable';
   } catch (e) { return 'unavailable'; }
 }
+// 0.112.0 (S63, the external review's F7; DP "3 is a go, no grace period"): THE LIGHTNING ADDRESS IS SIGNED. /lnurl/register
+// and /lnurl/release answered the published route token (= anyone) and checked only that the pubkey STRING in the body
+// matched the record — and the pubkey is in every invoice. A stranger could release a wallet's name and take it under his
+// own key, and payers' sats with it. Both routes now carry the push-subscribe proof (engine v352 lnurlp_auth, page
+// v1061): a single-use challenge from GET /lsps/registry/challenge, signed by the node key over
+//   sha256("lij-registry-v1" || action || nonce || pubkey || record_id)
+// where record_id binds what is asked and is REBUILT HERE from the body received — a proof for one body is no proof for
+// another:
+//   lnurl-register: "<name>:<count>:<sha256 hex of the hash fields, ASCII-lowercased, sorted bytewise, joined>"
+//                   (a probe with no hashes: count 0, the sha256 of nothing)
+//   lnurl-release:  "<name>"
+// The twin of lij-core registry_client::lnurlp_register_record_id — the rule is pinned by lnurlp-auth.test.js with the
+// engine's own vectors. The signer must be the record's key (node_pubkey = client_pubkey). No grace period: an unsigned
+// call is 401.
+function lnurlpRegisterRecordId(name, hashes) {
+  const hs = [];
+  for (const e of (Array.isArray(hashes) ? hashes : [])) {
+    if (e && typeof e === 'object' && !Array.isArray(e) && typeof e.hash === 'string') hs.push(e.hash.replace(/[A-Z]/g, (c) => c.toLowerCase()));
+  }
+  hs.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+  const h = crypto.createHash('sha256');
+  for (const x of hs) h.update(x, 'utf8');
+  return String(name).replace(/[A-Z]/g, (c) => c.toLowerCase()) + ':' + hs.length + ':' + h.digest('hex');
+}
+// The check both routes make: fields present and well-formed, the signer is the record's key, the signature holds over
+// the rebuilt record, then (and only then) the nonce is spent. Returns { ok:true } or { ok:false, code, status }.
+function lnurlpAuthCheck(body, action, clientPk, recordId) {
+  const nodePk = String((body && body.node_pubkey) || '').toLowerCase();
+  const nonce = String((body && body.nonce) || '');
+  const signature = String((body && body.signature) || '');
+  if (!nodePk || !nonce || !signature) return { ok: false, code: 'signature required', status: 401 };
+  if (!/^[0-9a-f]{66}$/.test(nodePk) || !/^[0-9a-fA-F]{64}$/.test(nonce) || !/^[0-9a-fA-F]{128}$/.test(signature)) return { ok: false, code: 'bad signature fields', status: 400 };
+  if (nodePk !== String(clientPk).toLowerCase()) return { ok: false, code: 'signer is not the record\'s key', status: 403 };
+  const message = registryBuildSignedMessage(action, nonce, nodePk, recordId);
+  const sig = registryVerifySignature(message, signature, nodePk);
+  if (!sig.ok) return { ok: false, code: sig.code || 'bad_signature', status: 401 };
+  const nr = registryNonceStore.consume(nonce);   // spent only after the signature held — a bad guess does not burn a stranger's nonce
+  if (!nr.ok) return { ok: false, code: nr.code, status: 401 };
+  return { ok: true };
+}
 // 0.68.0: one boot sweep — claim every name this LSP already holds (idempotent).
 async function lnurlpNameSweep() {
   if (!CONFIG.registry || !CONFIG.lnurlp.address_host) return;
@@ -1761,9 +1804,13 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       return { kind: 'refuse', reason: 'amount under opening fee' };
     }
     const sizeSats = computeChannelSizeSats(String(amt));
-    if (jitGuard.halted()) {   // 0.104.0: JIT is off after three funded-but-failed opens in 24 h, until released
+    if (jitGuard.halted()) {   // 0.104.0: JIT is off after three wallets' funded-but-failed opens in 24 h, until released
       console.error(`[JIT-GUARD] JIT is OFF — no channel for ${client.slice(0,16)}… (${T}); release from the Console`);
       return { kind: 'refuse', reason: 'JIT opens are halted by the guard' };
+    }
+    if (jitGuard.walletBlocked(client)) {   // 0.111.0: this wallet's own failed opens — only this wallet is refused
+      console.error(`[JIT-GUARD] wallet ${client.slice(0,16)}… is BLOCKED from JIT opens (${T}) — its own failed opens; clears 24 h after the last, or from the Console`);
+      return { kind: 'refuse', reason: 'this wallet is blocked from JIT opens by the guard' };
     }
     if (!(await jitReserveOk(sizeSats, jitTag || T))) {
       return { kind: 'refuse', reason: 'LSP on-chain reserve floor' };
@@ -2263,7 +2310,11 @@ function jitGuardSetting(name, dflt) {
   return Number(raw);
 }
 const JIT_GUARD_ARM_AT = jitGuardSetting('JIT_GUARD_ARM_AT', 2), JIT_GUARD_HALT_AT = jitGuardSetting('JIT_GUARD_HALT_AT', 3);
-const jitGuard = createJitGuard({ dataDir: DATA_DIR, log: (m) => console.log(m), armAt: JIT_GUARD_ARM_AT, haltAt: JIT_GUARD_HALT_AT });
+// 0.111.0 (S63, the review's F2): the halt counts DISTINCT wallets (DP's failsafe for a griefer with a million wallets);
+// one wallet's own repeat failures block THAT wallet at JIT_GUARD_WALLET_AT (default 2; 0 = off), for 24 h or until the
+// operator releases it from the Console — so no single wallet can switch JIT off for everyone.
+const JIT_GUARD_WALLET_AT = jitGuardSetting('JIT_GUARD_WALLET_AT', 2);
+const jitGuard = createJitGuard({ dataDir: DATA_DIR, log: (m) => console.log(m), armAt: JIT_GUARD_ARM_AT, haltAt: JIT_GUARD_HALT_AT, walletAt: JIT_GUARD_WALLET_AT });
 if (jitGuard.halted()) console.warn(`[JIT-GUARD] JIT is OFF (halted ${new Date(jitGuard.counts().halted.at).toISOString()} after ${jitGuard.counts().halted.count} funded-but-failed opens) — every JIT open is refused until released from the Console`);
 /// A channel point as "txid:index" from LND's gRPC ChannelPoint (funding_txid_bytes is little-endian; the display form
 /// — ListChannels, the Console — is the reverse). Empty when the bytes are not there.
@@ -2687,6 +2738,15 @@ async function handleInterceptedHtlc(req) {
     const promiseSizeMsat = BigInt(promise.payment_size_msat);
     const promiseFeeMsat = BigInt(promise.fee_msat);
     const grossTotalMsat = promiseSizeMsat + promiseFeeMsat;
+    // 0.111.0 (S63, the review's F2 — OVERSHOOT): a fixed promise is bought for one size. An HTLC LARGER than size + fee
+    // can never be forwarded (the channel is sized from the promise; LND refuses the bigger forward after the funding
+    // is published) — so it is failed back here, at the door, before anything opens. A payee could do this to itself at
+    // no cost and burn the operator's chain fee per attempt, three of which halted JIT for everyone.
+    if (outAmtMsat > grossTotalMsat) {
+      console.error(`[LSPS2] OVERSHOOT: HTLC ${outAmtMsat} msat > the promise's ${grossTotalMsat} msat (size ${promiseSizeMsat} + fee ${promiseFeeMsat}) for scid=${outgoingScidHex} — failing back at the door, nothing opens`);
+      try { SM.emit('hold_refused', { hash: paymentHashHex, why: 'overshoot' }); } catch (_) {}
+      return FAIL_TEMP;
+    }
     if (outAmtMsat < grossTotalMsat) {
       // B-11: an under-total HTLC is an MPP SHARD, not an error. Register it
       // under the promise; the window bounds the wait; the SUM (vs the same
@@ -3256,11 +3316,23 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
     return;
   }
 
-  // Sizing input ONLY — openChannelAndForward's forward math reads the
-  // shard sum (B-15), never this field: observed gross, ceiling-capped.
+  // 0.111.0 (S63, the review's F2): a set whose sum is ABOVE the declared ceiling is refused whole — the channel can
+  // only be sized to the ceiling while the forward would carry the full sum, which LND then refuses after the funding
+  // is published (a funded-but-failed open, counted by the guard). It used to cap the sizing and forward the full sum.
   const ceiling = BigInt(c.variable_ceiling_msat);
-  const sizingMsat = sum > ceiling ? ceiling : sum;
-  promise.payment_size_msat = sizingMsat.toString();
+  if (sum > ceiling) {
+    console.warn(`[LSPS2] v0.20 flush: gross ${sum} msat > the open-amount ceiling ${ceiling} — FAILing all ${promise._shards.size} part(s), nothing opens`);
+    for (const [, sh] of promise._shards) {
+      writeOne({ incoming_circuit_key: sh.incoming_circuit_key, action: 'FAIL', failure_code: 15 });
+    }
+    try { SM.emit('var_flush_failed', { hash: paymentHashHex, why: 'above ceiling' }); } catch (_) {}
+    if (promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
+    promise._shards = null; promise._shard_sum_msat = 0n; promise._var_flushing = false;
+    return;
+  }
+  // Sizing input ONLY — openChannelAndForward's forward math reads the
+  // shard sum (B-15), never this field: observed gross (never above the ceiling now).
+  promise.payment_size_msat = sum.toString();
   promise.fee_msat = fee.toString();
   // promise.total_amt_msat: the v188 sentinel (0) stays falsy -> the
   // mpp_record fallback declares exactly sum - fee. Do not touch it.
@@ -3394,6 +3466,11 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   if (jitGuard.halted()) {
     trampolineForwardsFailed += 1;
     console.error(`[JIT-GUARD] JIT is OFF — the open for ${promise.client_pubkey.slice(0,16)}… is refused (release from the Console)`);
+    return FAIL_TEMP;
+  }
+  if (jitGuard.walletBlocked(promise.client_pubkey)) {   // 0.111.0: this wallet's own failed opens block it alone
+    trampolineForwardsFailed += 1;
+    console.error(`[JIT-GUARD] wallet ${promise.client_pubkey.slice(0,16)}… is BLOCKED from JIT opens — the open is refused (its own failed opens; clears 24 h after the last, or from the Console)`);
     return FAIL_TEMP;
   }
   let _guardCp = '';   // 0.104.0: the channel point the guard remembers, once the funding is published
@@ -3934,7 +4011,21 @@ async function processPendingHtlcsForPubkey(pubkeyHex) {
         continue;
       }
       const _vceil = BigInt(CONFIG.lsps2.variable_ceiling_msat);
-      promise.payment_size_msat = (_vsum > _vceil ? _vceil : _vsum).toString();
+      if (_vsum > _vceil) {   // 0.111.0 (S63, F2): above the ceiling = refused whole, as on the live path (it used to cap the sizing and forward the full sum)
+        console.warn(`[LSPS2] replay: rebuilt gross ${_vsum} msat > the open-amount ceiling ${_vceil} — FAILing ${_jitEntries.length} held part(s), nothing opens`);
+        if (htlcInterceptor && htlcInterceptor.getCounters()._lastWrite) {
+          for (const _fe of _jitEntries) {
+            htlcInterceptor.getCounters()._lastWrite({ incoming_circuit_key: _fe.incoming_circuit_key, action: 'FAIL', failure_code: 15 });
+          }
+        }
+        pendingHtlcsForOfflineWallets.delete(paymentHashHex);
+        cancelHtlcWatchdog(paymentHashHex);
+        inFlightOpens.delete(held.promise_ref);
+        resolvedHtlcHashes.add(paymentHashHex);
+        offlineHtlcsFailed += _jitEntries.length;
+        continue;
+      }
+      promise.payment_size_msat = _vsum.toString();
       promise.fee_msat = _vfee.toString();
     }
     const _last = _jitEntries[_jitEntries.length - 1];
@@ -5218,6 +5309,7 @@ async function consoleSnapshot() {
       capacity: Number(c.capacity), local_balance: Number(c.local_balance), remote_balance: Number(c.remote_balance),
       active: !!c.active, private: !!c.private, pending_htlcs: (c.pending_htlcs || []).length,
       wallet: leaseIsWalletPeer(c.remote_pubkey), lease: leaseTxt, excluded: leaseIsExcluded(c.channel_point), channel_point: c.channel_point,
+      lease_ttl_days: lease ? leaseTtlDays(lease) : CONFIG.lease.days, lease_override_days: (lease && typeof lease.ttl_days === 'number' && lease.ttl_days > 0) ? lease.ttl_days : null,   // 0.111.0
       last_seen_ms: lease ? (lease.last_seen_ms || 0) : 0, last_source: lease ? (lease.last_source || '') : '',
       opened_ms: txTime[String(c.channel_point || '').split(':')[0]] || 0,
       opened_block: (() => { try { const h = Number(BigInt(c.chan_id || '0') >> 40n); return (h > 0 && h < 8000000) ? h : 0; } catch (_) { return 0; } })(),
@@ -5341,7 +5433,9 @@ async function consoleSnapshot() {
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
-    backups, loops, watchdog: !!process.env.NOTIFY_SOCKET, uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
+    backups, loops, watchdog: !!process.env.NOTIFY_SOCKET,
+    jit_now: jitNowMemory(),   // 0.111.0: the live promises, aggregating sets and held payments (was the public /health/jit)
+    lease: (() => { const r = leaseStatusReport(); delete r.channels; return r; })(),   // 0.111.0: the lease's figures (was the public /lease/status; the per-channel rows ride the channels) uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
   };
 }
 
@@ -5939,6 +6033,70 @@ async function ratesHandler(res) {
 }
 // ═════════════════════════════════════════════════════════════════════
 
+// 0.111.0 (S63): the operator views that left the public API — pure reads of this process's state, for the console.
+/// The lease, per channel: idle time, the effective ttl, any override, days remaining (zero LND I/O — at most one cycle old).
+function leaseStatusReport() {
+  const nowMs = Date.now();
+  const channels = Object.entries(leaseState.channels).map(([cp, rec]) => {
+    const ttl = leaseTtlDays(rec);
+    const idleDays = (nowMs - rec.last_seen_ms) / 86400000;
+    return {
+      chan_point: cp,
+      peer: (rec.peer || '').slice(0, 16),
+      last_seen: new Date(rec.last_seen_ms).toISOString(),
+      idle_days: Number(idleDays.toFixed(3)),
+      ttl_days_effective: ttl,
+      ttl_override: (typeof rec.ttl_days === 'number' && rec.ttl_days > 0) ? rec.ttl_days : null,
+      days_remaining: Number((ttl - idleDays).toFixed(3)),
+      excluded: leaseIsExcluded(cp),
+    };
+  });
+  return {
+    ok: true,
+    enabled: CONFIG.lease.enabled,
+    dry_run: CONFIG.lease.dry_run,
+    wallet_peers_known: leaseWalletPeers.size,
+    exclusion_list: { saved_at: leaseExclude.saved_at || 0, excluded: Object.entries(leaseExclude.chan_points).filter(([, v]) => v && v.excluded).map(([cp]) => cp) },
+    default_ttl_days: CONFIG.lease.days,
+    cycle_minutes: CONFIG.lease.cycle_minutes,
+    cycles: leaseCycles,
+    last_cycle_at: leaseLastCycleAt ? new Date(leaseLastCycleAt).toISOString() : null,
+    channels,
+  };
+}
+/// The operator's hand on one channel's lease length (the console; arm + confirm there). `raw` null/0 clears the
+/// override back to the default. The floor is ONE DAY: the old public route took 0.0001 days, which the next cycle closed.
+function leaseSetTtl(chanPoint, raw, by) {
+  const cp = String(chanPoint || '');
+  if (!/^[0-9a-f]{64}:[0-9]+$/.test(cp)) return { ok: false, error: 'chan_point must be <txid>:<index>' };
+  const clearing = raw === null || raw === 0 || raw === undefined || raw === '';
+  const ttl = Number(raw);
+  if (!clearing && (!Number.isFinite(ttl) || ttl < 1 || ttl > 3650)) return { ok: false, error: 'ttl_days must be a number from 1 to 3650, or empty to clear the override' };
+  let rec = leaseState.channels[cp];
+  if (!rec) rec = leaseState.channels[cp] = { last_seen_ms: Date.now(), ttl_days: null, peer: '' };
+  rec.ttl_days = clearing ? null : ttl;
+  leaseSaveState();
+  leaseLog({ event: 'ttl_set', chan_point: cp, ttl_days: rec.ttl_days, by: String(by || 'console').slice(0, 60) });
+  return { ok: true, chan_point: cp, ttl_days: rec.ttl_days, default_ttl_days: CONFIG.lease.days };
+}
+/// JIT, now: the live promises, the aggregating sets, the held payments — this process's memory, no LND call.
+function jitNowMemory() {
+  const nowMs = Date.now();
+  const promises = [], aggregating = [], held = [];
+  for (const [scidHex, pr] of pendingJitBuys) {
+    promises.push({ scid: scidHex.slice(0, 12), client: (pr.client_pubkey || '').slice(0, 16), size_msat: String(pr.payment_size_msat || 0), fee_msat: String(pr.fee_msat || 0),
+      mode: pr.mode || 'fixed', secret: !!pr.payment_secret, expires_in_s: Math.round(((pr.reservation_expires_at || 0) - nowMs) / 1000) });
+    if (pr._shards && pr._shards.size) {
+      aggregating.push({ scid: scidHex.slice(0, 12), shards: pr._shards.size, sum_msat: String(pr._shard_sum_msat), window_remaining_s: Math.max(0, Math.round(((pr._agg_deadline || 0) - nowMs) / 1000)) });
+    }
+  }
+  for (const [ph, h] of pendingHtlcsForOfflineWallets) {
+    held.push({ payment_hash: ph.slice(0, 16), kind: h.kind || 'jit', client: (h.client_pubkey || '').slice(0, 16), amount_msat: String(h.incoming_amount_msat || h.outgoing_amount_msat || 0),
+      age_s: Math.round((nowMs - (h.htlc_received_at || nowMs)) / 1000), auto_fail_height: h.auto_fail_height || null });
+  }
+  return { promises, aggregating, held };
+}
+
 const server = http.createServer(async (req, res) => {
   const parsed = new url.URL(req.url, `http://localhost:${CONFIG.adapter.port}`);
   const path   = parsed.pathname;
@@ -6337,6 +6495,12 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
     }
     const name = body.name.toLowerCase();
+    // 0.112.0 (S63, F7): the node key's proof over THIS body — the name, the count and the hashes — or nothing happens
+    const auth = lnurlpAuthCheck(body, 'lnurl-register', body.client_pubkey, lnurlpRegisterRecordId(name, body.hashes));
+    if (!auth.ok) {
+      console.warn(`[LNURLP] register ${name} by ${String(body.client_pubkey).slice(0, 16)}… refused: ${auth.code}`);
+      return jsonResponse(res, { ok: false, error: 'auth: ' + auth.code }, auth.status);
+    }
     const existing = lnurlpRegistry[name];
     if (existing && existing.client_pubkey.toLowerCase() !== body.client_pubkey.toLowerCase()) {
       return jsonResponse(res, { ok: false, error: 'name taken' }, 409);
@@ -6376,6 +6540,7 @@ const server = http.createServer(async (req, res) => {
   }
   // ── 0.57.0 (g): LNURLp name RELEASE — same auth wall as register; the
   // pubkey must match the record (a wrong name can't free someone else's).
+  // 0.112.0 (S63, F7): and the record's key must PROVE itself — the node key's signature over the name (lnurlpAuthCheck).
   // Refused while any entry is reserved/accepted: a held payment's story
   // must finish (settle or burn) before the name dies.
   if (method === 'POST' && path === '/lnurl/release') {
@@ -6392,6 +6557,12 @@ const server = http.createServer(async (req, res) => {
     const relPk = String((rel && rel.client_pubkey) || '').toLowerCase();
     if (!/^[a-z0-9_-]{2,32}$/.test(relName) || !/^[0-9a-f]{66}$/.test(relPk)) {
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
+    }
+    // 0.112.0 (S63, F7): the node key's proof over the name — before the record is even looked at
+    const relAuth = lnurlpAuthCheck(rel, 'lnurl-release', relPk, relName);
+    if (!relAuth.ok) {
+      console.warn(`[LNURLP] release ${relName} by ${relPk.slice(0, 16)}… refused: ${relAuth.code}`);
+      return jsonResponse(res, { ok: false, error: 'auth: ' + relAuth.code }, relAuth.status);
     }
     const relRec = lnurlpRegistry[relName];
     if (!relRec) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
@@ -6744,10 +6915,31 @@ const server = http.createServer(async (req, res) => {
       if (!/^[0-9a-f]{64}$/.test(ph))  return errResponse(res, 'payment_hash must be 64 lowercase hex chars');
       if (!/^[0-9a-f]{64}$/.test(sec)) return errResponse(res, 'payment_secret must be 64 lowercase hex chars (32 bytes)');
       if (!Number.isInteger(tm) || tm <= 0) return errResponse(res, 'total_msat must be a positive integer');
-      invoiceSecretsByHash.set(ph, { payment_secret: sec, total_msat: String(tm), at: Date.now() });
-      while (invoiceSecretsByHash.size > 500) {
-        invoiceSecretsByHash.delete(invoiceSecretsByHash.keys().next().value);
+      // 0.111.0 (S63, the review's F3): THE FIRST REGISTRATION WINS. The wallet registers before it shows the invoice,
+      // so a later write for the same hash with a DIFFERENT secret can only be someone else's — it is refused, never
+      // stored over the wallet's. The same values again (a retry) are fine. The store is bounded by count AND age:
+      // nothing younger than two hours is evicted to make room, so a flood of junk hashes cannot flush a live
+      // invoice's secret; when every entry is young the store is full and says so.
+      const prior = invoiceSecretsByHash.get(ph);
+      if (prior) {
+        if (prior.payment_secret === sec && prior.total_msat === String(tm)) return jsonResponse(res, { ok: true, keyed: 'payment_hash', already: true });
+        console.warn(`[B-10] invoice secret for hash=${ph.slice(0,16)}... is ALREADY registered with other values — refused (first registration wins)`);
+        return errResponse(res, 'a payment_secret is already registered for this payment_hash', 409);
       }
+      if (invoiceSecretsByHash.size >= INVOICE_SECRETS_MAX) {
+        const youngest = Date.now() - INVOICE_SECRETS_KEEP_MS;
+        let evicted = 0;
+        for (const [k, v] of invoiceSecretsByHash) {
+          if (invoiceSecretsByHash.size < INVOICE_SECRETS_MAX) break;
+          if (v.at < youngest) { invoiceSecretsByHash.delete(k); evicted++; }
+        }
+        if (invoiceSecretsByHash.size >= INVOICE_SECRETS_MAX) {
+          console.warn(`[B-10] invoice secret store FULL (${invoiceSecretsByHash.size} entries, all younger than ${INVOICE_SECRETS_KEEP_MS / 3600000} h) — registration refused`);
+          return errResponse(res, 'secret store full — try again later', 503);
+        }
+        if (evicted) console.log(`[B-10] invoice secret store: ${evicted} entries older than ${INVOICE_SECRETS_KEEP_MS / 3600000} h evicted`);
+      }
+      invoiceSecretsByHash.set(ph, { payment_secret: sec, total_msat: String(tm), at: Date.now() });
       console.log(`[B-10] invoice secret registered for hash=${ph.slice(0,16)}...`);
       try { SM.emit('secret_registered', { hash: ph }); } catch (_) {}
       return jsonResponse(res, { ok: true, keyed: 'payment_hash' });
@@ -6775,6 +6967,17 @@ const server = http.createServer(async (req, res) => {
     const promise = pendingJitBuys.get(scid);
     if (!promise) {
       return errResponse(res, `No pending JIT promise for scid ${scid} (expired, or buy not called)`, 404);
+    }
+    // 0.111.0 (S63, the review's F3): THE FIRST REGISTRATION WINS. The promise's scid is printed in the invoice's route
+    // hints, so anyone shown the invoice could post here; the wallet always registers BEFORE it shows the invoice, so a
+    // later write with other values is never the wallet's — refused, the stored secret untouched. A retry with the same
+    // values is fine. (Before: any caller overwrote the secret, the forward then carried the wrong one, the wallet
+    // refused it after the channel had opened, and the failure counted toward the guard.)
+    if (promise.payment_secret) {
+      const sameSecret = Buffer.isBuffer(promise.payment_secret) && promise.payment_secret.equals(Buffer.from(secretHex, 'hex'));
+      if (sameSecret && Number(promise.total_amt_msat) === totalMsat) return jsonResponse(res, { ok: true, scid, already: true });
+      console.warn(`[LSPS2] register_secret: scid=${scid} ALREADY has a payment_secret — a second registration with other values refused (first registration wins)`);
+      return errResponse(res, 'a payment_secret is already registered for this promise', 409);
     }
     promise.payment_secret = Buffer.from(secretHex, 'hex');
     promise.total_amt_msat = totalMsat;
@@ -7159,183 +7362,17 @@ const server = http.createServer(async (req, res) => {
   // channel values, counterparties) plus channel_keys_id_hex which is
   // meaningless without the wallet's seed — so no incremental sensitive-data
   // exposure vs the operator's existing visibility.
-  // ── B-5: JIT flight-panel (read-only) ────────────────────────────────────
-  if (path === '/health/jit' && method === 'GET') {
-    if (isAdminRateLimited(ip)) {
-      return errResponse(res, 'Rate limit exceeded', 429);
-    }
-    // v0.53 (P7): /health/jit is an OPS view (reserve figures, per-wallet
-    // hold counts, world-conduit state). Public only when the operator
-    // opts into detail; otherwise it requires the admin secret.
-    if ((process.env.HEALTH_DETAIL || 'off') !== 'on' && !authOk(req)) {
-      return errResponse(res, 'Unauthorized (set HEALTH_DETAIL=on to make this public, or send the admin secret)', 401);
-    }
-    try {
-      const [chans, pend, info, bal] = await Promise.all([
-        lndGet('/v1/channels').catch(() => ({ channels: [] })),
-        lndGet('/v1/channels/pending').catch(() => ({})),
-        lndGet('/v1/getinfo').catch(() => ({})),
-        lndGet('/v1/balance/blockchain').catch(() => ({})),
-      ]);
-      // v0.47: the "world conduit" is the first critical peer (operator-set); no baked pubkey.
-      const WORLD_PEER_PUBKEY = (CONFIG.critical_peers[0] || {}).pubkey || '';
-      const world = WORLD_PEER_PUBKEY ? (chans.channels || []).find(c => c.remote_pubkey === WORLD_PEER_PUBKEY) : undefined;
-      const pendingOpens = ((pend.pending_open_channels) || []).map(p => ({
-        peer: (p.channel && p.channel.remote_node_pub || '').slice(0, 16),
-        capacity: p.channel && p.channel.capacity,
-        confirmation_height: p.confirmation_height,
-      }));
-      const pendingByPeer = {};
-      for (const p of pendingOpens) pendingByPeer[p.peer] = (pendingByPeer[p.peer] || 0) + 1;
-      const nowMs = Date.now();
-      const promises = [];
-      for (const [scidHex, pr] of pendingJitBuys) {
-        promises.push({ scid: scidHex.slice(0, 12), client: (pr.client_pubkey || '').slice(0, 16), expires_in_s: Math.round(((pr.reservation_expires_at || 0) - nowMs) / 1000) });
-      }
-      const holds = [];
-      for (const [ph, h] of pendingHtlcsForOfflineWallets) {
-        holds.push({ payment_hash: ph.slice(0, 16), kind: h.kind || 'jit', client: (h.client_pubkey || '').slice(0, 16), age_s: Math.round((nowMs - (h.htlc_received_at || nowMs)) / 1000) });
-      }
-      return jsonResponse(res, {
-        ok: true,
-        tip: info.block_height || 0,
-        onchain_float_sat: bal.confirmed_balance || bal.total_balance || '0',
-        world_channel: world ? {
-          active: !!world.active,
-          lsp_can_send_out: Number(world.local_balance || 0) - Number(world.local_chan_reserve_sat || 0),
-          lsp_can_receive_in: Number(world.remote_balance || 0) - Number(world.remote_chan_reserve_sat || 0),
-          capacity: world.capacity,
-        } : null,
-        client_channels: (chans.channels || []).filter(c => c.remote_pubkey !== UMBREL).map(c => ({
-          peer: c.remote_pubkey.slice(0, 16),
-          active: !!c.active,
-          lsp_spendable: Number(c.local_balance || 0) - Number(c.local_chan_reserve_sat || 0),
-          client_spendable: Number(c.remote_balance || 0) - Number(c.remote_chan_reserve_sat || 0),
-        })),
-        pending_opens: pendingOpens,
-        pending_opens_by_peer: pendingByPeer,
-        live_promises: promises,
-        aggregating: (() => {
-          const out = [];
-          for (const [scidHex, pr] of pendingJitBuys) {
-            if (pr._shards && pr._shards.size) {
-              out.push({
-                scid: scidHex.slice(0, 12),
-                shards: pr._shards.size,
-                sum_msat: String(pr._shard_sum_msat),
-                window_remaining_s: Math.max(0, Math.round(((pr._agg_deadline || 0) - Date.now()) / 1000)),
-              });
-            }
-          }
-          return out;
-        })(),
-        held_htlcs: holds,
-      });
-    } catch (e) {
-      return errResponse(res, `health/jit failed: ${e.message}`, 500);
-    }
-  }
-  // v0.21: LEASE admin surfaces. GET /lease/status = the observation
-  // panel (per-channel countdowns; zero LND I/O — state is at most one
-  // cycle old). POST /lease/ttl = the per-channel override setter and
-  // THE endpoint the future paid-extension flow calls after payment.
-  // ── 0.57.0 (b): gated loop aggregate. Sits below the catch-all authOk
-  // wall like /lease/status — NEVER on /health (public surface stays
-  // minimal). stale = no cycle within max(5×period, 120s).
-  if (path === '/ops/loops' && method === 'GET') {
-    const now = Date.now();
-    const loops = {};
-    for (const [k, v] of Object.entries(loopStamps)) {
-      loops[k] = {
-        count: v.count,
-        period_ms: v.period_ms,
-        last_ms_ago: v.last ? (now - v.last) : null,
-        stale: v.last ? (now - v.last) > Math.max(5 * v.period_ms, 120000) : true,
-      };
-    }
-    // ── 0.59.0 (a, DP RULED S41): SCB BACKUP DASHBOARD — a save failure on
-    // either leg (LAN Pi / cloud worker) must DISPLAY here, the surface the
-    // operator already checks. The push scripts (ops/um890-scb/ in the lij
-    // repo) stamp status-{local,cloud}.json on EVERY outcome; this block
-    // reads them, computes staleness against the daily belt (26h), and
-    // raises backup_alert when any configured leg failed its last attempt
-    // or went stale. Absent file = leg not configured — reported, never
-    // alarmed (an LSP without the backup kit stays quiet).
-    const SCB_STATE_DIR = process.env.LIJ_SCB_STATE_DIR || '/var/lib/lij-scb';
-    const backup = {};
-    let backupAlert = false;
-    for (const leg of ['local', 'cloud']) {
-      try {
-        const st = JSON.parse(require('fs').readFileSync(`${SCB_STATE_DIR}/status-${leg}.json`, 'utf8'));
-        const lastOkAgoS = st.last_ok ? Math.round(now / 1000 - st.last_ok) : null;
-        const stale = lastOkAgoS === null || lastOkAgoS > 26 * 3600;
-        const legAlert = st.ok === false || stale;
-        backup[leg] = {
-          configured: true,
-          ok: st.ok !== false,
-          err: st.err || '',
-          last_ok_ago_s: lastOkAgoS,
-          last_attempt_ago_s: st.last_attempt ? Math.round(now / 1000 - st.last_attempt) : null,
-          stale,
-          alert: legAlert,
-        };
-        if (legAlert) backupAlert = true;
-      } catch (e) {
-        backup[leg] = { configured: false };
-      }
-    }
-    return jsonResponse(res, { ok: true, pid: process.pid, uptime_s: Math.round(process.uptime()), backup_alert: backupAlert, backup, loops });
-  }
-
-  if (path === '/lease/status' && method === 'GET') {
-    if (isAdminRateLimited(ip)) return errResponse(res, 'Rate limit exceeded', 429);
-    const nowMs = Date.now();
-    const channels = Object.entries(leaseState.channels).map(([cp, rec]) => {
-      const ttl = leaseTtlDays(rec);
-      const idleDays = (nowMs - rec.last_seen_ms) / 86400000;
-      return {
-        chan_point: cp,
-        peer: (rec.peer || '').slice(0, 16),
-        last_seen: new Date(rec.last_seen_ms).toISOString(),
-        idle_days: Number(idleDays.toFixed(3)),
-        ttl_days_effective: ttl,
-        ttl_override: (typeof rec.ttl_days === 'number' && rec.ttl_days > 0) ? rec.ttl_days : null,
-        days_remaining: Number((ttl - idleDays).toFixed(3)),
-        excluded: CONFIG.lease.exclude.includes(cp),
-      };
-    });
-    return jsonResponse(res, {
-      ok: true,
-      enabled: CONFIG.lease.enabled,
-      dry_run: CONFIG.lease.dry_run,
-      wallet_peers_known: leaseWalletPeers.size,
-      exclusion_list: { saved_at: leaseExclude.saved_at || 0, excluded: Object.entries(leaseExclude.chan_points).filter(([, v]) => v && v.excluded).map(([cp]) => cp) },   // 0.72.4
-      default_ttl_days: CONFIG.lease.days,
-      cycle_minutes: CONFIG.lease.cycle_minutes,
-      cycles: leaseCycles,
-      last_cycle_at: leaseLastCycleAt ? new Date(leaseLastCycleAt).toISOString() : null,
-      channels,
-    });
+  // 0.111.0 (S63, DP 2026-10-24 — the external review's F1 and F17): FOUR OPERATOR ROUTES RETIRED FROM THE PUBLIC API.
+  // /lease/status, /lease/ttl, /health/jit and /ops/loops answered anyone holding the published route token — and
+  // /lease/ttl set a channel's lease to a fraction of a day, which the next hourly cycle then force-closed. The data and
+  // the setter live on the operator console now (loopback + Tailscale, TOTP): leaseStatusReport / leaseSetTtl /
+  // jitNowMemory below; the console's snapshot carries jit_now and the lease figures. /lease/policy (the declared rule a
+  // wallet is owed) stays public. The old box-local dashboard reads GET /console/lease on the console port.
+  if ((path === '/lease/status' || path === '/health/jit' || path === '/ops/loops') && method === 'GET') {
+    return errResponse(res, 'retired: this view is on the operator console (0.111.0)', 410);
   }
   if (path === '/lease/ttl' && method === 'POST') {
-    if (isAdminRateLimited(ip)) return errResponse(res, 'Rate limit exceeded', 429);
-    let body;
-    try { body = await readBody(req); }
-    catch (_) { return errResponse(res, 'Invalid JSON'); }
-    const cp = String(body.chan_point || '');
-    if (!/^[0-9a-f]{64}:[0-9]+$/.test(cp)) return errResponse(res, 'chan_point must be <txid>:<index>');
-    const raw = body.ttl_days;
-    const clearing = raw === null || raw === 0 || raw === undefined;
-    const ttl = Number(raw);
-    if (!clearing && (!Number.isFinite(ttl) || ttl <= 0 || ttl > 3650)) {
-      return errResponse(res, 'ttl_days must be a number in (0, 3650], or null to clear');
-    }
-    let rec = leaseState.channels[cp];
-    if (!rec) rec = leaseState.channels[cp] = { last_seen_ms: Date.now(), ttl_days: null, peer: '' };
-    rec.ttl_days = clearing ? null : ttl;
-    leaseSaveState();
-    leaseLog({ event: 'ttl_set', chan_point: cp, ttl_days: rec.ttl_days });
-    return jsonResponse(res, { ok: true, chan_point: cp, ttl_days: rec.ttl_days, default_ttl_days: CONFIG.lease.days });
+    return errResponse(res, 'retired: a channel\'s lease length is set from the operator console (0.111.0)', 410);
   }
 
   // 0.74.0 (DP): the public /admin/registry/channels route is RETIRED. It answered with the
@@ -7541,6 +7578,10 @@ async function main() {
       // 0.72.4: the one operator action so far — lease exclusions (safety-increasing, so behind the session only)
       setNote: async (kind, key, text) => consoleNoteSet(kind, key, text),   // 0.73.0 notes + labels
       releaseJitGuard: async (by) => jitGuard.release(by),   // 0.104.0: the operator's hand on the guard (session + confirm, audited)
+      releaseJitWallet: async (wallet, by) => jitGuard.releaseWallet(wallet, by),   // 0.111.0: one blocked wallet back in
+      setLeaseTtl: async (cp, ttl, by) => leaseSetTtl(cp, ttl, by),   // 0.111.0: a channel's lease length (was the public /lease/ttl)
+      leaseStatus: () => leaseStatusReport(),   // 0.111.0: GET /console/lease — the old box-local dashboard's read (loopback + the route token)
+      routeToken: () => CONFIG.adapter.secret,
       setLeaseExclude: async (cp, excluded, peer) => {
         if (!/^[0-9a-f]{64}:\d+$/.test(cp)) throw new Error('bad channel point');
         const prev = leaseExclude.chan_points[cp] || {};
