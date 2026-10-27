@@ -49,6 +49,7 @@ Edit `config.env`. The required lines:
 | `WS_ALLOWED_ORIGINS` | the wallet origins allowed to connect: `https://lightninginajar.xyz` (add your own if you host the wallet). |
 | `LIJ_ADAPTER_MACAROON_HEX` | from step 1. |
 | `LIJOX_REGISTRY` | `https://lij-worker.dp-a95.workers.dev` — or any registry you prefer; empty runs registry-free. |
+| `LIJOX_REGISTRIES` | every registry to enroll at, comma-separated — `https://registry.lightninginajar.xyz,https://lij-worker.dp-a95.workers.dev` (the two doors of the LIJOX registry; the first is the one read). Overrides `LIJOX_REGISTRY`. |
 | `NODE_NAME` | the name wallets see. |
 
 Everything else has a working default. The ones operators change first: `FEE_PPM` (advertised routing fee), `CHANNEL_SIZE_SATS` / `MIN_CHANNEL_SATS` / `MAX_CHANNEL_SATS` (JIT channel sizes), `CHANNEL_OPEN_FEE_MIN_SATS` / `CHANNEL_OPEN_FEE_PPM` (what an open costs the wallet), `LEASE_ENABLE=true` once you've read the lease section in `README.md` (a silent wallet's channel is force-closed after `LEASE_DAYS`, its balance paid to the wallet's own address). Leave `CHAIN_BRIDGE_ENABLED=true`: wallets use your node as one of their chain-data sources.

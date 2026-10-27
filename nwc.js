@@ -170,8 +170,9 @@ function createNwc(deps) {
       if (recovered !== wallet) { log(`[NWC] BAD register signature for ${short(wallet)}`); return j({ ok: false, error: 'bad_signature' }, 401); }
       const existing = reg.conns[servicePk];
       if (existing && existing.wallet !== wallet) return j({ ok: false, error: 'service_pk is taken' }, 409);
+      if (existing && Number.isFinite(Number(existing.last_ts)) && ts < Number(existing.last_ts)) return j({ ok: false, error: 'stale', reason: 'a newer registration for this connection was already accepted' }, 409);   // 0.113.1 (F15): a captured body cannot roll the record back
       if (!existing && connsOf(wallet).length >= MAX_CONNS_PER_WALLET) return j({ ok: false, error: 'too_many', reason: `at most ${MAX_CONNS_PER_WALLET} connections per wallet` }, 429);
-      reg.conns[servicePk] = { wallet, client_pk: clientPk, expires_at: expiresAt, ttl_s: Math.min(ttl, TTL_CEILING_S), registered_at: nowS() };
+      reg.conns[servicePk] = { wallet, client_pk: clientPk, expires_at: expiresAt, ttl_s: Math.min(ttl, TTL_CEILING_S), registered_at: nowS(), last_ts: ts };   // 0.113.1 (F15)
       persistReg();
       log(`[NWC] ${existing ? 'renewed' : 'registered'} connection ${short(servicePk)} for ${short(wallet)} (${connsOf(wallet).length} of ${MAX_CONNS_PER_WALLET}; ttl ${reg.conns[servicePk].ttl_s} s; until ${new Date(expiresAt * 1000).toISOString()})`);
       return j({ ok: true, relay: relayUrlOf(), ttl_s: reg.conns[servicePk].ttl_s, ttl_ceiling_s: TTL_CEILING_S, expires_at: expiresAt, connections: connsOf(wallet).length, max_connections: MAX_CONNS_PER_WALLET });
@@ -186,6 +187,7 @@ function createNwc(deps) {
       const c = reg.conns[servicePk];
       if (!c) return j({ ok: true, gone: true });
       if (c.wallet !== wallet) return j({ ok: false, error: 'not yours' }, 403);
+      if (Number.isFinite(Number(c.last_ts)) && ts < Number(c.last_ts)) return j({ ok: false, error: 'stale', reason: 'older than the connection\'s last registration' }, 409);   // 0.113.1 (F15): a captured unregister cannot undo a later registration
       dropConn(servicePk, 'unregistered by its wallet');
       return j({ ok: true, gone: true, connections: connsOf(wallet).length });
     }
@@ -293,7 +295,10 @@ function createNwc(deps) {
     if (typeof id !== 'string' || !id || id.length > 64) { send(s, ['NOTICE', 'bad subscription id']); return; }
     if (s.subs.size >= MAX_SUBS_PER_SOCKET && !s.subs.has(id)) { send(s, ['CLOSED', id, 'rate-limited: too many subscriptions']); return; }
     const fs_ = filters.filter((f) => f && typeof f === 'object');
-    if (!fs_.length || fs_.some((f) => !(f.authors || f['#p'] || f.ids))) { send(s, ['CLOSED', id, 'restricted: a filter must name a key (authors, #p or ids)']); return; }
+    // 0.113.1 (F23): every key named must be a FULL 64-hex key — an empty string in authors used to match every event
+    const _keys = (a) => Array.isArray(a) && a.length > 0 && a.every((v) => typeof v === 'string' && /^[0-9a-f]{64}$/.test(v));
+    if (!fs_.length || fs_.some((f) => !(_keys(f.authors) || _keys(f['#p']) || _keys(f.ids)))) { send(s, ['CLOSED', id, 'restricted: a filter must name a full key (authors, #p or ids — 64 hex)']); return; }
+    if (fs_.some((f) => (f.authors !== undefined && !_keys(f.authors)) || (f['#p'] !== undefined && !_keys(f['#p'])) || (f.ids !== undefined && !_keys(f.ids)))) { send(s, ['CLOSED', id, 'restricted: authors, #p and ids take full 64-hex keys only']); return; }
     // a request read needs the service key authenticated
     if (fs_.some((f) => (f.kinds || []).includes(KIND_REQUEST) && !(f['#p'] || []).every((p) => s.authed.has(p)))) { send(s, ['CLOSED', id, 'auth-required: authenticate as the service key to read requests']); return; }
     s.subs.set(id, fs_);

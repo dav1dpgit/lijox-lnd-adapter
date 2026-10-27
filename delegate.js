@@ -284,7 +284,17 @@ async function epRegister(req, res, lndRequest) {
   const horizon = s.not_after - nowS();
   if (horizon <= 0 || horizon > CFG.MAX_HORIZON_S()) return j(res, 400, { ok: false, code: 'HORIZON_TOO_LONG', max_s: CFG.MAX_HORIZON_S() });
   if (countLive() >= CFG.MAX_LIVE()) return j(res, 429, { ok: false, code: 'MAX_LIVE' });
-  if (recGet(s.nonce)) return j(res, 409, { ok: false, code: 'NONCE_EXISTS' });
+  // 0.113.1 (S63, Kimi round 2 F11): the register runs under the nonce lock — two concurrent registers for one nonce
+  // used to both mint a funding invoice (the later write won; the first, if paid, was orphaned). A repeat with the same
+  // digest answers the stored funding invoice; a different digest for a known nonce is 409.
+  return withNonceLock(s.nonce, async () => {
+  const _ex = recGet(s.nonce);
+  if (_ex) {
+    if (_ex.state === 'AWAITING_FUNDING' && _ex.funding && _ex.slip && slipDigest(Object.assign({}, _ex.slip, { issuer_pubkey: s.issuer_pubkey, nonce: s.nonce })) === slipDigest(s) && String(_ex.slip.issuer_pubkey) === String(s.issuer_pubkey).toLowerCase()) {
+      return j(res, 200, { ok: true, nonce: s.nonce.toLowerCase(), state: 'AWAITING_FUNDING', funding_bolt11: String(_ex.funding.bolt11), funding_amount_msat: _ex.slip.cap_msat, repeat: true });
+    }
+    return j(res, 409, { ok: false, code: 'NONCE_EXISTS' });
+  }
 
   let v;
   try { v = await verifySig(lndRequest, slipDigest(s), s.sig); }
@@ -325,6 +335,7 @@ async function epRegister(req, res, lndRequest) {
   console.log('[delegate] REGISTER nonce=' + s.nonce.slice(0, 12) + '… cap=' + s.cap_msat + 'msat count=' + s.count + ' → AWAITING_FUNDING');
   return j(res, 200, { ok: true, nonce: s.nonce.toLowerCase(), state: 'AWAITING_FUNDING',
     funding_bolt11: String(fund.payment_request), funding_amount_msat: s.cap_msat });
+  });   // 0.113.1 (F11): withNonceLock
 }
 
 // ── endpoint: POST /delegate/spend (DELEGATE_SECRET gated) ───────────
@@ -812,6 +823,10 @@ async function epRefund(req, res, lndRequest) {
     if (dest !== rec.slip.issuer_pubkey) return j(res, 400, { ok: false, code: 'PAYEE_NOT_ISSUER' });
     const invMsat = Number((dec && dec.num_msat) || 0) || (Number((dec && dec.num_satoshis) || 0) * 1000);
     if (invMsat > owed) return j(res, 400, { ok: false, code: 'OVER_REFUND', owed_msat: owed });
+    // 0.114.0 (S63, Kimi round 2 F19 — DP "Agreed"): ONE refund for the whole remainder. A part-refund invoice is
+    // refused: an issuer could split a 1,000-sat remainder into a million 1-msat refunds, each paid with the 50-sat fee
+    // allowance that was never counted against the chit. An amountless invoice (paid the remainder) stays allowed.
+    if (invMsat > 0 && invMsat < owed) return j(res, 400, { ok: false, code: 'PARTIAL_REFUND', owed_msat: owed, reason: 'a refund invoice asks for the whole remainder (' + owed + ' msat) or carries no amount' });
     const payMsat = invMsat > 0 ? invMsat : owed;
 
     rec.refund_state = 'PAYING';
@@ -827,12 +842,15 @@ async function epRefund(req, res, lndRequest) {
     } catch (e) { pay = { payment_error: String(e.message || e).slice(0, 160) }; }
 
     if (pay && !pay.payment_error && pay.payment_preimage) {
-      rec.refunded_msat = (rec.refunded_msat || 0) + payMsat;
+      // 0.114.0 (F19): the routing fee this refund cost counts against the chit — the issuer's remainder paid it
+      const feePaid = Number((pay.payment_route && pay.payment_route.total_fees_msat) || pay.fee_msat || 0) || 0;
+      rec.refunded_msat = (rec.refunded_msat || 0) + payMsat + feePaid;
+      rec.refund_fee_msat = (rec.refund_fee_msat || 0) + feePaid;
       rec.refund_state = (refundOwedMsat(rec) > 0) ? 'OWED' : 'PAID';
       delete rec.refund_inflight;
       recPut(nonce, rec);
-      console.log('[delegate] REFUND paid nonce=' + nonce.slice(0, 12) + '… ' + payMsat + 'msat → ' + rec.refund_state);
-      return j(res, 200, { ok: true, refunded_msat: payMsat, remaining_owed_msat: refundOwedMsat(rec) });
+      console.log('[delegate] REFUND paid nonce=' + nonce.slice(0, 12) + '… ' + payMsat + 'msat (fee ' + feePaid + ' msat counted) → ' + rec.refund_state);
+      return j(res, 200, { ok: true, refunded_msat: payMsat, fee_msat: feePaid, remaining_owed_msat: refundOwedMsat(rec) });
     }
     rec.refund_state = 'OWED'; delete rec.refund_inflight; recPut(nonce, rec);
     const err = (pay && pay.payment_error) || 'no_preimage';

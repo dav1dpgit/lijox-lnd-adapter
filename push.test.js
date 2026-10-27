@@ -4,6 +4,11 @@
 // and delivery (the holder pays the far invoice, keeps fee − spent), the guards, boot resume.
 //   0.83.0: receivability first — /push/receivable, a claim refused before anything is minted or paid
 //   (cannot_receive + reason), a delivery-time burn's end_code at /push/claim-status, the holder's codes.
+//   0.113.0 (S63, DP's five Push points 2026-10-26): the 144-block margin, the hold fee (a box setting, 0 by default),
+//   the sender woken when its push is taken or returned, a claim refused when the sender's channel is gone.
+//   0.114.0 (S63, Kimi round 2 F2/F3): a refused settle is settle_pending with the preimage kept and retried, never
+//   'taken'; a hold cancelled under it is paid_unsettled; the window and claim-window timers wait while a delivery is in
+//   flight; a direct delivery that outran the RPC answers in_flight and is probed, on both sides of a claim.
 //   node push.test.js
 const assert = require('assert');
 const crypto = require('crypto');
@@ -38,6 +43,7 @@ const invoices = {};   // hash → { state, amt_paid_msat, cltv, value_msat }
 const farInvoices = {}; // bolt11 → { payment_hash, num_msat, destination, preimage, fee_msat, fail }
 const payments = [];
 let keyDenies = new Set();   // 0.83.1: RPCs the fake key lacks → LND's permission body
+let settleFail = null;       // 0.114.0 (F3): LND's error body for a settle (lndRequest hands it back as data)
 const PERM = { code: 2, message: 'permission denied', details: [] };
 const LOCAL = '03' + '11'.repeat(32);
 const FAR = '02' + '22'.repeat(32);
@@ -53,6 +59,7 @@ const lnd = {
   },
   async post(p, body) {
     if (p === '/v2/invoices/hodl') { const h = Buffer.from(body.hash, 'base64').toString('hex'); if (invoices[h]) return { code: 6, message: 'invoice with payment hash already exists' }; invoices[h] = { state: 'OPEN', value_msat: body.value_msat, cltv: Number(body.cltv_expiry), hints: (body.route_hints || []).length, expiry: Number(body.expiry) }; return { payment_request: 'lnbc-hold-' + h.slice(0, 8) + (body.route_hints ? '-h' : '') }; }
+    if (p === '/v2/invoices/settle' && settleFail) return settleFail;   // 0.114.0 (F3)
     if (p === '/v2/invoices/settle') { const pre = Buffer.from(body.preimage, 'base64').toString('hex'); const h = crypto.createHash('sha256').update(Buffer.from(pre, 'hex')).digest('hex'); if (!invoices[h] || invoices[h].state !== 'ACCEPTED') return { code: 5, message: 'invoice not accepted' }; invoices[h].state = 'SETTLED'; return {}; }
     if (p === '/v2/invoices/cancel') { const h = Buffer.from(body.payment_hash, 'base64').toString('hex'); if (invoices[h]) invoices[h].state = 'CANCELED'; return {}; }
     if (p === '/v1/verifymessage' && keyDenies.has('VerifyMessage')) return PERM;
@@ -80,6 +87,8 @@ const rxAsked = [];
 let refuseNext = null;   // 0.83.0: make the fake deliverToWallet refuse once (a delivery-time change)
 const innerFail = {};   // 0.84.0: hash → { tries, answer } — the fake deliverToWallet's attempt answer for that hash
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'push-'));
+const wakes = [];   // 0.113.0: sendWakePush calls (pubkey, ms, kind)
+let senderLock = { ok: true, chan_point: 'ab'.repeat(32) + ':0', active: false, expiration_height: 900_576, height: 900_100 };   // 0.113.0: the sender's lock on its channel, as listchannels would show it
 const deps = {
   dataDir: dir, lndGet: lnd.get, lndPost: lnd.post,
   deliverToWallet: async ({ client, hashHex, secretHex, amountMsat }) => {
@@ -91,7 +100,8 @@ const deps = {
     return { kind: 'attempt', attempt: { status: 'SUCCEEDED', preimage: pre }, innerMsat: String(amountMsat), feeMsat: 0n, chan: {} };
   },
   isPeerConnected: async (pk) => connected.has(pk),
-  sendWakePush: async () => {}, authOk: (req) => req.headers['x-adapter-secret'] === 'tok',
+  sendWakePush: async (pk, ms, kind) => { wakes.push({ pk, ms, kind }); }, authOk: (req) => req.headers['x-adapter-secret'] === 'tok',
+  senderHtlc: async () => senderLock,   // 0.113.0 (5)
   buildPublicHints: async () => [{ hop_hints: [{ node_id: FAR }] }],
   plRecord: (kind, f) => pl.push({ kind, ...f }), leaseTouch: () => {}, touchWalletActive: () => {},
   localPubkey: () => LOCAL, log: () => {}, env: {}, now: () => clock, timers,
@@ -112,20 +122,20 @@ const nowS = () => Math.floor(clock / 1000);
   // ── fee and blocks ──
   check(rail.feeMsat(20_000_000) === 41_000, 'fee: 1 sat base + 0.2% of 20,000 sats = 41 sats');
   check(rail.feeMsat(1000) === 1000 + 2, 'fee floor: base + ceil(ppm) for a tiny amount');
-  check(rail.blocksFor(72 * 3600) === 472, '72 h = 432 blocks + 40 margin = 472');
+  check(rail.blocksFor(72 * 3600) === 576, '72 h = 432 blocks + 144 margin = 576 (0.113.0: the margin was 40)');
 
   // ── 0. the quote ──
   {
     let out = null; const res = {}; const req = { headers: {}, url: '/push/quote?amount_sats=20000' };
     await rail.handle(req, res, '/push/quote', 'GET', '1.2.3.4', async () => ({}), (r, data, status) => { out = { data, status: status || 200 }; });
-    check(out.status === 200 && out.data.ok && out.data.fee_msat === '41000' && out.data.total_msat === '20041000' && out.data.cltv_expiry === 472, 'quote: 20,000 sats → fee 41 sats, total 20,041, cltv 472');
+    check(out.status === 200 && out.data.ok && out.data.fee_msat === '41000' && out.data.total_msat === '20041000' && out.data.cltv_expiry === 576 && out.data.cltv_margin_blocks === 144 && out.data.hold_fee_ppm_per_day === 0 && out.data.hold_fee_msat === '0', 'quote: 20,000 sats → fee 41 sats, total 20,041, cltv 576, the margin and the hold fee (0) named');
   }
 
   // ── 1. LOCK → locked ──
   const A = pair('A');
   let r = await call('POST', '/push/lock', { client_pubkey: SENDER, hash: A.hash, amount_sats: 20000, expiry: nowS() + 72 * 3600 });
-  check(r.status === 200 && r.data.ok && r.data.bolt11 && r.data.total_msat === '20041000' && r.data.cltv_expiry === 472 && r.data.holder === LOCAL, 'lock: a hold invoice for amount + fee, cltv 472, the holder named');
-  check(invoices[A.hash] && invoices[A.hash].cltv === 472 && invoices[A.hash].value_msat === '20041000', 'the hold invoice minted on the hash with the right value and timelock');
+  check(r.status === 200 && r.data.ok && r.data.bolt11 && r.data.total_msat === '20041000' && r.data.cltv_expiry === 576 && r.data.holder === LOCAL, 'lock: a hold invoice for amount + fee, cltv 576, the holder named');
+  check(invoices[A.hash] && invoices[A.hash].cltv === 576 && invoices[A.hash].value_msat === '20041000', 'the hold invoice minted on the hash with the right value and timelock');
   await advance(300);
   check(rail._reg().out[A.hash].status === 'minted', 'unpaid: still minted');
   invoices[A.hash].state = 'ACCEPTED'; invoices[A.hash].amt_paid_msat = '20041000';
@@ -148,6 +158,8 @@ const nowS = () => Math.floor(clock / 1000);
   check(r.status === 200 && r.data.ok && r.data.mode === 'direct' && r.data.status === 'taken', 'claim on the holding provider: delivered directly, TAKEN');
   check(delivered.length === 1 && delivered[0].client === RECIP && delivered[0].hashHex === A.hash && delivered[0].secretHex === SECRET && delivered[0].amountMsat === '20000000', 'one delivery of exactly the amount (the fee stays with the provider)');
   check(invoices[A.hash].state === 'SETTLED', 'the sender\'s hold settled with the recipient\'s preimage');
+  await new Promise((r2) => setImmediate(r2));
+  check(wakes.length === 1 && wakes[0].pk === SENDER && wakes[0].kind === 'push_taken' && wakes[0].ms === (900_576 - 900_100 - 10) * 600 * 1000, '0.113.0 (1): the SENDER is woken on the take — push_taken, with the time to open: (expiry 900,576 − height 900,100 − LND\'s 10) blocks × 10 min');
   check(pl.some((e) => e.kind === 'push_fee' && e.msat === 41000 && e.moved_msat === 20000000), 'PL: the fee kept (41 sats), 20,000 moved');
   r = await call('GET', '/push/status/' + A.hash, null, false);
   check(r.data.status === 'taken' && r.data.taken_at, 'status: taken');
@@ -177,6 +189,8 @@ const nowS = () => Math.floor(clock / 1000);
   check(rail._reg().out[C.hash].status === 'locked', 'C locked');
   await advance(3600 * 1000 + 5000);
   check(rail._reg().out[C.hash].status === 'returned' && invoices[C.hash].state === 'CANCELED', 'the window over: the hold cancelled — RETURNED to the sender');
+  await new Promise((r2) => setImmediate(r2));
+  check(wakes.length === 2 && wakes[1].pk === SENDER && wakes[1].kind === 'push_returned', '0.113.0 (1): the sender is woken on the return too — the fail-back reaches its wallet only when it is open');
   r = await call('GET', '/push/status/' + C.hash, null, false);
   check(r.data.status === 'returned' && /nobody brought the key/.test(r.data.end_reason), 'status says why');
 
@@ -367,6 +381,37 @@ const nowS = () => Math.floor(clock / 1000);
   check(r.status === 404, 'and the read says no note');
   check(rail.capability.sealed_note === true, 'capability: sealed_note');
 
+  // ── 7g. 0.113.0 (5): a claim is refused when the sender's channel no longer carries the lock ──
+  const W = pair('W');
+  await call('POST', '/push/lock', { client_pubkey: SENDER, hash: W.hash, amount_sats: 2000, expiry: nowS() + 72 * 3600 });
+  invoices[W.hash].state = 'ACCEPTED'; await advance(4000);
+  walletPreimage[W.hash] = W.pre;
+  const dW = delivered.length, wW = wakes.length;
+  senderLock = { ok: false, reason: 'no open channel of the sender\'s carries this lock' };
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: W.hash, secret: SECRET });
+  check(r.status === 409 && r.data.error === 'sender_channel_closed' && /closing or closed/.test(r.data.reason) && delivered.length === dW && rail._reg().out[W.hash].status === 'locked' && invoices[W.hash].state === 'ACCEPTED', 'direct claim with the sender\'s channel gone: sender_channel_closed, nothing delivered, the lock untouched');
+  farInvoices['lnfar-W'] = { payment_hash: W.hash, num_msat: 2_000_000, destination: FAR, preimage: W.pre, fee_msat: 1 };
+  const pW = payments.length;
+  r = await call('POST', '/push/deliver', { client_pubkey: RECIP, hash: W.hash, bolt11: 'lnfar-W' });
+  check(r.status === 409 && r.data.error === 'sender_channel_closed' && payments.length === pW && rail._reg().out[W.hash].status === 'locked', 'cross-provider delivery with the sender\'s channel gone: refused, nothing paid');
+  senderLock = { error: 'lnd down' };
+  r = await call('POST', '/push/deliver', { client_pubkey: RECIP, hash: W.hash, bolt11: 'lnfar-W' });
+  check(r.status === 503 && r.data.error === 'sender_channel_unknown' && payments.length === pW, 'the sender\'s channel unreadable: 503, nothing paid (never on a guess)');
+  senderLock = { ok: true, chan_point: 'ab'.repeat(32) + ':0', active: false, expiration_height: 900_576, height: 900_100 };
+  r = await call('POST', '/push/deliver', { client_pubkey: RECIP, hash: W.hash, bolt11: 'lnfar-W' });
+  check(r.status === 200 && r.data.status === 'taken' && wakes.length === wW + 1 && wakes[wW].kind === 'push_taken', 'the lock back on an open channel (the sender merely offline): delivered, TAKEN, the sender woken');
+  // 0.113.0 (3): the hold fee is a box setting inside the lock's fee — per million of the amount per day of the window
+  const rail3 = createPushRail(Object.assign({}, deps, { dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'push3-')), env: { PUSH_HOLD_FEE_PPM_PER_DAY: '100' } }));
+  check(rail3.holdFeeMsat(20_000_000, 72 * 3600) === 6000, 'hold fee 100 ppm/day: 20,000 sats × 100/1e6 × 3 days = 6 sats');
+  check(rail3.feeMsat(20_000_000, 72 * 3600) === 41_000 + 6000, 'the lock\'s fee = base + ppm + the hold fee');
+  check(rail3.feeMsat(20_000_000, 600) === 41_000 + 2000, 'a 10-minute window counts as one day');
+  check(rail.holdFeeMsat(20_000_000, 72 * 3600) === 0 && rail.settings().hold_fee_ppm_per_day === 0 && rail.settings().cltv_margin_blocks === 144, 'unset: no hold fee; settings name both knobs');
+  {
+    let out = null; const res = {}; const req = { headers: {}, url: '/push/quote?amount_sats=20000' };
+    await rail3.handle(req, res, '/push/quote', 'GET', '1.2.3.4', async () => ({}), (r2, data, status) => { out = { data, status: status || 200 }; });
+    check(out.data.fee_msat === '47000' && out.data.hold_fee_msat === '6000' && out.data.hold_fee_ppm_per_day === 100, 'the quote carries the hold fee inside fee_msat and names it');
+  }
+
   // ── 8. boot resume ──
   const I = pair('I');
   await call('POST', '/push/lock', { client_pubkey: SENDER, hash: I.hash, amount_sats: 4000, expiry: nowS() + 72 * 3600 });
@@ -375,8 +420,188 @@ const nowS = () => Math.floor(clock / 1000);
   const n = rail2.bootResume();
   check(n === 4 && rail2._reg().out[I.hash].status === 'locked' && rail2._reg().out[H.hash].status === 'locked' && rail2._reg().out[K.hash].status === 'locked' && rail2._reg().out[M.hash].status === 'locked', 'a fresh process resumes the four open locks, H, I, K and M (settled, void, returned, unpaid, burned, taken ones stay put) — got ' + n);
   const s = rail.summary();
-  check(s.locked === 4 && s.taken === 3 && s.returned === 3 && s.claims_open === 0, 'summary: 4 locked (H, I, K, M), 3 taken (A, F, N), 3 returned/void (B, C, V), no open claims — got ' + JSON.stringify(s));
+  check(s.locked === 4 && s.taken === 4 && s.returned === 3 && s.claims_open === 0, 'summary: 4 locked (H, I, K, M), 4 taken (A, F, N, W), 3 returned/void (B, C, V), no open claims — got ' + JSON.stringify(s));
   check(rail.capability.holder === true && rail.settings().fee_ppm === 2000, 'capability and settings exposed');
+
+
+  // ── 9. 0.114.0 (Kimi round 2 F2/F3, DP "Fix this hole"): the settle truth and the in-flight guards ──
+  // 9a. F3: the direct delivery succeeds, LND refuses the settle → settle_pending with the preimage kept; the retry lands
+  const P = pair('P');
+  await call('POST', '/push/lock', { client_pubkey: SENDER, hash: P.hash, amount_sats: 6000, expiry: nowS() + 72 * 3600 });
+  invoices[P.hash].state = 'ACCEPTED'; invoices[P.hash].amt_paid_msat = '6013000'; await advance(4000);
+  walletPreimage[P.hash] = P.pre; settleFail = { code: 2, message: 'rpc error: unknown invoice state' };
+  const wakesBefore = wakes.length;
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: P.hash, secret: SECRET });
+  check(r.status === 200 && r.data.ok && r.data.mode === 'direct' && r.data.status === 'settle_pending' && r.data.delivered_msat === '6000000', 'F3: the recipient is paid, LND refused the settle → ok, mode direct, status settle_pending (the page says Taken)');
+  check(rail._reg().out[P.hash].status === 'settle_pending' && rail._reg().out[P.hash].preimage === P.pre && invoices[P.hash].state === 'ACCEPTED' && /unknown invoice state/.test(rail._reg().out[P.hash].settle_error), 'the record is settle_pending with the preimage KEPT and the error named; the hold still ACCEPTED (before 0.114.0: recorded taken)');
+  await new Promise((r2) => setImmediate(r2));
+  check(wakes.length === wakesBefore, 'the sender is not told "taken" before the settle lands');
+  await advance(4000);
+  check(rail._reg().out[P.hash].status === 'settle_pending' && rail._reg().out[P.hash].settle_tries >= 2, 'the watcher retries the settle while LND still refuses (tries ' + rail._reg().out[P.hash].settle_tries + ')');
+  settleFail = null;
+  await advance(16000);
+  check(rail._reg().out[P.hash].status === 'taken' && invoices[P.hash].state === 'SETTLED' && !rail._reg().out[P.hash].settle_error, 'LND accepts the retry → TAKEN, the hold SETTLED, the error cleared');
+  await new Promise((r2) => setImmediate(r2));
+  check(wakes.length === wakesBefore + 1 && wakes[wakes.length - 1].kind === 'push_taken', 'the sender is woken on the real settle');
+  check(pl.filter((e) => e.kind === 'push_fee' && e.hash === P.hash).length === 1, 'the fee is recorded once');
+  r = await call('GET', '/push/status/' + P.hash, null, false);
+  check(r.data.status === 'taken', 'status: taken');
+
+  // 9b. F3: the settle fails and LND cancels the hold meanwhile → paid_unsettled (MANUAL ATTENTION), never 'taken'
+  const Q9 = pair('Q9');
+  await call('POST', '/push/lock', { client_pubkey: SENDER, hash: Q9.hash, amount_sats: 6000, expiry: nowS() + 72 * 3600 });
+  invoices[Q9.hash].state = 'ACCEPTED'; await advance(4000);
+  walletPreimage[Q9.hash] = Q9.pre; settleFail = { code: 2, message: 'invoice already canceled' };
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: Q9.hash, secret: SECRET });
+  check(r.data.status === 'settle_pending', 'Q9: the settle refused → settle_pending');
+  invoices[Q9.hash].state = 'CANCELED'; await advance(4000);
+  check(rail._reg().out[Q9.hash].status === 'paid_unsettled' && /MANUAL ATTENTION/.test(rail._reg().out[Q9.hash].end_reason), 'the hold cancelled under a pending settle → paid_unsettled (MANUAL ATTENTION), not taken');
+  settleFail = null;
+
+  // 9c. F2 (the holder): the window ends while a direct delivery is in flight → the hold stays; the probe settles it late
+  const S9 = pair('S9');
+  await call('POST', '/push/lock', { client_pubkey: SENDER, hash: S9.hash, amount_sats: 6000, expiry: nowS() + 600 });
+  invoices[S9.hash].state = 'ACCEPTED'; await advance(4000);
+  innerFail[S9.hash] = { tries: 0, answer: { kind: 'attempt', attempt: { status: 'HARD_TIMEOUT', failure: { code: 'F3_HARD_TIMEOUT' } } } };
+  const sPay = { payment_hash: S9.hash, status: 'IN_FLIGHT' }; payments.push(sPay);   // LND owns the attempt
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: S9.hash, secret: SECRET });
+  check(r.status === 409 && r.data.error === 'in_flight' && rail._reg().out[S9.hash].deliver_inflight_at && rail._reg().out[S9.hash].status === 'locked', 'F2: a direct delivery that hit the hard timeout answers in_flight; the record carries deliver_inflight_at, still locked');
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: S9.hash, secret: SECRET });
+  check(r.status === 409 && r.data.error === 'in_flight' && innerFail[S9.hash].tries === 1, 'a second claim meanwhile: in_flight, NO second send');
+  await advance(600 * 1000 + 5000);
+  check(rail._reg().out[S9.hash].status === 'locked' && invoices[S9.hash].state === 'ACCEPTED', 'the window over with the delivery in flight: the hold is NOT cancelled (before 0.114.0: returned while the inner could still pay)');
+  sPay.status = 'SUCCEEDED'; sPay.payment_preimage = S9.pre; sPay.fee_msat = '0';   // LND finishes it late
+  await advance(65 * 1000);
+  check(rail._reg().out[S9.hash].status === 'taken' && invoices[S9.hash].state === 'SETTLED', 'the probe finds the late success → TAKEN, the hold settled with the preimage');
+
+  // 9c'. the window ends with the delivery in flight and LND then FAILS it → the next window tick returns the sats
+  const S9b = pair('S9b');
+  await call('POST', '/push/lock', { client_pubkey: SENDER, hash: S9b.hash, amount_sats: 6000, expiry: nowS() + 600 });
+  invoices[S9b.hash].state = 'ACCEPTED'; await advance(4000);
+  innerFail[S9b.hash] = { tries: 0, answer: { kind: 'attempt', attempt: { status: 'HARD_TIMEOUT', failure: { code: 'F3_HARD_TIMEOUT' } } } };
+  const s2Pay = { payment_hash: S9b.hash, status: 'IN_FLIGHT' }; payments.push(s2Pay);
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: S9b.hash, secret: SECRET });
+  await advance(600 * 1000 + 5000);
+  check(rail._reg().out[S9b.hash].status === 'locked', 'S9b: held through the window end while in flight');
+  s2Pay.status = 'FAILED'; s2Pay.failure_reason = 'FAILURE_REASON_TIMEOUT';
+  await advance(65 * 1000);
+  check(rail._reg().out[S9b.hash].status === 'returned' && invoices[S9b.hash].state === 'CANCELED', 'LND failed the in-flight delivery → the next window tick RETURNS the sats to the sender');
+
+  // 9d. F2/F3 on the claim side (this box as the recipient's provider): the delivery hits the hard timeout → no failed-try count,
+  //     the claim window waits, the late success settles the holder's payment
+  const T9 = pair('T9');
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: T9.hash, secret: SECRET, amount_sats: 7000, expiry: nowS() + 3600, holder_prefix: FAR.slice(0, 16) });
+  check(r.status === 200 && r.data.mode === 'invoice', 'T9: the claim invoice minted');
+  innerFail[T9.hash] = { tries: 0, answer: { kind: 'attempt', attempt: { status: 'HARD_TIMEOUT', failure: { code: 'F3_HARD_TIMEOUT' } } } };
+  const tPay = { payment_hash: T9.hash, status: 'IN_FLIGHT' }; payments.push(tPay);
+  invoices[T9.hash].state = 'ACCEPTED'; invoices[T9.hash].amt_paid_msat = '7000000';
+  await advance(30 * 1000);
+  check(rail._reg().in[T9.hash].status === 'accepted' && innerFail[T9.hash].tries === 1 && rail._reg().in[T9.hash].deliver_inflight_at && !rail._reg().in[T9.hash].inner_fails, 'the claim: ONE send, then the hard timeout → deliver_inflight_at, no failed-try counted, no second send over 30 s (tries ' + innerFail[T9.hash].tries + ')');
+  await advance(15 * 60 * 1000 + 5000);
+  check(rail._reg().in[T9.hash].status === 'accepted' && invoices[T9.hash].state === 'ACCEPTED', 'the claim window over with the delivery in flight: the holder\'s payment is NOT cancelled');
+  tPay.status = 'SUCCEEDED'; tPay.payment_preimage = T9.pre; tPay.value_msat = '7000000';
+  await advance(65 * 1000);
+  check(rail._reg().in[T9.hash].status === 'settled' && invoices[T9.hash].state === 'SETTLED' && innerFail[T9.hash].tries === 1, 'the probe finds the late success → the holder\'s payment SETTLED with the wallet\'s preimage; still one send');
+  check(pl.some((e) => e.kind === 'hold_fee' && e.hash === T9.hash && e.moved_msat === 7000000), 'PL: the claim recorded on the real settle');
+
+  // 9e. F3 on the claim side: the inner succeeds, the settle is refused → settle_pending; the retry lands
+  const U2 = pair('U2');
+  walletPreimage[U2.hash] = U2.pre;
+  r = await call('POST', '/push/claim', { client_pubkey: RECIP, hash: U2.hash, secret: SECRET, amount_sats: 7000, expiry: nowS() + 3600, holder_prefix: FAR.slice(0, 16) });
+  settleFail = { code: 2, message: 'rpc error: unknown invoice state' };
+  invoices[U2.hash].state = 'ACCEPTED'; invoices[U2.hash].amt_paid_msat = '7000000';
+  await advance(4000);
+  check(rail._reg().in[U2.hash].status === 'settle_pending' && rail._reg().in[U2.hash].preimage === U2.pre && invoices[U2.hash].state === 'ACCEPTED', 'the claim delivered, the settle refused → settle_pending with the preimage kept (before 0.114.0: recorded settled)');
+  const sentBefore = delivered.filter((d) => d.hashHex === U2.hash).length;
+  settleFail = null;
+  await advance(20000);
+  check(rail._reg().in[U2.hash].status === 'settled' && invoices[U2.hash].state === 'SETTLED' && delivered.filter((d) => d.hashHex === U2.hash).length === sentBefore, 'the retry settles the holder\'s payment — the inner delivery was NOT repeated');
+
+  // 9f. boot: settle_pending records resume their watchers
+  const rail9 = createPushRail(deps);
+  const n3 = rail9.bootResume();
+  check(n3 >= 4, 'a fresh process resumes the open locks (got ' + n3 + ')');
+
+
+  // ── 10. 0.116.0 (Kimi round 2 F4/F6, DP "Both. Agreed."): the claimant's proof; a second proven claimant replaces an
+  //       unpaid claim; a key whose claim burned after an open waits 24 h; the canceled claim invoice deleted from LND ──
+  const logsP = [], deletes = []; let deleteAnswer = {};
+  const proofCheck = (fields, action, clientPk, recordId) => (fields && fields.node_pubkey === clientPk && fields.signature === 'proof:' + action + ':' + recordId) ? { ok: true } : { ok: false, code: (fields && fields.signature) ? 'bad_signature' : 'signature required', status: 401 };
+  const sha = (s) => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
+  const proofFor = (action, pk, recordId) => ({ node_pubkey: pk, nonce: 'n'.repeat(64), signature: 'proof:' + action + ':' + recordId });
+  const depsP = Object.assign({}, deps, { dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'push-p-')), log: (m) => logsP.push(String(m)), proofCheck, lndDelete: async (p) => { deletes.push(p); return deleteAnswer; } });
+  const railP = createPushRail(depsP);
+  const callP = async (method, pathname, body, auth = true) => {
+    let out = null; const res = {}; const req = { headers: auth ? { 'x-adapter-secret': 'tok' } : {}, url: pathname };
+    await railP.handle(req, res, pathname.split('?')[0], method, '1.2.3.4', async () => body, (r, data, status) => { out = { data, status: status || 200 }; });
+    return out;
+  };
+  const OTHER = '02' + 'ee'.repeat(32); const OTHER2 = '02' + 'ef'.repeat(32); connected.add(OTHER); connected.add(OTHER2);   // the squatters are connected peers here
+  // 10a. the claim needs the claimant's proof — over the hash, the key, the secret's digest and the cross-provider fields
+  const X1 = pair('X1'); walletPreimage[X1.hash] = X1.pre;
+  const claimRec = (hash, pk, secret, amt, exp, hp) => 'claim:' + hash + ':' + pk + ':' + sha(secret) + ':' + (amt || 0) + ':' + (exp || 0) + ':' + (hp || '');
+  const expX = nowS() + 3600;
+  r = await callP('POST', '/push/claim', { client_pubkey: RECIP, hash: X1.hash, secret: SECRET, amount_sats: 7000, expiry: expX, holder_prefix: FAR.slice(0, 16) });
+  check(r.status === 401 && /signature required/.test(r.data.error), 'F4: a claim without the proof → 401');
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: RECIP, hash: X1.hash, secret: SECRET, amount_sats: 7000, expiry: expX, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', RECIP, claimRec(X1.hash, RECIP, 'ff'.repeat(32), 7000, expX, FAR.slice(0, 16)))));
+  check(r.status === 401 && /bad_signature/.test(r.data.error), 'F4: a proof over another secret → 401 (the record binds the secret\'s digest)');
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: RECIP, hash: X1.hash, secret: SECRET, amount_sats: 7000, expiry: expX, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', RECIP, claimRec(X1.hash, RECIP, SECRET, 7000, expX, FAR.slice(0, 16)))));
+  check(r.status === 200 && r.data.ok && r.data.mode === 'invoice', 'F4: the proven claim mints the claim invoice');
+  const bolt11X = r.data.bolt11;
+  // the claim-status read: the proof in the query
+  r = await callP('GET', '/push/claim-status/' + X1.hash + '?client_pubkey=' + RECIP, null);
+  check(r.status === 401, 'F4: claim-status without the proof → 401');
+  const csq = proofFor('push-claim-status', RECIP, 'claim-status:' + X1.hash + ':' + RECIP);
+  r = await callP('GET', '/push/claim-status/' + X1.hash + '?client_pubkey=' + RECIP + '&node_pubkey=' + csq.node_pubkey + '&nonce=' + csq.nonce + '&signature=' + encodeURIComponent(csq.signature), null);
+  check(r.status === 200 && r.data.status === 'reserved', 'F4: claim-status with the proof in the query → the record');
+  // 10b. F6: a second PROVEN claimant replaces the unpaid claim — the same invoice, the record now the second one's
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: OTHER, hash: X1.hash, secret: 'ab'.repeat(32), amount_sats: 7000, expiry: expX, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', OTHER, claimRec(X1.hash, OTHER, 'ab'.repeat(32), 7000, expX, FAR.slice(0, 16)))));
+  check(r.status === 200 && r.data.ok && r.data.bolt11 === bolt11X && railP._reg().in[X1.hash].client_pubkey === OTHER && railP._reg().in[X1.hash].secret === 'ab'.repeat(32), 'F6: a second proven claimant replaces the unpaid claim — the same invoice, the record is now its');
+  r = await callP('GET', '/push/claim-status/' + X1.hash + '?client_pubkey=' + RECIP + '&node_pubkey=' + csq.node_pubkey + '&nonce=' + csq.nonce + '&signature=' + encodeURIComponent(csq.signature), null);
+  check(r.status === 403, 'the first claimant\'s status read is now "not yours"');
+  // the holder pays → the record belongs to its claimant until it ends
+  invoices[X1.hash].state = 'ACCEPTED'; invoices[X1.hash].amt_paid_msat = '7000000';
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: RECIP, hash: X1.hash, secret: SECRET, amount_sats: 7000, expiry: expX, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', RECIP, claimRec(X1.hash, RECIP, SECRET, 7000, expX, FAR.slice(0, 16)))));
+  check(r.status === 409 && r.data.error === 'claimed', 'once the holder has paid, another claimant is refused (claimed)');
+  // 10c. F6: the delivery to the squatter burns (no preimage for its secret) after an open → that key is blocked 24 h for
+  //      claims that need an open; the canceled invoice is deleted so the hash can be claimed here again
+  rxAnswer = { ok: true, mode: 'open', fee_msat: '2000', receivable_msat: '0', min_msat: '1000' };
+  const X2 = pair('X2'); const expX2 = nowS() + 3600;
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: OTHER, hash: X2.hash, secret: 'ab'.repeat(32), amount_sats: 7000, expiry: expX2, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', OTHER, claimRec(X2.hash, OTHER, 'ab'.repeat(32), 7000, expX2, FAR.slice(0, 16)))));
+  check(r.status === 200 && railP._reg().in[X2.hash].rx_mode === 'open', 'a squatter\'s claim that will need a channel open is minted (the open is kept — a new wallet needs it)');
+  deletes.length = 0; deleteAnswer = {};
+  invoices[X2.hash].state = 'ACCEPTED'; invoices[X2.hash].amt_paid_msat = '7000000';
+  await advance(5000);
+  check(railP._reg().in[X2.hash].status === 'burned' && railP._reg().in[X2.hash].end_code === 'recipient_refused' && invoices[X2.hash].state === 'CANCELED', 'the delivery burns (the squatter has no preimage) — the holder\'s payment fails back');
+  check(deletes.length === 1 && deletes[0] === '/v1/invoices?invoice_hash=' + X2.hash && railP._reg().in[X2.hash].invoice_deleted === true && railP.capability.delete_canceled === true, 'F6: the canceled claim invoice is DELETED from LND (DeleteCanceledInvoice) — the hash can be claimed here again');
+  const X3 = pair('X3'); const expX3 = nowS() + 3600;
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: OTHER, hash: X3.hash, secret: 'ab'.repeat(32), amount_sats: 7000, expiry: expX3, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', OTHER, claimRec(X3.hash, OTHER, 'ab'.repeat(32), 7000, expX3, FAR.slice(0, 16)))));
+  check(r.status === 429 && r.data.error === 'claim_open_blocked', 'F6: the same key\'s next claim that needs an open is refused for 24 h (claim_open_blocked)');
+  rxAnswer = { ok: true, mode: 'channel', fee_msat: '0', receivable_msat: '50000000', min_msat: '1000' };
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: OTHER, hash: X3.hash, secret: 'ab'.repeat(32), amount_sats: 7000, expiry: expX3, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', OTHER, claimRec(X3.hash, OTHER, 'ab'.repeat(32), 7000, expX3, FAR.slice(0, 16)))));
+  check(r.status === 200, 'a claim that needs no open is not blocked');
+  // the real recipient claims the burned-then-deleted hash: LND no longer holds the canceled invoice → a fresh mint
+  delete invoices[X2.hash]; walletPreimage[X2.hash] = X2.pre;
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: RECIP, hash: X2.hash, secret: SECRET, amount_sats: 7000, expiry: expX2, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', RECIP, claimRec(X2.hash, RECIP, SECRET, 7000, expX2, FAR.slice(0, 16)))));
+  check(r.status === 200 && r.data.ok && railP._reg().in[X2.hash].client_pubkey === RECIP && railP._reg().in[X2.hash].status === 'reserved', 'the real recipient claims the hash after the squat (a fresh invoice)');
+  // a key that cannot delete: the gap logged once, the claim stays claim_expired as before
+  deleteAnswer = { code: 2, message: 'permission denied', details: [] }; deletes.length = 0;
+  const X4 = pair('X4'); const expX4 = nowS() + 3600;
+  rxAnswer = { ok: true, mode: 'open', fee_msat: '2000', receivable_msat: '0', min_msat: '1000' };
+  r = await callP('POST', '/push/claim', Object.assign({ client_pubkey: OTHER2, hash: X4.hash, secret: 'ab'.repeat(32), amount_sats: 7000, expiry: expX4, holder_prefix: FAR.slice(0, 16) }, proofFor('push-claim', OTHER2, claimRec(X4.hash, OTHER2, 'ab'.repeat(32), 7000, expX4, FAR.slice(0, 16)))));
+  invoices[X4.hash].state = 'ACCEPTED'; invoices[X4.hash].amt_paid_msat = '7000000';
+  await advance(5000);
+  check(railP._reg().in[X4.hash].status === 'burned' && deletes.length === 1 && railP.capability.delete_canceled === false && logsP.some((m) => /lacks \/lnrpc\.Lightning\/DeleteCanceledInvoice/.test(m)), 'a key without DeleteCanceledInvoice: the gap logged, the burn as before');
+  rxAnswer = { ok: true, mode: 'channel', fee_msat: '0', receivable_msat: '50000000', min_msat: '1000' };
+  // 10d. the deliver ask carries the claimant's proof over the invoice it hands over
+  const X5 = pair('X5');
+  await callP('POST', '/push/lock', { client_pubkey: SENDER, hash: X5.hash, amount_sats: 9000, expiry: nowS() + 72 * 3600 });
+  invoices[X5.hash].state = 'ACCEPTED'; await advance(4000);
+  farInvoices['lnfar-X5'] = { payment_hash: X5.hash, num_msat: 9_000_000, destination: FAR, preimage: X5.pre, fee_msat: 10 };
+  r = await callP('POST', '/push/deliver', { client_pubkey: RECIP, hash: X5.hash, bolt11: 'lnfar-X5' });
+  check(r.status === 401, 'F4: a delivery ask without the proof → 401');
+  r = await callP('POST', '/push/deliver', Object.assign({ client_pubkey: RECIP, hash: X5.hash, bolt11: 'lnfar-X5' }, proofFor('push-deliver', RECIP, 'deliver:' + X5.hash + ':' + RECIP + ':' + sha('lnfar-x5'))));
+  check(r.status === 200 && r.data.status === 'taken', 'F4: the proven delivery ask (the record binds the invoice, lowercased) → delivered, TAKEN');
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

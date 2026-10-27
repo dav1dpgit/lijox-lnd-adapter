@@ -34,6 +34,8 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
 | lnrpc.Lightning/UpdateChannelPolicy | per-channel fee policy enforcement (planned) — baked now so no re-bake later |
 | lnrpc.Lightning/AbandonChannel | TATARA CHANNEL POOLS (0.103.0+): drop a pool's pending inbound channel whose funding can never confirm (an input spent elsewhere, 6 deep) — called with i_know_what_i_am_doing, on pending channels of Tatara pools only (tatara-channels.js) |
 | lnrpc.Lightning/DecodePayReq, ListPayments, VerifyMessage; routerrpc.Router/SendPaymentV2 | PUSH KEY HOLDER (0.82.0+): read the recipient's provider's invoice, pay it, probe it, verify a void's signature. The same four the delegate module uses — a key without them holds and delivers on its own provider only, and cannot verify a void; the adapter probes them at boot and says so (0.83.1). In bake-permissions-nodelegate.json from 0.83.1. |
+| lnrpc.Lightning/DeleteCanceledInvoice | PUSH KEY (0.116.0+, Kimi round 2 F6): after a claim burns on this provider (the claimant's wallet refused the delivery), the canceled claim invoice is deleted so the real recipient can claim the hash here again (LND never mints a hash twice otherwise). Without it the adapter logs the gap at boot and a burned claim's hash stays unclaimable here. |
+| routerrpc.Router/XImportMissionControl | ROUTING REPORTS (baked 2026-10-25, used from the next release — docs/design/pathfinding in the wallet repo): the adapter writes the routing failures a wallet reports (signed, Privacy → LSP → Routing reports) into its own LND's mission control, so later route asks avoid them. It writes LND's routing memory only — it moves no funds. In both bake-permissions files. |
 
 ## RECOMMENDED — strict per-RPC macaroon (exactly the table above)
 
@@ -69,7 +71,9 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
       uri:/lnrpc.Lightning/ListPayments \
       uri:/lnrpc.Lightning/SendPaymentSync \
       uri:/routerrpc.Router/SendPaymentV2 \
-      uri:/lnrpc.Lightning/UpdateChannelPolicy
+      uri:/lnrpc.Lightning/UpdateChannelPolicy \
+      uri:/routerrpc.Router/XImportMissionControl \
+      uri:/lnrpc.Lightning/DeleteCanceledInvoice
 
 Then hex it into your .env:
 

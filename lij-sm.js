@@ -184,12 +184,22 @@ const handlers = {
     const it = p.hash ? intents.get(p.hash) : null;
     if (!it) return;
     if (p.phase === 'start') { if (it.state === 'HOLDING') transition(it, 'FORWARDING', 'B-10 trampoline'); return; }
+    if (p.phase === 'inflight') { if (it.state === 'HOLDING') transition(it, 'FORWARDING', 'B-10 trampoline — LND owns the inner, parked for the probe'); return; }   // 0.114.0 (F1): stays FORWARDING; the park's verdict (trampoline ok / not ok) ends it
     if (p.ok) {
       if (it.state !== 'SETTLING') transition(it, 'SETTLING', 'trampoline paid — preimage received');
       transition(it, 'SETTLED', 'inbound settled with the preimage');
     } else if (it.state === 'FORWARDING') {
       transition(it, 'HOLDING', 'trampoline did not complete — replay path');
     }
+  },
+
+  // 0.114.0 (F1): the JIT rail parked the payer's circuits because LND still owns the inner payment — the intent stays
+  // where it is (FORWARDING after an open, HOLDING for a held one); the probe's verdict arrives as settle / forward_result /
+  // trampoline ok|not ok.
+  inflight_parked(p) {
+    const it = p.hash ? intents.get(p.hash) : null;
+    if (!it) return;
+    if (it.state === 'OPENING' || it.state === 'HOLDING' || it.state === 'GATED' || it.state === 'INTERCEPTED' || it.state === 'AGGREGATING') transition(it, 'FORWARDING', `inner payment in flight at LND — ${p.circuits || '?'} circuit(s) parked (${p.kind || 'jit'})`);
   },
 
   open_started(p) {

@@ -353,6 +353,7 @@
  *   WS_PROXY_PORT=7001
  *   ADAPTER_SECRET=pick_a_random_string
  *   LIJOX_REGISTRY=            (optional — leave unset to run registry-free)
+ *   LIJOX_REGISTRIES=          (0.118.0: every registry to enroll at, comma-separated — the first is read; overrides LIJOX_REGISTRY)
  *   NODE_PUBKEY=your_lnd_node_pubkey
  *   NODE_HOST=your_public_ip:9735
  *   NODE_NAME=Your Node Name
@@ -612,15 +613,34 @@ const nwc = createNwc({
     return String((r && r.pubkey) || '').toLowerCase();
   },
 });
+// 0.113.0 (S63, DP 2026-10-26 — Push item 5, and the sender's wake of item 1): the sender's lock, found as an INCOMING
+// HTLC on the sender's OPEN channel (listchannels' pending_htlcs, hash_lock = the push's hash). Answers {ok, chan_point,
+// active, expiration_height, height} when it sits there, {ok:false, reason} when no open channel of the sender's carries
+// it (closing, closed, or settled already), {error} when LND did not answer. The Push rail refuses a claim without it.
+async function pushSenderHtlc(clientPubkey, hashHex) {
+  const want = Buffer.from(String(hashHex), 'hex').toString('base64');
+  let chans, info;
+  try { [chans, info] = await Promise.all([lndGet('/v1/channels'), lndGet('/v1/getinfo')]); } catch (e) { return { error: String(e.message || e) }; }
+  if (!chans || !Array.isArray(chans.channels)) return { error: 'listchannels gave no list' };
+  for (const c of chans.channels) {
+    if (String(c.remote_pubkey || '').toLowerCase() !== String(clientPubkey).toLowerCase()) continue;
+    const h = (c.pending_htlcs || []).find((x) => x && x.incoming && x.hash_lock === want);
+    if (h) return { ok: true, chan_point: c.channel_point, active: !!c.active, expiration_height: Number(h.expiration_height), height: Number(info && info.block_height) };
+  }
+  return { ok: false, reason: 'no open channel of the sender\'s carries this lock' };
+}
 const pushRail = createPushRail({
   dataDir: DATA_DIR,
   lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
   deliverToWallet: (args) => deliverToWallet(args), isPeerConnected: (pk) => isPeerConnected(pk),
-  sendWakePush: (pk, ms) => sendWakePush(pk, ms), authOk: (req) => authOk(req),   // 0.88.1: the claim window travels
+  sendWakePush: (pk, ms, kind) => sendWakePush(pk, ms, kind), authOk: (req) => authOk(req),   // 0.88.1: the claim window travels; 0.113.0: the kind (push_taken / push_returned to the sender)
+  senderHtlc: (pk, h) => pushSenderHtlc(pk, h),   // 0.113.0 (5)
   buildPublicHints: (amt) => lnurlpBuildPublicHints(amt),
   plRecord: (k, f) => plRecord(k, f), leaseTouch: (pk, s) => leaseTouch(pk, s), touchWalletActive: (pk) => touchWalletActive(pk),
   localPubkey: () => LOCAL_PUBKEY, log: (m) => console.log(m),
   walletReceivable: (pk, msat) => walletReceivable(pk, msat),   // 0.83.0: receivability first
+  proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),   // 0.116.0 (F4): the node key's proof on the claim routes
+  lndDelete: (p) => lndRequest('DELETE', p, null),   // 0.116.0 (F6): DeleteCanceledInvoice
 });
 // 0.72.0 (S45 #10): the PL engine — fee ledger + daily snapshots (pl.js). Created
 // at boot next to the console; the fee-realization points below write through
@@ -660,6 +680,36 @@ setInterval(() => {
   }
 }, 3600000);
 
+// 0.115.0 (S63, Kimi round 2 F17 — DP "256MiB total with the oldest past 30 days deleted first"): the tape store is
+// bounded. At the cap, the oldest tapes PAST keepMs are unlinked first (oldest first) until the new tape fits; a tape
+// younger than keepMs is never deleted — a store full of young tapes refuses the drop. Pure: dir, caps, now in; the
+// verdict out. The file name's leading number is the tape's write time.
+const TAPES_MAX_BYTES = parseInt(process.env.TAPES_MAX_BYTES || String(256 * 1024 * 1024), 10) || 256 * 1024 * 1024;
+const TAPES_KEEP_DAYS = parseInt(process.env.TAPES_KEEP_DAYS || '30', 10) || 30;
+function tapesSweep(dir, incomingBytes, maxBytes, keepMs, nowMs) {
+  const fs = require('fs'), path = require('path');
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch (_) { return { ok: true, total: 0, unlinked: 0 }; }
+  const rows = [];
+  let total = 0;
+  for (const f of files) {
+    let st; try { st = fs.statSync(path.join(dir, f)); } catch (_) { continue; }
+    if (!st.isFile()) continue;
+    const t = parseInt(f.split('-')[0], 10);
+    rows.push({ f, size: st.size, at: Number.isFinite(t) ? t : st.mtimeMs });
+    total += st.size;
+  }
+  let unlinked = 0;
+  if (total + incomingBytes > maxBytes) {
+    rows.sort((a, b) => a.at - b.at);   // the oldest first
+    for (const r of rows) {
+      if (total + incomingBytes <= maxBytes) break;
+      if (nowMs - r.at < keepMs) break;   // the rest are younger — never deleted
+      try { fs.unlinkSync(path.join(dir, r.f)); total -= r.size; unlinked += 1; } catch (_) {}
+    }
+  }
+  return { ok: total + incomingBytes <= maxBytes, total, unlinked };
+}
 async function handleTapeDrop(req, res, ip) {
   const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   if (tdRateLimited(ip)) return reply(429, { ok: false, code: 'RATE_LIMITED' });
@@ -673,6 +723,9 @@ async function handleTapeDrop(req, res, ip) {
   if (payload.length > 262144) return reply(413, { ok: false, code: 'TOO_LARGE' });
   const id8 = String(b.tape_id || Date.now()).replace(/[^0-9a-zA-Z_-]/g, '').slice(0, 24) || String(Date.now());
   const fname = require('path').join(TAPES_DIR, Date.now() + '-' + id8 + '.json');
+  const sw = tapesSweep(TAPES_DIR, Buffer.byteLength(payload), TAPES_MAX_BYTES, TAPES_KEEP_DAYS * 86400000, Date.now());   // 0.115.0 (F17)
+  if (sw.unlinked) console.log(`[TapeDrop] store at the cap (${Math.round(sw.total / 1048576)} MiB of ${Math.round(TAPES_MAX_BYTES / 1048576)}) — ${sw.unlinked} tape(s) older than ${TAPES_KEEP_DAYS} days unlinked`);
+  if (!sw.ok) { console.warn(`[TapeDrop] store FULL (${Math.round(sw.total / 1048576)} MiB, every tape younger than ${TAPES_KEEP_DAYS} days) — drop from ${pk.slice(0, 16)}… refused`); return reply(507, { ok: false, code: 'TAPES_FULL' }); }
   try { require('fs').writeFileSync(fname, payload); } catch (e) { return reply(500, { ok: false, code: 'WRITE_FAILED' }); }
   let digest = '';
   try {
@@ -806,6 +859,16 @@ const RETIRED_0900 = {
 };
 const RETIRED_0900_SET = Object.keys(RETIRED_0900).filter((n) => process.env[n] !== undefined && String(process.env[n]).trim() !== '');
 for (const n of RETIRED_0900_SET) console.warn(`[Config] ${n} is IGNORED since 0.90.0 — replaced by ${RETIRED_0900[n]}; comment the line out`);
+// 0.118.0 (S63, Phase C — docs/design/routes/phase-c-r1.md §4.4): the registry has two doors (the box's direct door,
+// registry.lightninginajar.xyz, and the worker on Cloudflare), kept level by a mirror. This box enrolls at EVERY registry
+// listed — LIJOX_REGISTRIES, comma-separated, the first the one it reads; LIJOX_REGISTRY (one address) is read as a
+// one-entry list. Empty = registry-free (v0.47 Q3). Trailing slashes dropped; repeats dropped.
+const REGISTRIES_FROM_ENV = (() => {
+  const raw = String(process.env.LIJOX_REGISTRIES || process.env.LIJOX_REGISTRY || '');
+  const out = [];
+  for (const s of raw.split(',')) { const u = s.trim().replace(/\/+$/, ''); if (u && !out.includes(u)) out.push(u); }
+  return out;
+})();
 const CONFIG = {
   lnd: {
     endpoint:      process.env.LND_ENDPOINT  || 'https://localhost:8080',
@@ -823,7 +886,8 @@ const CONFIG = {
     ws_port: parseInt(process.env.WS_PROXY_PORT || '7001'),
     secret:  process.env.ADAPTER_SECRET || '',
   },
-  registry: process.env.LIJOX_REGISTRY || '', // v0.47 (Q3): registries are OPTIONAL — empty = enroll nowhere; plural REGISTRY list lands with the LIJOX-layer restructure
+  registries: REGISTRIES_FROM_ENV,              // 0.118.0 (Phase C): every door of the registry this box enrolls at
+  registry: REGISTRIES_FROM_ENV[0] || '',       // v0.47 (Q3): registries are OPTIONAL — empty = enroll nowhere; 0.118.0: the first of the list (the one read)
   node: {
     pubkey:  process.env.NODE_PUBKEY || '',
     host:    process.env.NODE_HOST   || '',
@@ -1242,13 +1306,17 @@ function persistPushSubs() {
 // same hash: the wallet's claim reveals the preimage, which settles the
 // outer hold. We can deliver or refund (cancel); we cannot claim.
 const LNURLP_PATH = require('path').join(DATA_DIR, 'lnurlp-registry.json');  // v0.48 (D1)
-let lnurlpRegistry = {};
+// 0.113.1 (S63, Kimi round 2 F18): a NULL-PROTOTYPE object — `lnurlpRegistry['__proto__']` used to answer
+// Object.prototype (truthy), and `.client_pubkey.toLowerCase()` on it threw inside the public handler: the process
+// exited. The names themselves are refused below (lnurlpNameSafe); this is the belt.
+let lnurlpRegistry = Object.create(null);
 try {
-  lnurlpRegistry = JSON.parse(require('fs').readFileSync(LNURLP_PATH, 'utf8'));
+  lnurlpRegistry = Object.assign(Object.create(null), JSON.parse(require('fs').readFileSync(LNURLP_PATH, 'utf8')));
   console.log(`[LNURLP] loaded ${Object.keys(lnurlpRegistry).length} name(s)`);
 } catch (e) {
-  lnurlpRegistry = {};
+  lnurlpRegistry = Object.create(null);
 }
+const lnurlpNameSafe = (n) => /^[a-z0-9_-]{2,32}$/.test(n) && !/^(__proto__|constructor|prototype)$/.test(n);   // 0.113.1 (F18)
 // 0.67.0 (S43, DP — the robust static-address design, rule 2): a hash
 // carries its own expiry. The wallet registers each hash in its own engine
 // for a stated life (engine v229: 30 years) and hands the same `expires`
@@ -1262,6 +1330,7 @@ function lnurlpNowS() { return Math.floor(Date.now() / 1000); }
 function lnurlpEntryLive(e, nowS) {
   return e.status === 'free' && Number(e.expires || 0) > (nowS == null ? lnurlpNowS() : nowS);
 }
+const LNURLP_MAX_LIVE_PER_NAME = parseInt(process.env.LNURLP_MAX_LIVE_PER_NAME || '500', 10) || 500;   // 0.115.0 (F22): a name's pool of live claims (the wallet tops up at 20)
 function lnurlpLiveFree(rec) {
   const nowS = lnurlpNowS();
   return (rec && rec.entries || []).filter((e) => lnurlpEntryLive(e, nowS));
@@ -1333,13 +1402,18 @@ function lnurlpHoldMs(pubkeyHex) {
   return Math.max(0, Math.min(dial, blocksMs));
 }
 const lnurlpHoldTimers = new Map();   // hashHex -> timeout: cancels an accepted hold at the dial
-function lnurlpArmHoldTimer(name, entry) {
+function lnurlpArmHoldTimer(name, entry, msOverride) {   // 0.114.0: msOverride — the watcher's arm for a hold that predates this process
   const rec = lnurlpRegistry[name]; if (!rec) return;
-  const ms = lnurlpHoldMs(rec.client_pubkey);
+  const ms = Number.isFinite(msOverride) ? msOverride : lnurlpHoldMs(rec.client_pubkey);
   const t = lnurlpHoldTimers.get(entry.hash); if (t) clearTimeout(t);
   const fire = async () => {
     lnurlpHoldTimers.delete(entry.hash);
     if (entry.status !== 'accepted') return;   // delivered or already gone
+    if (entry._delivering || entry._inflight_at) {   // 0.114.0 (F2, this rail's twin): never cancel while the delivery is in flight — a minute more, the belt probes
+      console.log(`[LNURLP] ${name}: hold window over but the delivery is in flight hash=${entry.hash.slice(0,16)} — the hold stays a minute more`);
+      lnurlpHoldTimers.set(entry.hash, setTimeout(() => fire().catch(() => {}), 60000));
+      return;
+    }
     console.log(`[LNURLP] ${name}: hold window over (${Math.round(ms / 1000)}s) hash=${entry.hash.slice(0,16)} — cancelling, the sender's sats return`);
     await lnurlpCancelOuter(name, entry, 'hold expired');
   };
@@ -1430,17 +1504,24 @@ function lnurlpAddrHost(req, rec) {
 // registration itself (LND signmessage over a canonical line; the worker
 // recovers the node key and checks it is a registered LSP). Returns
 // 'ok' | 'taken' | 'unavailable'.
-async function lnurlpNameAt(kind, name) {
+async function lnurlpNameAt(kind, name, toPubkey) {   // 0.116.0 (K1): kind 'transfer' carries the new provider's pubkey as the fifth signed part (worker 0.15.0)
   if (!CONFIG.registry || !CONFIG.lnurlp.address_host || !CONFIG.node.pubkey) return 'unavailable';
   try {
     const ts = Math.floor(Date.now() / 1000);
-    const msg = 'lijox-name:v1:' + [kind, name, CONFIG.node.pubkey, String(ts)].map(encodeURIComponent).join(':');
+    const parts = [kind, name, CONFIG.node.pubkey, String(ts)]; if (kind === 'transfer') parts.push(String(toPubkey || ''));
+    const msg = 'lijox-name:v1:' + parts.map(encodeURIComponent).join(':');
     const signed = await lndPost('/v1/signmessage', { msg: Buffer.from(msg, 'utf8').toString('base64') });
     if (!signed || !signed.signature) return 'unavailable';
-    const r = await httpsPost(`${CONFIG.registry}/names/${kind}`, { name, lsp_pubkey: CONFIG.node.pubkey, ts, signature: signed.signature });
-    if (r && r.ok) return 'ok';
-    if (r && /taken/i.test(String(r.error || ''))) return 'taken';
-    return 'unavailable';
+    const nbody = { name, lsp_pubkey: CONFIG.node.pubkey, ts, signature: signed.signature }; if (kind === 'transfer') nbody.to_lsp_pubkey = String(toPubkey || '');
+    // 0.118.0 (Phase C): the same signed op at every door of the registry — 'taken' if any door says so, 'ok' if any
+    // door took it (the mirror levels the rest), else 'unavailable'
+    let anyOk = false;
+    for (const reg of CONFIG.registries) {
+      const r = await httpsPost(`${reg}/names/${kind}`, nbody).catch(() => null);
+      if (r && /taken/i.test(String(r.error || ''))) return 'taken';
+      if (r && r.ok) anyOk = true;
+    }
+    return anyOk ? 'ok' : 'unavailable';
   } catch (e) { return 'unavailable'; }
 }
 // 0.112.0 (S63, the external review's F7; DP "3 is a go, no grace period"): THE LIGHTNING ADDRESS IS SIGNED. /lnurl/register
@@ -1483,6 +1564,12 @@ function lnurlpAuthCheck(body, action, clientPk, recordId) {
   if (!nr.ok) return { ok: false, code: nr.code, status: 401 };
   return { ok: true };
 }
+// 0.116.0 (S63, engine v355's lsp_proof): the same check for a GET — the proof fields ride the query string.
+function proofFromQuery(sp) {
+  return { node_pubkey: String(sp.get('node_pubkey') || ''), nonce: String(sp.get('nonce') || ''), signature: String(sp.get('signature') || '') };
+}
+// 0.116.0 (F10): a proof whose record carries the time it was made — within 90 s of now, or refused.
+function proofTsOk(ts) { const t = Number(ts); return Number.isFinite(t) && Math.abs(Date.now() / 1000 - t) <= 90; }
 // 0.68.0: one boot sweep — claim every name this LSP already holds (idempotent).
 async function lnurlpNameSweep() {
   if (!CONFIG.registry || !CONFIG.lnurlp.address_host) return;
@@ -1499,6 +1586,96 @@ async function lnurlpNameSweep() {
 }
 const EMDASH = '\u2014';
 
+// ── 0.113.0 (S63, DP 2026-10-26 — docs/design/pathfinding/pathfinding-r9.md §3a–§3c, agreed 2026-10-25): ROUTING REPORTS ──
+// Only the ADAPTER writes to LND (DP). A failure message travels back along the route encrypted for the sender alone,
+// so this node, which merely forwarded the HTLC, never learns which node refused; the wallet does. After a send ends
+// the wallet sends ONE signed report — the 0.112.0 proof (lnurlpAuthCheck) over "route-report" and a record_id that
+// binds the content — and this node writes the TEMPORARY refusals into its own LND's mission control
+// (XImportMissionControl; LND keeps its newer data, no force), so the next route ask from ANY wallet here avoids them
+// until LND's own memory decays. Checks, in order: the signature; every reported pair was on a route this adapter itself
+// handed out for that hash within 15 minutes (routeHandouts); only temporary codes are imported; a per-wallet cap of
+// ROUTE_REPORT_MAX_PAIRS_PER_HOUR (20). Off really means off (§3e): a route ask's own ignored_pairs / ignored_nodes NEVER
+// enter LND's memory — only a signed report does.
+// record_id = "<hash>:<count>:<sha256 over '<from>:<to>:<scid>:<amount_msat>:<code>\n' lines, lowercased, sorted>" —
+// the twin of lij-core registry_client::route_report_record_id (route-report.test.js pins the vectors).
+function routeReportRecordId(hashHex, failures) {
+  const low = (v) => (v === undefined || v === null) ? '' : String(v).replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const lines = [];
+  for (const e of (Array.isArray(failures) ? failures : [])) {
+    if (!e || typeof e !== 'object' || Array.isArray(e)) continue;
+    lines.push(low(e.from) + ':' + low(e.to) + ':' + low(e.scid) + ':' + low(e.amount_msat) + ':' + low(e.code) + '\n');
+  }
+  lines.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+  const h = crypto.createHash('sha256');
+  for (const l of lines) h.update(l, 'utf8');
+  return low(hashHex) + ':' + lines.length + ':' + h.digest('hex');
+}
+const ROUTE_HANDOUT_LIFE_MS = 15 * 60 * 1000;
+const ROUTE_REPORT_MAX_PAIRS_PER_HOUR = parseInt(process.env.ROUTE_REPORT_MAX_PAIRS_PER_HOUR || '20', 10) || 20;
+const routeHandouts = new Map();   // payment hash → { at, pairs: Set('from:to') } — the routes this adapter handed out
+const routeReportCaps = new Map(); // wallet pubkey → [ms of imported pairs in the last hour]
+const routeReports = { received: 0, imported: 0, refused: 0, last: [] };   // the console's view
+function routeHandoutRemember(hashHex, routes) {
+  if (!hashHex || !Array.isArray(routes)) return;
+  const now = Date.now();
+  for (const [h, v] of routeHandouts) if (now - v.at > ROUTE_HANDOUT_LIFE_MS) routeHandouts.delete(h);
+  const rec = routeHandouts.get(hashHex) || { at: now, pairs: new Set() };
+  rec.at = now;
+  for (const r of routes) {
+    if (!r || !Array.isArray(r.hops)) continue;
+    let prev = String(LOCAL_PUBKEY || '').toLowerCase();
+    for (const hop of r.hops) { const pk = String((hop && hop.pub_key) || '').toLowerCase(); if (prev && pk) rec.pairs.add(prev + ':' + pk); prev = pk; }
+  }
+  routeHandouts.set(hashHex, rec);
+  if (routeHandouts.size > 2000) routeHandouts.delete(routeHandouts.keys().next().value);
+}
+function routeHopsLine(routes) {   // §3b: the hops of an answer, for the journal — pubkey prefix:scid:msat
+  const r = Array.isArray(routes) && routes[0];
+  if (!r || !Array.isArray(r.hops) || !r.hops.length) return 'none';
+  return r.hops.map((h) => `${String(h.pub_key || '').slice(0, 8)}:${h.chan_id || '?'}:${h.amt_to_forward_msat || '?'}`).join(' -> ');
+}
+function routeReportNote(line) { routeReports.last.push({ at: Date.now(), line }); while (routeReports.last.length > 30) routeReports.last.shift(); }
+async function routeReportHandle(body, res, ip) {
+  routeReports.received++;
+  const pk = String((body && body.client_pubkey) || '').toLowerCase();
+  const hash = String((body && body.payment_hash) || '').toLowerCase();
+  const failures = Array.isArray(body && body.failures) ? body.failures : null;
+  if (!/^[0-9a-f]{66}$/.test(pk) || !/^[0-9a-f]{64}$/.test(hash) || !failures) { routeReports.refused++; return errResponse(res, 'client_pubkey, payment_hash and failures required', 400); }
+  if (failures.length > 64) { routeReports.refused++; return errResponse(res, 'too many failures in one report', 400); }
+  const auth = lnurlpAuthCheck(body, 'route-report', pk, routeReportRecordId(hash, failures));
+  if (!auth.ok) { routeReports.refused++; routeReportNote(`${pk.slice(0, 16)}… ${hash.slice(0, 12)}…: refused (${auth.code})`); return errResponse(res, 'route report refused: ' + auth.code, auth.status); }
+  const handout = routeHandouts.get(hash);
+  const local = String(LOCAL_PUBKEY || '').toLowerCase();
+  const nowS = Math.floor(Date.now() / 1000);
+  const pairs = [];
+  const skipped = { not_on_route: 0, permanent: 0, own_link: 0, malformed: 0, capped: 0 };
+  const caps = (routeReportCaps.get(pk) || []).filter((t) => Date.now() - t < 3600000);
+  for (const e of failures) {
+    const from = String((e && e.from) || '').toLowerCase(), to = String((e && e.to) || '').toLowerCase();
+    const msat = Number((e && e.amount_msat) || 0); const code = String((e && e.code) || '').toLowerCase();
+    if (!/^[0-9a-f]{66}$/.test(from) || !/^[0-9a-f]{66}$/.test(to) || !(msat > 0)) { skipped.malformed++; continue; }
+    if (code !== 'temporary') { skipped.permanent++; continue; }
+    if (from === local) { skipped.own_link++; continue; }   // LND knows its own channels' balances
+    if (!handout || !handout.pairs.has(from + ':' + to)) { skipped.not_on_route++; continue; }
+    if (caps.length >= ROUTE_REPORT_MAX_PAIRS_PER_HOUR) { skipped.capped++; continue; }
+    caps.push(Date.now());
+    pairs.push({ node_from: Buffer.from(from, 'hex').toString('base64'), node_to: Buffer.from(to, 'hex').toString('base64'), history: { fail_time: String(nowS), fail_amt_msat: String(Math.floor(msat)), fail_amt_sat: String(Math.floor(msat / 1000)) } });
+  }
+  routeReportCaps.set(pk, caps);
+  let imported = 0, lndNote = '';
+  if (pairs.length) {
+    try {
+      const r = await lndPost('/v2/router/x/importhistory', { pairs, force: false });
+      if (r && (r.code || (r.error && r.error.message))) { lndNote = 'LND: ' + String(r.message || (r.error && r.error.message)); }
+      else imported = pairs.length;
+    } catch (e) { lndNote = 'LND: ' + e.message; }
+  }
+  routeReports.imported += imported;
+  const line = `${pk.slice(0, 16)}… ${hash.slice(0, 12)}…: ${failures.length} refusal(s) reported, ${imported} imported` + (lndNote ? ` (${lndNote})` : '') + ` — skipped: not on a route of ours ${skipped.not_on_route}, permanent ${skipped.permanent}, own link ${skipped.own_link}, capped ${skipped.capped}, malformed ${skipped.malformed}`;
+  console.log(`[ROUTE-REPORT] ${line} (from ${ip})`);
+  routeReportNote(line);
+  return jsonResponse(res, { ok: true, received: failures.length, imported, skipped, lnd: lndNote || null });
+}
 function lnurlpMetadata(name, host) {
   return JSON.stringify([
     ['text/plain', 'Pay ' + name + ' — Lightning in a Jar'],
@@ -1766,9 +1943,14 @@ async function lnurlpProbeInflight(name, entry) {
   const pay = (r && r.payments || []).find((x) => String(x.payment_hash || '').toLowerCase() === entry.hash);
   if (!pay) { if (Date.now() - entry._inflight_at > 120000) delete entry._inflight_at; return; }
   if (pay.status === 'SUCCEEDED' && /^[0-9a-f]{64}$/i.test(String(pay.payment_preimage || ''))) {
-    try { await lndPost('/v2/invoices/settle', { preimage: Buffer.from(pay.payment_preimage, 'hex').toString('base64') }); }
-    catch (e) { console.error(`[LNURLP] ${name}: OUTER SETTLE FAILED after late inner success (${e.message}) — hash=${entry.hash} MANUAL ATTENTION`); }
-    entry.status = 'settled'; entry.settled_at = Date.now(); delete entry._inflight_at; lnurlpPersist(); lnurlpStopWatch(entry.hash);
+    entry.preimage = Buffer.from(pay.payment_preimage, 'hex').toString('base64');   // 0.114.0 (F3)
+    try { await lndSettleHoldOrThrow(entry.preimage); }
+    catch (e) {
+      entry.status = 'settle_pending'; entry.settle_error = String(e.message || e).slice(0, 160); entry.settle_tries = (entry.settle_tries || 0) + 1; delete entry._inflight_at; lnurlpPersist();
+      console.error(`[LNURLP] ${name}: OUTER SETTLE FAILED after late inner success (${entry.settle_error}) — hash=${entry.hash} settle_pending, the watcher retries`);
+      return;
+    }
+    entry.status = 'settled'; entry.settled_at = Date.now(); delete entry._inflight_at; delete entry.settle_error; lnurlpPersist(); lnurlpStopWatch(entry.hash);
     console.log(`[LNURLP] ${name}: SETTLED (late — inner succeeded after the RPC deadline) hash=${entry.hash.slice(0,16)}…`);
   } else if (pay.status === 'FAILED') {
     delete entry._inflight_at;
@@ -1790,12 +1972,24 @@ async function lnurlpProbeInflight(name, entry) {
 //   { kind: 'refuse', reason }   — permanent for this amount (fee ≥ amount; the reserve floor)
 //   { kind: 'retry', reason }    — try again on the next sweep (open failed, no tip, channel unlisted)
 //   { kind: 'rejected', error }  — SendToRoute rejected before an attempt existed
+// 0.117.0 (S63, Kimi round 2 F21 — DP "Go ahead … be triply careful"): ONE CHANNEL OPEN PER WALLET AT A TIME on the
+// delivery rail. Two deliveries to one wallet in the same moment (an address sweep and a Push claim; two payments to
+// one name) both saw "no room", both passed the reserve check (the chain balance has not moved yet) and both opened —
+// two channels, two chain fees, the floor undercut by one funding; and a 'retry' after the RPC deadline re-entered
+// while LND was still opening the first. Now the second caller answers 'retry' (the sweep's next tick, as any retry);
+// the reserve check subtracts fundings committed to opens in flight; a re-entry asks LND for pending channels to the
+// wallet before opening again; after a deadline the record stays 90 s so the next tick asks LND first. The JIT
+// interceptor path (openChannelAndForward) is untouched — it has its own per-promise lock and settle-all.
+const deliverOpening = new Map();   // client pubkey → { at, sizeSats, tag, deadline: bool }
+const DELIVER_OPEN_HOLD_MS = 90000;
+function deliverReservedFundingSats() { let s = 0; for (const o of deliverOpening.values()) s += Number(o.sizeSats) || 0; return s; }
 async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat: fixedFeeMsat, finalCltvDelta, tag, jitTag }) {
   let guardCp = '';   // 0.104.0: set when THIS call opened the channel; its payment's outcome is reported to the guard below
   const amt = BigInt(amountMsat);
   const T = tag || 'deliver';
   let chan = await lnurlpClientChannel(client);
   let feeMsat = 0n;
+  if (chan && deliverOpening.has(client)) deliverOpening.delete(client);   // 0.117.0 (F21): the channel is listed — whatever open we remembered is done
   if (!chan || chan.room_msat < amt) {   // 0.84.0: the room LND will send (reserve, commit fee, fee buffer, margin already off)
     // JIT path: same fee law as every channel-opening receive (or the fee the wallet was promised).
     feeMsat = (fixedFeeMsat !== undefined && fixedFeeMsat !== null) ? BigInt(fixedFeeMsat) : lnurlpFeeMsat(amt, client);
@@ -1812,10 +2006,30 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       console.error(`[JIT-GUARD] wallet ${client.slice(0,16)}… is BLOCKED from JIT opens (${T}) — its own failed opens; clears 24 h after the last, or from the Console`);
       return { kind: 'refuse', reason: 'this wallet is blocked from JIT opens by the guard' };
     }
-    if (!(await jitReserveOk(sizeSats, jitTag || T))) {
+    // 0.117.0 (F21): one open per wallet at a time — another delivery is opening for this wallet right now (retry: the
+    // sweep's next tick), or the last open's RPC outran its deadline less than 90 s ago: then LND's pending list says
+    // whether that open landed (wait for it to list) or not (open again). The pending list is read ONLY after a
+    // deadline — a wallet with some other pending channel (a channel pool's, say) is not held back by it.
+    const _op = deliverOpening.get(client);
+    if (_op && Date.now() - _op.at < DELIVER_OPEN_HOLD_MS) {
+      if (!_op.deadline) {
+        console.log(`[${T}]: an open to ${client.slice(0,16)}… is in flight (${_op.tag}, ${Math.round((Date.now() - _op.at) / 1000)} s ago) — this delivery waits (retry)`);
+        return { kind: 'retry', reason: 'an open to this wallet is in flight' };
+      }
+      let _pendingToPeer = 0;
+      try { _pendingToPeer = await jitPendingOpensToPeer(client); } catch (_) { _pendingToPeer = 0; }
+      if (_pendingToPeer > 0) {
+        console.log(`[${T}]: the open to ${client.slice(0,16)}… that outran its deadline ${Math.round((Date.now() - _op.at) / 1000)} s ago is pending in LND — waiting for it to list (retry), not opening another`);
+        return { kind: 'retry', reason: 'a channel to this wallet is already opening' };
+      }
+      console.log(`[${T}]: the open to ${client.slice(0,16)}… that outran its deadline is neither pending nor listed — opening again`);
+      deliverOpening.delete(client);
+    } else if (_op) deliverOpening.delete(client);
+    if (!(await jitReserveOk(sizeSats + deliverReservedFundingSats(), jitTag || T))) {   // 0.117.0 (F21): the reserve counts the opens in flight
       return { kind: 'refuse', reason: 'LSP on-chain reserve floor' };
     }
     console.log(`[${T}]: no usable channel — zero-conf JIT open ${sizeSats} sats to ${client.slice(0,16)}…`);
+    deliverOpening.set(client, { at: Date.now(), sizeSats, tag: T, deadline: false });
     try {
       leaseRememberWalletPeer(client);   // 0.72.3: a JIT open marks the peer as a wallet for the lease
       await openChannelSync(lightningOpenChannelClient, {
@@ -1833,12 +2047,15 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       }, CONFIG.lsps2.openchannel_timeout_ms);
     } catch (e) {
       console.error(`[${T}]: open failed (${e.message}) — will retry`);
+      if (/DEADLINE|deadline|timed? ?out/i.test(String(e.message || e))) { const o = deliverOpening.get(client); if (o) o.deadline = true; }   // 0.117.0 (F21): LND may still be opening — the record stays 90 s; the next tick asks LND's pending list first
+      else deliverOpening.delete(client);
       return { kind: 'retry', reason: 'open failed: ' + e.message };
     }
     for (let i = 0; i < 24 && !chan; i++) {
       await new Promise((r2) => setTimeout(r2, 500));
       chan = await lnurlpClientChannel(client);
     }
+    deliverOpening.delete(client);   // 0.117.0 (F21): the open call returned — listed or not, the next caller reads LND
     if (!chan) { console.error(`[${T}]: opened channel never listed — retry`); return { kind: 'retry', reason: 'opened channel never listed' }; }
     jitRecordOpen(client);   // v0.32.0: per-wallet open counter
     guardCp = chan.channel_point || ''; jitGuard.recordOpen(guardCp, client, sizeSats, T.toLowerCase().split(' ')[0]);   // 0.104.0
@@ -1934,14 +2151,20 @@ async function lnurlpDeliver(name, entry) {
     const preB64 = Buffer.isBuffer(attempt.preimage)
       ? attempt.preimage.toString('base64')
       : Buffer.from(attempt.preimage, attempt.preimage.length === 64 ? 'hex' : 'base64').toString('base64');
+    entry.preimage = preB64; entry.delivered_msat = String(innerMsat); entry.fee_kept_msat = String(feeMsat);   // 0.114.0 (F3): kept — a settle that fails is retried with it
     try {
-      await lndPost('/v2/invoices/settle', { preimage: preB64 });
+      await lndSettleHoldOrThrow(preB64);
     } catch (e) {
-      console.error(`[LNURLP] ${name}: OUTER SETTLE FAILED after inner success (${e.message}) — hash=${entry.hash} MANUAL ATTENTION`);
+      // 0.114.0 (F3): the recipient is paid; the payer's HTLC stays ACCEPTED until the settle lands — settle_pending,
+      // the watcher retries the settle alone (never the inner); the bookkeeping follows the real settle
+      entry.status = 'settle_pending'; entry.settle_error = String(e.message || e).slice(0, 160); entry.settle_tries = (entry.settle_tries || 0) + 1;
+      delete entry._delivering; lnurlpPersist();
+      console.error(`[LNURLP] ${name}: OUTER SETTLE FAILED after inner success (${entry.settle_error}) — hash=${entry.hash} settle_pending, the watcher retries`);
+      return;
     }
     entry.status = 'settled';
     entry.settled_at = Date.now();
-    delete entry._delivering;
+    delete entry._delivering; delete entry.settle_error;
     lnurlpPersist();
     lnurlpStopWatch(entry.hash);
     console.log(`[LNURLP] ${name}: SETTLED ${innerMsat} msat delivered, fee ${feeMsat} msat kept, hash=${entry.hash.slice(0,16)}…`);
@@ -2051,17 +2274,30 @@ function lnurlpWatch(name, entry) {
         if (!lnurlpHoldTimers.has(entry.hash)) {   // 0.75.2: a hold that predates this process gets its clock from accepted_at
           const rec2 = lnurlpRegistry[name];
           const left = rec2 ? lnurlpHoldMs(rec2.client_pubkey) - (Date.now() - (entry.accepted_at || Date.now())) : 0;
-          if (left <= 0) { lnurlpCancelOuter(name, entry, 'hold expired').catch(() => {}); }
-          else { lnurlpHoldTimers.set(entry.hash, setTimeout(() => { lnurlpHoldTimers.delete(entry.hash); if (entry.status === 'accepted') lnurlpCancelOuter(name, entry, 'hold expired').catch(() => {}); }, left)); }
+          if (left <= 0 && !(entry._delivering || entry._inflight_at)) { lnurlpCancelOuter(name, entry, 'hold expired').catch(() => {}); }
+          else { lnurlpArmHoldTimer(name, entry, Math.max(left, 60000)); }   // 0.114.0 (F2): the one timer, with its in-flight guard
         }
         // v0.28.0 (S30): watcher belt — re-attempt every 4s while accepted;
         // deliverer self-guards (online, in-flight), so this is near-free.
         lnurlpDeliver(name, entry).catch((e) => console.error(`[LNURLP] watcher deliver error: ${e.message}`));
+      } else if (state === 'ACCEPTED' && entry.status === 'settle_pending') {   // 0.114.0 (F3): the settle alone, retried every 15 s
+        if (entry.preimage && (!entry.settle_last_try || Date.now() - entry.settle_last_try >= 15000)) {
+          entry.settle_last_try = Date.now();
+          try {
+            await lndSettleHoldOrThrow(entry.preimage);
+            entry.status = 'settled'; entry.settled_at = Date.now(); delete entry.settle_error; lnurlpPersist(); lnurlpStopWatch(entry.hash);
+            const rec3 = lnurlpRegistry[name]; const feeK = Number(entry.fee_kept_msat || 0);
+            plRecord(feeK > 0 ? 'open_fee' : 'hold_fee', { msat: feeK, moved_msat: Number(entry.delivered_msat || entry.amount_msat || 0), wallet: rec3 ? rec3.client_pubkey : '', name, hash: entry.hash });
+            if (rec3) leaseTouch(rec3.client_pubkey, 'lnurl:delivered');
+            console.log(`[LNURLP] ${name}: SETTLED on retry hash=${entry.hash.slice(0,16)}… (try ${entry.settle_tries})`);
+          } catch (e) { entry.settle_error = String(e.message || e).slice(0, 160); entry.settle_tries = (entry.settle_tries || 0) + 1; lnurlpPersist(); }
+        }
       } else if (state === 'SETTLED') {
-        if (entry.status !== 'settled') { entry.status = 'settled'; lnurlpPersist(); }
+        if (entry.status !== 'settled') { entry.status = 'settled'; delete entry.settle_error; lnurlpPersist(); }
         lnurlpStopWatch(entry.hash);
       } else if (state === 'CANCELED') {
-        if (entry.status !== 'burned' && entry.status !== 'chit') { entry.status = 'burned'; entry.burn_reason = 'canceled/expired'; lnurlpPersist(); }   // 0.91.0: a chit's cancel is not a burn
+        if (entry.status === 'settle_pending') { entry.status = 'paid_unsettled'; entry.burn_reason = 'the recipient was paid but the payer\'s hold was cancelled before the settle — MANUAL ATTENTION'; lnurlpPersist(); console.error(`[LNURLP] ${name}: PAID BUT UNSETTLED hash=${entry.hash} (${entry.settle_error || 'settle failed'}) — MANUAL ATTENTION`); }   // 0.114.0 (F3)
+        else if (entry.status !== 'burned' && entry.status !== 'chit') { entry.status = 'burned'; entry.burn_reason = 'canceled/expired'; lnurlpPersist(); }   // 0.91.0: a chit's cancel is not a burn
         lnurlpStopWatch(entry.hash);
       } else if (state === 'OPEN' && entry.status === 'reserved' && Date.now() - started > 1500000) {
         // 0.67.0: 25 min unpaid (invoice life is 20): past expiry — stop watching; LND cancels it.
@@ -2079,7 +2315,7 @@ function lnurlpBootResume() {
   let resumed = 0;
   for (const [name, rec] of Object.entries(lnurlpRegistry)) {
     for (const entry of (rec.entries || [])) {
-      if (entry.status === 'reserved' || entry.status === 'accepted') {
+      if (entry.status === 'reserved' || entry.status === 'accepted' || entry.status === 'settle_pending') {   // 0.114.0 (F3): a pending settle is resumed
         delete entry._delivering;
         lnurlpWatch(name, entry);
         resumed += 1;
@@ -2347,7 +2583,7 @@ const tatara = createTatara({
   },
   sendWakePush: (pk, kind) => sendWakePush(pk, undefined, kind),   // 0.98.0: the start wakes the seat's wallet, {t:"tatara"}
   // 0.100.0: the registry's records (a forwarded payout goes only to a relay a registered provider declares)
-  listProviders: async () => { if (!CONFIG.registry) return []; const r = await httpsGetJson(CONFIG.registry + '/lsps'); return (r && r.json && Array.isArray(r.json.lsps)) ? r.json.lsps : []; },
+  listProviders: async () => { for (const reg of CONFIG.registries) { const r = await httpsGetJson(reg + '/lsps'); if (r && r.json && Array.isArray(r.json.lsps)) return r.json.lsps; } return []; },   // 0.118.0: the first door that answers
   getJson: (u) => httpsGetJson(u),   // 0.100.0: coin checks and the settlement check
   // 0.101.0 (door 1, (b)): the start pushed to a seat's own wake address (a subscription the phone made for that seat alone)
   sendToSubscription: async (sub, payload) => { if (!PUSH_ENABLED) return; await webpush.sendNotification(sub, JSON.stringify(payload), { TTL: 180 }); },
@@ -2475,6 +2711,16 @@ async function handleInterceptedHtlc(req) {
   };
 
   try {
+    {   // 0.114.0 (F1): a re-delivered (the interceptor stream came back) or sibling HTLC of a parked hash joins the park — the probe resolves it
+      const _pkHex = (req.payment_hash && req.payment_hash.toString) ? req.payment_hash.toString('hex') : '';
+      const _park = _pkHex ? jitInflight.get(_pkHex) : null;
+      if (_park) {
+        const ck = req.incoming_circuit_key; const key = ck ? `${ck.chan_id || '0'}:${ck.htlc_id || '0'}` : '';
+        if (ck && !_park.circuits.some((c) => `${c.chan_id || '0'}:${c.htlc_id || '0'}` === key)) _park.circuits.push(ck);
+        console.log(`[LSPS2] 0.114.0: HTLC for parked hash ${_pkHex.slice(0,16)}… joins the park (${_park.circuits.length} circuit(s))`);
+        return null;
+      }
+    }
     const outgoingScidDecimal = req.outgoing_requested_chan_id;
     if (!outgoingScidDecimal || outgoingScidDecimal === '0') return RESUME;
 
@@ -2524,7 +2770,15 @@ async function handleInterceptedHtlc(req) {
               if (dPromise._shard_sum_msat < dGross) {
                 return null;  // HOLD — siblings complete the aggregate
               }
-              console.log(`[LSPS2] B-16 aggregation COMPLETE via divert — one open+forward`);
+// 0.113.1 (S63, Kimi round 2 F8): the 0.111.0 overshoot gate on the divert path too — a set whose sum is ABOVE the
+      // declared gross would fund a channel LND then refuses to forward through (a funded-but-failed open). Fail the set
+      // whole, nothing opens; the payer's wallet retries a clean set.
+      if (dPromise._shard_sum_msat > dGross) {
+        console.warn(`[LSPS2] B-16 divert: shard sum ${dPromise._shard_sum_msat} msat > gross ${dGross} — FAILing the set whole, nothing opens (0.113.1 F8)`);
+        jitFailSiblings(dPromise, req, 'B-16 overshoot');
+        return FAIL_TEMP;
+      }
+                    console.log(`[LSPS2] B-16 aggregation COMPLETE via divert — one open+forward`);
               if (inFlightOpens.has(_bind.scidHex)) {
                 console.log(`[LSPS2] B-16: open already in flight for scid=${_bind.scidHex} — HOLD shard for settle-all`);
                 return null;
@@ -2567,6 +2821,11 @@ async function handleInterceptedHtlc(req) {
             const _eHash = req.payment_hash ? Buffer.from(req.payment_hash).toString('hex') : null;
             if (_eHash && invoiceSecretsByHash.has(_eHash) && !promiseByPaymentHash.has(_eHash)) {
               const _cands = [];
+              const _reg = invoiceSecretsByHash.get(_eHash);   // 0.117.0 (B-19 b): the entry names its promise (jit_scid) when the invoice was a JIT one (engine v356)
+              if (_reg && _reg.jit_scid && pendingJitBuys.has(_reg.jit_scid)) {
+                const _np = pendingJitBuys.get(_reg.jit_scid);
+                if (_np && _np.client_pubkey === c.remote_pubkey && Date.now() <= _np.reservation_expires_at && BigInt(_np.payment_size_msat || 0) > 0n) _cands.push([_reg.jit_scid, _np]);
+              } else
               for (const [_psc, _ppr] of pendingJitBuys) {
                 // v0.56.2 (run-2 conviction): FIXED promises only. A variable
                 // promise has payment_size 0 — gross 0 — so the F1 size gate
@@ -2599,7 +2858,13 @@ async function handleInterceptedHtlc(req) {
                 const _plausible = (_hOut > 0n)
                   && (_alreadyHeld + _hOut <= _gGross)
                   && !(_hOut * 100n < _gGross && _hOut < 10000000n);
-                if (!_plausible) {
+                // 0.117.0 (S63, Kimi round 2 F9 — DP's (b)): THE SECRET GATE. The hash's registered secret must be the
+                // promise's own (the engine registers a JIT invoice's secret by scid AND by hash, v356). A plain invoice's
+                // hash — the only kind the store held before — can never match, so B-19 no longer captures one.
+                const _secretOk = !!(_reg && _pr.payment_secret && Buffer.isBuffer(_pr.payment_secret) && String(_reg.payment_secret || '').toLowerCase() === _pr.payment_secret.toString('hex'));
+                if (!_secretOk) {
+                  console.warn(`[LSPS2] B-19 bind REFUSED: hash=${_eHash.slice(0,16)}… registered secret is not promise scid=${_sc}'s (${_reg && _reg.jit_scid ? 'a JIT invoice of another promise' : 'a plain invoice'}) — not this payment; falling through to offline evaluation (0.117.0)`);
+                } else if (!_plausible) {
                   // v0.56.2 (S36, DP run-2 conviction, journal 18:31:26): the
                   // refusal means "not THIS promise's payment" — it says
                   // NOTHING about peer reachability. The old raw RESUME here
@@ -2610,7 +2875,24 @@ async function handleInterceptedHtlc(req) {
                   // is genuinely offline and RESUMEs when it is live.
                   console.warn(`[LSPS2] F1 B-19 bind REFUSED: HTLC ${_hOut}msat implausible for promise gross ${_gGross}msat (held ${_alreadyHeld}) -- not this payment; falling through to offline evaluation (v0.56.2)`);
                 } else {
-                if (!_pr._shards) { _pr._shards = new Map(); _pr._shard_sum_msat = 0n; }
+                if (!_pr._shards) {
+                  _pr._shards = new Map(); _pr._shard_sum_msat = 0n;
+                  // 0.117.0 (B-19 b): THE WINDOW TIMER, as the main path arms it (B-11) — a set that stays short fails
+                  // back and resets instead of sitting until LND's auto-fail (Kimi's "no window timer")
+                  _pr._agg_deadline = Date.now() + (CONFIG.lsps2.agg_window_s * 1000);
+                  const _winPr = _pr;
+                  setTimeout(() => {
+                    if (_winPr._shards && _winPr._shard_sum_msat < (BigInt(_winPr.payment_size_msat) + BigInt(_winPr.fee_msat))) {
+                      console.warn(`[LSPS2] B-11 window (armed by B-19) closed short: ${_winPr._shard_sum_msat} msat across ${_winPr._shards.size} shard(s) -- FAILing all`);
+                      try { SM.emit('agg_window_short', { hash: _winPr._b16_hash || null }); } catch (_) {}
+                      if (_winPr._b16_hash) promiseByPaymentHash.delete(_winPr._b16_hash);
+                      if (htlcInterceptor && htlcInterceptor.getCounters && htlcInterceptor.getCounters()._lastWrite) {
+                        for (const [, sh] of _winPr._shards) htlcInterceptor.getCounters()._lastWrite({ incoming_circuit_key: sh.incoming_circuit_key, action: 'FAIL', failure_code: 15 });
+                      }
+                      _winPr._shards = null; _winPr._shard_sum_msat = 0n; _winPr._agg_deadline = 0; _winPr._agg_completed = false;
+                    }
+                  }, CONFIG.lsps2.agg_window_s * 1000 + 250);
+                }
                 _pr._b16_hash = _eHash;
                 promiseByPaymentHash.set(_eHash, { promise: _pr, scidHex: _sc });
                 const _dOut = BigInt(req.outgoing_amount_msat || '0');
@@ -3114,6 +3396,12 @@ function scheduleHtlcWatchdog(paymentHashHex, autoFailHeight, capMs) {
     ? (_beltHeld.entries || [ { incoming_circuit_key: _beltHeld.incoming_circuit_key } ]).map(e => e.incoming_circuit_key)
     : [];
   const handle = setTimeout(() => {
+    if (jitInflight.has(paymentHashHex)) {   // 0.114.0 (F1): the inner is LND's — the probe resolves it; look again in two minutes
+      console.warn(`[LSPS2] watchdog: ${paymentHashHex.slice(0,16)}… is parked with its inner in flight — re-arming 2 min`);
+      htlcWatchdogs.delete(paymentHashHex);
+      scheduleHtlcWatchdog(paymentHashHex, autoFailHeight, 120000);
+      return;
+    }
     const held = pendingHtlcsForOfflineWallets.get(paymentHashHex);
     if (!held) {
       // v0.54.1 (b): record gone but resolution never written — the exact
@@ -3272,7 +3560,18 @@ function handleVariableShard(req, promise, outgoingScidHex, paymentHashHex) {
   if (promise._var_timer) clearTimeout(promise._var_timer);
   promise._var_timer = setTimeout(() => {
     flushVariable(promise, outgoingScidHex, paymentHashHex).catch((e) => {
-      console.error(`[LSPS2] v0.20 flush error for scid=${outgoingScidHex}: ${e.message}`);
+      // 0.113.1 (F5): a throw inside the flush used to leave `_var_flushing` true (every later flush skipped) and the
+      // parts held until LND's auto-fail. Now: every part FAILed back, the aggregate reset, the flag cleared — the
+      // payer's wallet retries and a clean flush follows.
+      console.error(`[LSPS2] v0.20 flush error for scid=${outgoingScidHex}: ${e.message} — FAILing every part, aggregate reset`);
+      try {
+        const _w = (htlcInterceptor && htlcInterceptor.getCounters && htlcInterceptor.getCounters()._lastWrite) || null;
+        if (_w && promise._shards) for (const [, sh] of promise._shards) { try { _w({ incoming_circuit_key: sh.incoming_circuit_key, action: 'FAIL', failure_code: 15 }); } catch (_) {} }
+        if (promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
+        try { SM.emit('var_flush_failed', { hash: paymentHashHex, why: 'flush threw: ' + e.message }); } catch (_) {}
+      } finally {
+        promise._shards = null; promise._shard_sum_msat = 0n; promise._var_flushing = false;
+      }
     });
   }, CONFIG.lsps2.variable_quiesce_ms);
 
@@ -3409,7 +3708,7 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
     custom_records: {},
   };
 
-  console.log(`[LSPS2] v0.20 QUIESCENCE FLUSH: ${promise._shards.size} part(s), gross=${sum} fee=${fee} net=${net} — opening (sized from ${sizingMsat} msat)`);
+  console.log(`[LSPS2] v0.20 QUIESCENCE FLUSH: ${promise._shards.size} part(s), gross=${sum} fee=${fee} net=${net} — opening (sized from ${sum} msat)`);   // 0.113.1 (F5): `sizingMsat` was undeclared since 0.111.0 — strict mode threw here, before every online open-amount open
   inFlightOpens.add(scidHex);
   let resp = null;
   try {
@@ -3452,6 +3751,126 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
   }
 }
 
+// 0.114.0 (S63, Kimi round 2 F1 — DP "Agreed" 2026-10-26 17:00): when LND still owns the inner payment to the wallet
+// (the 30-s bomb fired, or SendToRoute says an attempt is in flight), the payer's HTLC(s) are HELD, not failed. The park
+// keeps every circuit of the hash; a probe asks LND what became of the payment (ListPayments — the LNURLP belt's way):
+// SUCCEEDED → every inbound SETTLED with the preimage and the success bookkeeping; FAILED → every inbound FAILed and
+// the guard told; and three blocks before LND would fail the inbound itself (auto_fail_height) the probe FAILs it —
+// the one residue: an inner that settles after that is paid from the operator's balance (MANUAL ATTENTION logged).
+// Before: FAIL_TEMP at once, and a late inner success paid the wallet while the payer had been refunded.
+const jitInflight = new Map();   // payment hash → { circuits, promise, scidHex, guardCp, forwardAmountMsat, auto_fail_height, at, kind, held, why }
+const JIT_INFLIGHT_HEADROOM_BLOCKS = 3;
+const JIT_INFLIGHT_MAX_MS = 6 * 3600 * 1000;   // with no tip at all: six hours, then FAIL
+let jitListPaymentsBlind = false;
+function jitInflightPark(o) {
+  const circuits = [];
+  const seen = new Set();
+  const add = (c) => { if (!c) return; const k = `${c.chan_id || '0'}:${c.htlc_id || '0'}`; if (seen.has(k)) return; seen.add(k); circuits.push(c); };
+  if (o.req) add(o.req.incoming_circuit_key);
+  if (o.promise && o.promise._shards) for (const sh of o.promise._shards.values()) add(sh.incoming_circuit_key);
+  for (const c of (o.circuits || [])) add(c);
+  const held = o.held || pendingHtlcsForOfflineWallets.get(o.hash) || null;
+  if (held) for (const e of (held.entries || [{ incoming_circuit_key: held.incoming_circuit_key }])) add(e.incoming_circuit_key);
+  const rec = { hash: o.hash, circuits, promise: o.promise || null, scidHex: o.scidHex || null, guardCp: o.guardCp || '', forwardAmountMsat: String(o.forwardAmountMsat || '0'),
+    auto_fail_height: parseInt(o.autoFailHeight, 10) || (held && parseInt(held.auto_fail_height, 10)) || 0, at: Date.now(), kind: o.kind || 'jit', held, why: o.why || '' };
+  jitInflight.set(o.hash, rec);
+  console.warn(`[LSPS2] 0.114.0: inner payment for ${o.hash.slice(0,16)}… is LND's (${rec.why}) — ${circuits.length} inbound circuit(s) HELD, probing ListPayments (FAIL by block ${rec.auto_fail_height ? rec.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS : '?'})`);
+  try { SM.emit('inflight_parked', { hash: o.hash, circuits: circuits.length, kind: rec.kind }); } catch (_) {}
+  return rec;
+}
+function jitInflightWrite(rec, resp) {
+  const w = (htlcInterceptor && htlcInterceptor.getCounters && htlcInterceptor.getCounters()._lastWrite) || null;
+  if (!w) return 0;
+  let n = 0;
+  for (const c of rec.circuits) { try { w(Object.assign({ incoming_circuit_key: c }, resp)); n += 1; } catch (_) {} }
+  return n;
+}
+function jitInflightClear(rec) {
+  if (rec.promise) {
+    if (rec.promise._b16_hash) promiseByPaymentHash.delete(rec.promise._b16_hash);
+    rec.promise._shards = null; rec.promise._shard_sum_msat = 0n; rec.promise._agg_deadline = 0; rec.promise._agg_completed = false; rec.promise._var_flushing = false;
+  }
+  if (rec.held) { pendingHtlcsForOfflineWallets.delete(rec.hash); cancelHtlcWatchdog(rec.hash); }
+  resolvedHtlcHashes.add(rec.hash);
+  jitInflight.delete(rec.hash);
+}
+function jitInflightSettle(rec, preimageHex) {
+  const n = jitInflightWrite(rec, { action: 'SETTLE', preimage: Buffer.from(preimageHex, 'hex') });
+  console.log(`[LSPS2] 0.114.0: inner payment for ${rec.hash.slice(0,16)}… SUCCEEDED late — ${n} inbound circuit(s) SETTLED with the preimage`);
+  trampolineForwardsSucceeded += 1;
+  if (rec.promise) {
+    try { jitGuard.settle(rec.guardCp); } catch (_) {}
+    try { plRecord('open_fee', { msat: Number(rec.promise.fee_msat || 0), moved_msat: Number(rec.forwardAmountMsat), wallet: rec.promise.client_pubkey, hash: rec.hash, scarcity_pct: rec.promise.scarcity_mult_pct || 100 }); } catch (_) {}
+    try { leaseTouch(rec.promise.client_pubkey, 'jit:settled'); } catch (_) {}
+    if (rec.scidHex) pendingJitBuys.delete(rec.scidHex);
+  }
+  if (rec.held) { offlineHtlcsSettled += 1; try { SM.emit('trampoline', { hash: rec.hash, ok: true }); } catch (_) {} }
+  try { SM.emit('settle', { hash: rec.hash }); } catch (_) {}
+  jitInflightClear(rec);
+}
+function jitInflightFail(rec, reason, tellGuard) {
+  const n = jitInflightWrite(rec, { action: 'FAIL', failure_code: 15 });
+  console.warn(`[LSPS2] 0.114.0: inner payment for ${rec.hash.slice(0,16)}… ${reason} — ${n} inbound circuit(s) FAILed back to the payer`);
+  trampolineForwardsFailed += 1;
+  if (rec.promise) {
+    if (tellGuard) { try { jitGuard.fail(rec.guardCp, String(reason)); } catch (_) {} }
+    if (['INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', 'FINAL_INCORRECT_CLTV_EXPIRY', 'FINAL_INCORRECT_HTLC_AMOUNT'].some((c) => String(reason).includes(c))) rec.promise._finalVerdict = String(reason);
+    try { SM.emit('forward_result', { hash: rec.hash, ok: false, code: String(reason) }); } catch (_) {}
+  }
+  if (rec.held) {
+    offlineHtlcsFailed += 1;
+    try { attemptJournalWrite(rec.hash, 'RETRACTED', Number(rec.held.outgoing_amount_msat || rec.held.incoming_amount_msat || 0)); } catch (_) {}
+    try { SM.emit('trampoline', { hash: rec.hash, ok: false }); } catch (_) {}
+  }
+  jitInflightClear(rec);
+}
+async function jitInflightTick() {
+  if (!jitInflight.size) return;
+  let payments = null;
+  if (!jitListPaymentsBlind) {
+    try {
+      const r = await lndGet('/v1/payments?include_incomplete=true&reversed=true&max_payments=200');
+      if (r && /permission/i.test(String(r.message || ''))) { jitListPaymentsBlind = true; console.warn('[LSPS2] 0.114.0: in-flight truth unavailable — ListPayments is not in this macaroon; parked inbounds FAIL at their block deadline'); }
+      else payments = (r && r.payments) || null;
+    } catch (e) { if (/permission|403|401/i.test(e.message)) { jitListPaymentsBlind = true; console.warn('[LSPS2] 0.114.0: in-flight truth unavailable — ListPayments is not in this macaroon; parked inbounds FAIL at their block deadline'); } }
+  }
+  for (const rec of [...jitInflight.values()]) {
+    const pay = payments ? payments.find((x) => String(x.payment_hash || '').toLowerCase() === rec.hash) : null;
+    if (pay && pay.status === 'SUCCEEDED' && /^[0-9a-f]{64}$/i.test(String(pay.payment_preimage || ''))) { jitInflightSettle(rec, String(pay.payment_preimage).toLowerCase()); continue; }
+    if (pay && pay.status === 'FAILED') { jitInflightFail(rec, 'FAILED: ' + String(pay.failure_reason || 'FAILED'), true); continue; }
+    const tip = currentBlockHeight || 0;
+    const outOfBlocks = tip > 0 && rec.auto_fail_height > 0 && tip >= rec.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS;
+    const outOfTime = Date.now() - rec.at > JIT_INFLIGHT_MAX_MS;
+    if (outOfBlocks || outOfTime) {
+      console.error(`[LSPS2] 0.114.0: inner payment for ${rec.hash.slice(0,16)}… still LND's at the inbound's deadline (${outOfBlocks ? 'block ' + tip + ' of ' + rec.auto_fail_height : '6 h'}) — FAILing the inbound; if the inner settles later the wallet is paid from this node's balance: MANUAL ATTENTION hash=${rec.hash}`);
+      jitInflightFail(rec, 'deadline: inner still in flight', false);
+    }
+  }
+}
+setInterval(() => { jitInflightTick().catch((e) => console.error(`[LSPS2] 0.114.0 probe error: ${e.message}`)); }, 15000).unref();
+
+// 0.113.1 (S63, Kimi round 2 F7/F20): when the completing request fails AFTER aggregation, its sibling shards used to sit
+// unresolved until LND's auto-fail (only the A5 reservation path and the success path fanned out). Every post-aggregation
+// FAIL_TEMP return in openChannelAndForward now fails the siblings back and resets the aggregate so the payer's wallet
+// retries clean. Safe on the variable path too: flushVariable's own FAIL branch finds `_shards` already null.
+function jitFailSiblings(promise, req, why) {
+  try {
+    if (!promise || !promise._shards || !promise._shards.size) return 0;
+    const ck = (req && req.incoming_circuit_key) || {};
+    const reqKey = `${ck.chan_id || '0'}:${ck.htlc_id || '0'}`;
+    const _w = (htlcInterceptor && htlcInterceptor.getCounters && htlcInterceptor.getCounters()._lastWrite) || null;
+    let n = 0;
+    for (const [k, sh] of promise._shards) {
+      if (k === reqKey) continue;
+      if (_w) { try { _w({ incoming_circuit_key: sh.incoming_circuit_key, action: 'FAIL', failure_code: 15 }); n += 1; } catch (_) {} }
+    }
+    if (promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
+    promise._shards = null; promise._shard_sum_msat = 0n; promise._agg_deadline = 0; promise._agg_completed = false;
+    if (n) console.log(`[LSPS2] 0.113.1: ${n} sibling shard(s) FAILed back with the completing HTLC (${why})`);
+    return n;
+  } catch (e) { return 0; }
+}
+
 // v0.18: the core D.2 path. Opens channel, sends payment over it, settles
 // the inbound HTLC with the returned preimage. Returns the
 // ForwardHtlcInterceptResponse to write back on the stream.
@@ -3483,6 +3902,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     if (!(await isPeerConnected(promise.client_pubkey))) {
       trampolineForwardsFailed += 1;
       console.log(`[LSPS2] peer ${promise.client_pubkey.slice(0,16)}… not a live LND peer at open time — FAIL fast (D-1 2b)`);
+      jitFailSiblings(promise, req, 'peer gone at open time');   // 0.113.1 (F7)
       return FAIL_TEMP;
     }
   } catch (e) {
@@ -3530,10 +3950,11 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   // v0.32.0 (S30): on-chain reserve floor — fail-fast mirrors D-1 2b.
   if (!(await jitReserveOk(channelSizeSats, 'lsps2:' + promise.client_pubkey.slice(0, 16)))) {
     trampolineForwardsFailed += 1;
-    if (htlcInterceptor && htlcInterceptor.getCounters && htlcInterceptor.getCounters()._lastWrite) {
-      htlcInterceptor.getCounters()._lastWrite(FAIL_TEMP);
-    }
-    return null;
+    // 0.113.1 (F20): used to write FAIL_TEMP here and return null — which flushVariable read as "hold path engaged" (one
+    // part failed, the rest held, the promise wedged). The caller writes the answer: the interceptor for a fixed promise,
+    // flushVariable's FAIL branch for an open-amount one (fan-out + reset).
+    jitFailSiblings(promise, req, 'on-chain reserve floor');   // 0.113.1 (F7)
+    return FAIL_TEMP;
   }
   console.log(`[LSPS2] opening ${channelSizeSats}-sat channel to ${promise.client_pubkey.slice(0,16)}…`);
   const _dtOpenT0 = Date.now();  /* v0.40.0 */
@@ -3661,12 +4082,14 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] findChannelScid failed: ${e.message}`);
     jitGuard.fail(_guardCp, 'no scid: ' + e.message);   // 0.104.0
+    jitFailSiblings(promise, req, 'no scid');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
   if (!newChannelScid) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] new channel has no usable SCID yet — FAIL`);
     jitGuard.fail(_guardCp, 'no usable scid');   // 0.104.0
+    jitFailSiblings(promise, req, 'no usable scid');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
 
@@ -3690,6 +4113,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] no MPP payment_secret in incoming HTLC for scid=${scidHex} — FAIL`);
     jitGuard.fail(_guardCp, 'no payment secret');   // 0.104.0
+    jitFailSiblings(promise, req, 'no payment secret');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
 
@@ -3717,13 +4141,22 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     const paymentHash = Buffer.from(paymentHashHex, 'hex');
     htlcAttempt = await sendToRouteV2Hard(routerClient, paymentHash, route, CONFIG.lsps2.sendtoroute_timeout_ms, 'jit-or-trampoline');  /* F3 v0.37.0 */
   } catch (e) {
+    if (/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(e && e.message || ''))) {   // 0.114.0 (F1): LND still owns it — HOLD every circuit and probe
+      jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'rejected as in flight: ' + (e && e.message || '?') });
+      return null;
+    }
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] sendToRouteV2 rejected for scid=${scidHex}: ${e.message}`);
     try { SM.emit('forward_result', { hash: paymentHashHex, ok: false, code: 'reject:' + ((e && e.message) || '?') }); } catch (_) {}  /* F3 v0.37.0 */
-    if (!/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(e && e.message || ''))) jitGuard.fail(_guardCp, 'reject: ' + (e && e.message || '?'));   // 0.104.0: an attempt LND still owns is not a failure yet
+    jitGuard.fail(_guardCp, 'reject: ' + (e && e.message || '?'));   // 0.104.0
+    jitFailSiblings(promise, req, 'send rejected');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
 
+  if (htlcAttempt.status === 'HARD_TIMEOUT') {   // 0.114.0 (F1): the 30-s bomb — LND still owns the inner; HOLD every circuit and probe, never FAIL_TEMP
+    jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'hard timeout' });
+    return null;
+  }
   if (htlcAttempt.status !== 'SUCCEEDED' || !htlcAttempt.preimage || htlcAttempt.preimage.length === 0) {
     trampolineForwardsFailed += 1;
     const failCode = htlcAttempt.failure && htlcAttempt.failure.code;
@@ -3739,6 +4172,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
       }
     } catch (_) {}
     try { SM.emit('forward_result', { hash: paymentHashHex, ok: false, code: failCode }); } catch (_) {}
+    jitFailSiblings(promise, req, 'send did not succeed: ' + String(failCode || htlcAttempt.status));   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
 
@@ -3895,13 +4329,20 @@ async function processPendingHtlcsForPubkey(pubkeyHex) {
       // the adapter pays the recipient directly with the same payment_hash
       // and settles the inbound with the preimage (write queues if the
       // sender is offline). No secret -> legacy grace+RESUME below.
-      const invSec = invoiceSecretsByHash.get(paymentHashHex);
+      const invSec0 = invoiceSecretsByHash.get(paymentHashHex);
+      // 0.117.0 (B-19 b): a JIT invoice's hash (engine v356 registers it with its promise's scid) is NOT a trampoline
+      // candidate — its held first shard is a part of a larger payment, and a trampoline would pay that part alone
+      // (the wallet refuses it and the A2 latch would fail the siblings); such a hold RESUMEs like any other
+      const invSec = (invSec0 && invSec0.jit_scid) ? null : invSec0;
+      if (invSec0 && invSec0.jit_scid) console.log(`[B-10] held ${paymentHashHex.slice(0,16)}… is a JIT invoice's shard (promise scid=${invSec0.jit_scid}) — no trampoline; RESUME path`);
       // B-18: the trampoline settles ONE payment in full; a multi-shard held
       // set must RESUME its shards instead (a partial trampoline pays a
       // fraction the recipient can never claim — M3a2 specimen).
+      if (jitInflight.has(paymentHashHex)) continue;   // 0.114.0 (F1): the probe owns a parked hash — no second send, no RESUME
       if (invSec && (!held.entries || held.entries.length === 1)) {
         try {
           const done = await trampolineForwardHeld(held, paymentHashHex, invSec);
+          if (done === 'inflight') continue;   // 0.114.0 (F1): parked; the held record and its watchdog stay (the watchdog re-arms while parked)
           if (done) {
             pendingHtlcsForOfflineWallets.delete(paymentHashHex);
             cancelHtlcWatchdog(paymentHashHex);
@@ -4195,6 +4636,14 @@ function lndRequestRaw(method, path, body) {
   });
 }
 
+// 0.114.0 (S63, Kimi round 2 F3): a hold-invoice SETTLE whose answer is read — lndRequest hands an LND error body back
+// as data, so "invoice already canceled" used to pass for a settle. Throws on any error body.
+async function lndSettleHoldOrThrow(preimageB64) {
+  const r = await lndPost('/v2/invoices/settle', { preimage: preimageB64 });
+  const m = r ? String(r.message || (r.error && r.error.message) || '') : '';
+  if (r && (m || r.code !== undefined)) throw new Error(m || ('LND code ' + r.code));
+  return r;
+}
 // Unchanged contract: the parsed body, whatever the HTTP status (an LND error reply comes back as data).
 function lndRequest(method, path, body) {
   return lndRequestRaw(method, path, body).then(({ data }) => {
@@ -4538,8 +4987,18 @@ async function trampolineForwardHeld(held, paymentHashHex, invSec) {
     htlcAttempt = await sendToRouteV2Hard(routerClient, paymentHash, route, CONFIG.lsps2.sendtoroute_timeout_ms, 'jit-or-trampoline');  /* F3 v0.37.0 */
   } catch (e) {
     console.error(`[B-10] sendToRouteV2 rejected: ${e.message}`);
+    if (/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(e.message || ''))) {   // 0.114.0 (F1): LND owns it — park, probe, no RESUME
+      jitInflightPark({ hash: paymentHashHex, held, kind: 'trampoline', why: 'rejected as in flight: ' + e.message });
+      try { SM.emit('trampoline', { hash: paymentHashHex, phase: 'inflight' }); } catch (_) {}
+      return 'inflight';
+    }
     try { SM.emit('trampoline', { hash: paymentHashHex, ok: false }); } catch (_) {}
     return false;
+  }
+  if (htlcAttempt && htlcAttempt.status === 'HARD_TIMEOUT') {   // 0.114.0 (F1): never RESUME a second HTLC while LND owns the first — park, probe
+    jitInflightPark({ hash: paymentHashHex, held, kind: 'trampoline', why: 'hard timeout' });
+    try { SM.emit('trampoline', { hash: paymentHashHex, phase: 'inflight' }); } catch (_) {}
+    return 'inflight';
   }
   if (!htlcAttempt || htlcAttempt.status !== 'SUCCEEDED') {
     const failCode = htlcAttempt && htlcAttempt.failure ? htlcAttempt.failure.code : 'unknown';
@@ -4997,7 +5456,7 @@ function canonicalUnregisterMsg(pubkey, ts) {
 // 0.71.0: registry liveness. The worker marks a record stale after 24h without a
 // registration, so we re-register every LIJOX_REGISTER_EVERY_HOURS (6). The
 // console reads registryStatus.
-const registryStatus = { last_ok: 0, last_error: '', next_ms: 0, every_h: parseFloat(process.env.LIJOX_REGISTER_EVERY_HOURS || '6') };
+const registryStatus = { last_ok: 0, last_error: '', next_ms: 0, every_h: parseFloat(process.env.LIJOX_REGISTER_EVERY_HOURS || '6'), doors: {} };   // 0.118.0: doors — each registry's last answer
 let registryTimer = null;
 
 // `node lij-adapter.js --unregister`: sign a departure with the node key and POST
@@ -5008,9 +5467,14 @@ async function unregisterFromRegistry() {
   const canonical = canonicalUnregisterMsg(CONFIG.node.pubkey, ts);
   const signed = await lndPost('/v1/signmessage', { msg: Buffer.from(canonical, 'utf8').toString('base64') });
   if (!signed || !signed.signature) throw new Error('LND signmessage returned no signature; LND said: ' + JSON.stringify(signed).slice(0, 300));
-  const result = await httpsPost(`${CONFIG.registry}/lsps/unregister`, { pubkey: CONFIG.node.pubkey, ts, signature: signed.signature });
-  console.log('[Registry] Unregister:', result);
-  return result;
+  // 0.118.0 (Phase C): the signed departure at every door
+  const results = [];
+  for (const reg of CONFIG.registries) {
+    const result = await httpsPost(`${reg}/lsps/unregister`, { pubkey: CONFIG.node.pubkey, ts, signature: signed.signature }).catch((e) => ({ ok: false, error: e.message }));
+    console.log('[Registry] Unregister at ' + reg + ':', result);
+    results.push(Object.assign({ registry: reg }, result || {}));
+  }
+  return results.length === 1 ? results[0] : { ok: results.every((r) => r && r.ok), results };
 }
 
 async function registerWithRegistry() {
@@ -5022,7 +5486,7 @@ async function registerWithRegistry() {
     console.warn('[Registry] NODE_PUBKEY or NODE_HOST not set — skipping');
     return;
   }
-  console.log(`[Registry] Registering with ${CONFIG.registry}`);
+  console.log(`[Registry] Registering with ${CONFIG.registries.join(', ')}`);
   try {
     // v0.15: register with Cloudflare-fronted URLs and shared macaroon.
     // - endpoint, route_endpoint, wss_url from CONFIG.public so the
@@ -5071,8 +5535,7 @@ async function registerWithRegistry() {
     const routes = await buildRoutes();
     for (const ln of routesStatus.notes) console.log('[Registry] ' + ln);
     body.routes = routes;
-    const signAndPost = async () => {
-      const canonical = canonicalRegisterMsg(body);
+    const signWith = async (canonical) => {
       const signed = await lndPost('/v1/signmessage', {
         msg: Buffer.from(canonical, 'utf8').toString('base64'),
       });
@@ -5082,19 +5545,28 @@ async function registerWithRegistry() {
         // nothing. Next time the journal names the cause itself.
         throw new Error('LND signmessage returned no signature — registration aborted; LND said: ' + JSON.stringify(signed).slice(0, 300));
       }
-      body.signature = signed.signature;
-      return httpsPost(`${CONFIG.registry}/lsps/register`, body);
+      return signed.signature;
     };
-    let result = await signAndPost();
-    if (result && !result.ok && body.routes && /signature does not verify/i.test(String(result.error || ''))) {
-      // a registry older than lij-worker 0.13.0 does not know routes (its canonical is v3): register the first door alone
-      console.log('[Registry] this registry does not know routes (its answer: ' + result.error + ') — registering the first door alone (v3)');
-      delete body.routes; delete body.signature;
-      result = await signAndPost();
+    // 0.118.0 (Phase C): ONE signed record, posted to EVERY door of the registry — the same bytes at each, so the
+    // mirror between the doors has nothing to level. A registry older than lij-worker 0.13.0 does not know routes
+    // (its canonical is v3): that one gets the first door alone, signed once more for it.
+    body.signature = await signWith(canonicalRegisterMsg(body));
+    let v3 = null;
+    const errors = [];
+    for (const reg of CONFIG.registries) {
+      let result = await httpsPost(`${reg}/lsps/register`, body).catch((e) => ({ ok: false, error: e.message }));
+      if (result && !result.ok && body.routes && /signature does not verify/i.test(String(result.error || ''))) {
+        console.log('[Registry] ' + reg + ' does not know routes (its answer: ' + result.error + ') — registering the first door alone (v3)');
+        if (!v3) { v3 = Object.assign({}, body); delete v3.routes; delete v3.signature; v3.signature = await signWith(canonicalRegisterMsg(v3)); }
+        result = await httpsPost(`${reg}/lsps/register`, v3).catch((e) => ({ ok: false, error: e.message }));
+      }
+      console.log('[Registry] Registered at ' + reg + ':', result);
+      const door = registryStatus.doors[reg] || (registryStatus.doors[reg] = { last_ok: 0, last_error: '' });
+      if (result && result.ok) { door.last_ok = Date.now(); door.last_error = ''; }
+      else { door.last_error = (result && (result.error || JSON.stringify(result))) || 'unknown'; errors.push(reg + ': ' + door.last_error); }
     }
-    console.log('[Registry] Registered:', result);
-    if (result && result.ok) { registryStatus.last_ok = Date.now(); registryStatus.last_error = ''; }
-    else registryStatus.last_error = (result && (result.error || JSON.stringify(result))) || 'unknown';
+    if (errors.length < CONFIG.registries.length) registryStatus.last_ok = Date.now();
+    registryStatus.last_error = errors.join(' · ');
   } catch (e) {
     console.error('[Registry] Registration failed:', e.message);
     registryStatus.last_error = e.message;
@@ -5175,7 +5647,12 @@ function settingsReport() {
     row('Offline hold', 'CLTV headroom', 'LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS', OFFLINE_MIN_HEADROOM_BLOCKS, 'blocks', 'the least room an HTLC must have left to be held at all'),
     row('Push Key', 'delivery fee base', 'PUSH_DELIVERY_FEE_BASE_MSAT', pushRail.settings().fee_base_msat, 'msat', 'the sender pays it on top of the amount; kept whether or not a route costs it (0.82.0)'),
     row('Push Key', 'delivery fee', 'PUSH_DELIVERY_FEE_PPM', pushRail.settings().fee_ppm, 'ppm', 'of the amount — the ceiling a cross-provider delivery may spend'),
-    row('Push Key', 'timelock margin', 'PUSH_CLTV_MARGIN_BLOCKS', pushRail.settings().cltv_margin_blocks, 'blocks', 'added to the window\'s blocks on the lock invoice'),
+    row('Push Key', 'timelock margin', 'PUSH_CLTV_MARGIN_BLOCKS', pushRail.settings().cltv_margin_blocks, 'blocks', 'added to the window\'s blocks on the lock invoice — 144 by default since 0.113.0 (about a day for the sender to come online after a last-minute take)'),
+    row('Push Key', 'hold fee', 'PUSH_HOLD_FEE_PPM_PER_DAY', pushRail.settings().hold_fee_ppm_per_day, 'ppm/day', 'per million of the amount per day of the window, inside the lock\'s fee (0.113.0; 0 = none)'),
+    row('Stores', 'tape store cap', 'TAPES_MAX_BYTES', TAPES_MAX_BYTES, 'bytes', Math.round(TAPES_MAX_BYTES / 1048576) + ' MiB — at the cap the oldest tapes past the keep window are unlinked first; a store of young tapes refuses a drop (0.115.0)'),
+    row('Stores', 'tape keep window', 'TAPES_KEEP_DAYS', TAPES_KEEP_DAYS, 'days', 'a tape younger than this is never deleted'),
+    row('Stores', 'address claims per name', 'LNURLP_MAX_LIVE_PER_NAME', LNURLP_MAX_LIVE_PER_NAME, 'live entries', 'a Lightning-address name\'s pool of live claims; the wallet tops up at 20 (0.115.0)'),
+    row('Routing reports', 'cap per wallet', 'ROUTE_REPORT_MAX_PAIRS_PER_HOUR', ROUTE_REPORT_MAX_PAIRS_PER_HOUR, 'pairs/h', 'a wallet\'s signed routing report may write this many refused pairs an hour into LND\'s routing memory (0.113.0)'),
     row('Push Key', 'amount floor', 'PUSH_MIN_SATS', pushRail.settings().min_sats, 'sats', ''),
     row('Push Key', 'amount ceiling', 'PUSH_MAX_SATS', pushRail.settings().max_sats, 'sats', ''),
     row('NWC', 'switch', 'NWC_ENABLED', nwc.settings().enabled ? 'on' : 'off', '', 'off by default; on = this provider keeps and relays NWC requests for its wallets (never pays, never reads one) — 0.86.0'),
@@ -5194,7 +5671,7 @@ function settingsReport() {
     row('Lease', 'session gap', 'LEASE_SESSION_GAP_MIN', Math.round(LEASE_SESSION_GAP_MS / 60000), 'min', 'contact after this much silence = a new session (one write, one log line)'),
     row('Lease', 'exclusions', '', Object.values(leaseExclude.chan_points || {}).filter((v) => v && v.excluded).length + ' from console' + (Ls.exclude.length ? ' + ' + Ls.exclude.length + ' from .env' : ''), '', leaseExclude.saved_at ? 'list saved' : 'list NEVER saved — the lease closes nothing'),
     row('Lease', 'lncli command', 'LEASE_LNCLI', Ls.lncli, '', 'the box\'s admin lncli, used only by the lease close'),
-    row('Registry', 'registry', 'LIJOX_REGISTRY', CONFIG.registry || '(none — registry-free)', '', ''),
+    row('Registry', 'registries', 'LIJOX_REGISTRIES', CONFIG.registries.join(', ') || '(none — registry-free)', '', CONFIG.registries.length > 1 ? 'every write goes to each door; the first is read' : ''),   // 0.118.0 (Phase C)
     row('Registry', 're-register every', 'LIJOX_REGISTER_EVERY_HOURS', registryStatus.every_h, 'h', 'the registry marks a record stale after 24 h without one'),
     row('Registry', 'advertised name', 'NODE_NAME', N.name, '', ''),
     row('Registry', 'advertised host', 'NODE_HOST', N.host, '', 'Tor or clearnet URI for peers'),
@@ -5432,9 +5909,12 @@ async function consoleSnapshot() {
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
-    registry: { url: CONFIG.registry || '', last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
+    registry: { url: CONFIG.registry || '', urls: CONFIG.registries, doors: registryStatus.doors, last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
     backups, loops, watchdog: !!process.env.NOTIFY_SOCKET,
     jit_now: jitNowMemory(),   // 0.111.0: the live promises, aggregating sets and held payments (was the public /health/jit)
+    deliver_opening: [...deliverOpening.entries()].map(([pk, o]) => ({ wallet: pk.slice(0, 16), size_sats: o.sizeSats, tag: o.tag, age_s: Math.round((Date.now() - o.at) / 1000), after_deadline: !!o.deadline })),   // 0.117.0 (F21)
+    inflight_parked: [...jitInflight.values()].map((r) => ({ hash: r.hash.slice(0, 16), circuits: r.circuits.length, kind: r.kind, age_s: Math.round((Date.now() - r.at) / 1000), fail_by: r.auto_fail_height ? r.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS : null })),   // 0.114.0 (F1)
+    routing_reports: { received: routeReports.received, imported: routeReports.imported, refused: routeReports.refused, cap_per_hour: ROUTE_REPORT_MAX_PAIRS_PER_HOUR, handouts_remembered: routeHandouts.size, last: routeReports.last.slice(-10) },   // 0.113.0 (S63): the wallets' routing reports and what went into LND
     lease: (() => { const r = leaseStatusReport(); delete r.channels; return r; })(),   // 0.111.0: the lease's figures (was the public /lease/status; the per-channel rows ride the channels) uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
   };
 }
@@ -5927,6 +6407,10 @@ async function leaseCycle() {
     const ttlMs = leaseTtlDays(rec) * 86400000;
     if (idleMs <= ttlMs) continue;
     if (leaseIsExcluded(cp)) continue;               // 0.72.4: the operator's exclusion list (console) + the .env list
+    if (Array.isArray(c.pending_htlcs) && c.pending_htlcs.length > 0) {   // 0.113.0 (S63, DP 2026-10-26, Push item 4): a payment still on the channel (a Push lock, a held forward) — skip it this cycle, look again next cycle
+      leaseLog({ event: 'skip_htlcs', chan_point: cp, peer: c.remote_pubkey.slice(0, 16), htlcs: c.pending_htlcs.length, idle_days: Number((idleMs / 86400000).toFixed(3)) });
+      continue;
+    }
     const detail = {
       chan_point: cp,
       peer: c.remote_pubkey.slice(0, 16),
@@ -6097,7 +6581,8 @@ function jitNowMemory() {
   return { promises, aggregating, held };
 }
 
-const server = http.createServer(async (req, res) => {
+let _healthInfo = { at: 0, info: null };   // 0.113.1 (F16): the /health getinfo memo
+const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a named async function; createServer wraps it below
   const parsed = new url.URL(req.url, `http://localhost:${CONFIG.adapter.port}`);
   const path   = parsed.pathname;
   const method = req.method;
@@ -6127,12 +6612,13 @@ const server = http.createServer(async (req, res) => {
 
   // Health check — no auth required
   if (path === '/health' && method === 'GET') {
+    // 0.113.1 (F16): one getinfo per two seconds, whoever asks — the route is public and was a live LND call per hit
     /* v0.55.4: scope-free heartbeat parse. 0.55.1 referenced an
        out-of-scope parse var; its try/catch swallowed the ReferenceError,
        silently dropping every v539 heartbeat (second-send starvation). */
-    { const _m = String(req.url||'').match(/[?&]client(?:_pubkey)?=([0-9a-fA-F]{66})/); if (_m) { touchWalletActive(_m[1].toLowerCase()); console.log(`[HB] awake heartbeat from ${_m[1].slice(0,16)}…`); } }  /* v0.55.5: the [HTTP] logger strips query strings, so the heartbeat must announce itself */
+    { const _m = String(req.url||'').match(/[?&]client(?:_pubkey)?=([0-9a-fA-F]{66})/); if (_m) { walletContactTouch(_m[1].toLowerCase(), 'http'); console.log(`[HB] health ping from ${_m[1].slice(0,16)}… (contact only — the awake proof is the signed /v1/heartbeat since 0.116.0)`); } }   // 0.116.0 (F10): no awake stamp from a typed pubkey  /* v0.55.5: the [HTTP] logger strips query strings, so the heartbeat must announce itself */
     try {
-      const info = await lndGet('/v1/getinfo');
+      const info = (Date.now() - _healthInfo.at < 2000 && _healthInfo.info) ? _healthInfo.info : (_healthInfo = { at: Date.now(), info: await lndGet('/v1/getinfo') }).info;   // 0.113.1 (F16)
       // v0.5: include chain bridge status if running
       // v0.7: also surface gRPC stream counts and tip cache state for ops visibility
       const chain_bridge_status = chainBridge
@@ -6438,6 +6924,8 @@ const server = http.createServer(async (req, res) => {
       const e = ((rec && rec.entries) || []).find((x) => x && x.hash === hash);
       if (e) { hit = e; owner = String(rec.client_pubkey || '').toLowerCase(); break; }
     }
+    // 0.116.0 (F14, the second half): the owner proves the key — the proof fields in the query, over `note:<hash>:<client>`
+    { const npr = lnurlpAuthCheck(proofFromQuery(parsed.searchParams), 'lnurl-note', who, 'note:' + hash + ':' + who); if (!npr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + npr.code }, npr.status); }
     if (!hit) return jsonResponse(res, { ok: false, error: 'unknown hash' }, 404);
     if (owner !== who) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
     touchWalletActive(who);
@@ -6471,6 +6959,8 @@ const server = http.createServer(async (req, res) => {
         || typeof body.hold_ms !== 'number' || body.hold_ms < 0 || body.hold_ms > 86400000) {
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
     }
+    // 0.116.0 (F10): the dial is the wallet's — the node key's proof over `prefs:<hold_ms>` (engine v355), or nothing
+    { const fpr = lnurlpAuthCheck(body, 'client-prefs', String(body.client_pubkey).toLowerCase(), 'prefs:' + String(body.hold_ms)); if (!fpr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + fpr.code }, fpr.status); }
     const pk = body.client_pubkey.toLowerCase();
     clientPrefs[pk] = Object.assign(clientPrefs[pk] || {}, { hold_ms: Math.round(body.hold_ms), updated: Date.now() });
     clientPrefsPersist();
@@ -6478,6 +6968,26 @@ const server = http.createServer(async (req, res) => {
     touchWalletActive(String((body && body.client_pubkey) || '').toLowerCase());  /* v0.54.4 (d): prefs = awake proof */
     console.log(`[prefs] ${pk.slice(0, 16)}… hold_ms=${body.hold_ms} effective=${eff} (lsp cap ${OFFLINE_HOLD_CAP_MS})`);
     return jsonResponse(res, { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED });   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
+  }
+  // 0.116.0 (S63, Kimi round 2 F10 — DP "Agreed"): THE AWAKE PROOF. The page sends this every 30 s while it is open:
+  // the node key's proof (engine v355 lsp_proof, action "heartbeat") over `hb:<unix s>`; within 90 s of now. It is the
+  // ONLY thing that stamps walletLastActiveMs from HTTP — the replay gate and the wake gate read a proven stamp.
+  if (method === 'POST' && path === '/v1/heartbeat') {
+    if (!authOk(req)) return errResponse(res, 'Unauthorized', 401);
+    let hb; try { hb = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
+    const hpk = String((hb && hb.client_pubkey) || '').toLowerCase();
+    if (!/^[0-9a-f]{66}$/.test(hpk)) return jsonResponse(res, { ok: false, error: 'client_pubkey required' }, 400);
+    if (!proofTsOk(hb.ts)) return jsonResponse(res, { ok: false, error: 'ts outside the 90-s window' }, 400);
+    const hpr = lnurlpAuthCheck(hb, 'heartbeat', hpk, 'hb:' + String(Math.floor(Number(hb.ts))));
+    if (!hpr.ok) { console.warn(`[HB] heartbeat from ${hpk.slice(0, 16)}… refused: ${hpr.code}`); return jsonResponse(res, { ok: false, error: 'auth: ' + hpr.code }, hpr.status); }
+    touchWalletActive(hpk);
+    console.log(`[HB] awake heartbeat from ${hpk.slice(0, 16)}… (signed)`);
+    return jsonResponse(res, { ok: true, active_window_ms: ACTIVE_WINDOW_MS });
+  }
+  if (method === 'POST' && path === '/v1/route/report') {   // 0.113.0 (S63): the wallet's signed routing report (route token + the node-key proof)
+    if (!authOk(req)) return errResponse(res, 'Unauthorized', 401);
+    let rbody; try { rbody = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
+    return routeReportHandle(rbody, res, ip);
   }
   if (method === 'POST' && path === '/lnurl/register') {
     if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
@@ -6489,7 +6999,7 @@ const server = http.createServer(async (req, res) => {
     });
     let body = null;
     try { body = JSON.parse(bodyStr); } catch (e) {}
-    if (!body || !/^[a-z0-9_-]{2,32}$/.test(body.name || '')
+    if (!body || !lnurlpNameSafe(String(body.name || '').toLowerCase())   // 0.113.1 (F18): __proto__ / constructor / prototype refused
         || !/^[0-9a-f]{66}$/.test((body.client_pubkey || '').toLowerCase())
         || !Array.isArray(body.hashes)) {
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
@@ -6515,12 +7025,14 @@ const server = http.createServer(async (req, res) => {
       if (c === 'ok') rec.neutral = true;
     }
     const seen = new Set(rec.entries.map((e) => e.hash));
-    let added = 0;
+    let added = 0, capped = false;
+    let liveNow = lnurlpLiveFree(rec).length;   // 0.115.0 (F22): the cap counts live free entries — reserved/accepted/settled/expired ones are not a pool
     for (const h of body.hashes.slice(0, 100)) {
       if (!h || !/^[0-9a-f]{64}$/.test((h.hash || '').toLowerCase())
           || !/^[0-9a-f]{64}$/.test((h.secret || '').toLowerCase())) continue;
       const hh = h.hash.toLowerCase();
       if (seen.has(hh)) continue;
+      if (liveNow + added >= LNURLP_MAX_LIVE_PER_NAME) { capped = true; break; }   // 0.115.0 (S63, Kimi round 2 F22 — DP "500 live entries per name")
       // 0.67.0: the wallet states each hash's life (engine v229: 30 years);
       // an older engine states none and gets its own old 30-day life.
       const nowS = lnurlpNowS();
@@ -6535,8 +7047,10 @@ const server = http.createServer(async (req, res) => {
     lnurlpPersist();
     const free = lnurlpLiveFree(rec).length;   // 0.67.0: live ones only
     touchWalletActive(rec.client_pubkey);  /* v0.55.1 R2 */
-    console.log(`[LNURLP] register: ${name} += ${added} hash(es); live pool ${free}; next_index ${lnurlpNextIndex(rec)}`);
-    return jsonResponse(res, { ok: true, pool_size: free, added: added, next_index: lnurlpNextIndex(rec), address: name + '@' + lnurlpAddrHost(req, rec) });   // 0.68.0: the address as written
+    console.log(`[LNURLP] register: ${name} += ${added} hash(es); live pool ${free}${capped ? ' (AT THE CAP ' + LNURLP_MAX_LIVE_PER_NAME + ' — the rest refused)' : ''}; next_index ${lnurlpNextIndex(rec)}`);
+    const ans = { ok: true, pool_size: free, added: added, next_index: lnurlpNextIndex(rec), address: name + '@' + lnurlpAddrHost(req, rec) };   // 0.68.0: the address as written
+    if (capped) { ans.capped = true; ans.cap = LNURLP_MAX_LIVE_PER_NAME; }   // 0.115.0 (F22)
+    return jsonResponse(res, ans);
   }
   // ── 0.57.0 (g): LNURLp name RELEASE — same auth wall as register; the
   // pubkey must match the record (a wrong name can't free someone else's).
@@ -6547,7 +7061,7 @@ const server = http.createServer(async (req, res) => {
     if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
     const relStr = await new Promise((resolve) => {
       let b = '';
-      req.on('data', (c) => { b += c; if (b.length > 4096) { req.destroy(); resolve(null); } });
+      req.on('data', (c) => { b += c; if (b.length > 8192) { req.destroy(); resolve(null); } });   // 0.116.0: room for the proof and transfer_to
       req.on('end', () => resolve(b));
       req.on('error', () => resolve(null));
     });
@@ -6555,7 +7069,7 @@ const server = http.createServer(async (req, res) => {
     try { rel = JSON.parse(relStr); } catch (e) {}
     const relName = String((rel && rel.name) || '').toLowerCase();
     const relPk = String((rel && rel.client_pubkey) || '').toLowerCase();
-    if (!/^[a-z0-9_-]{2,32}$/.test(relName) || !/^[0-9a-f]{66}$/.test(relPk)) {
+    if (!lnurlpNameSafe(relName) || !/^[0-9a-f]{66}$/.test(relPk)) {   // 0.113.1 (F18): __proto__ / constructor / prototype refused
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
     }
     // 0.112.0 (S63, F7): the node key's proof over the name — before the record is even looked at
@@ -6571,11 +7085,18 @@ const server = http.createServer(async (req, res) => {
     }
     const relBusy = relRec.entries.filter((e) => e.status === 'reserved' || e.status === 'accepted').length;
     if (relBusy) return jsonResponse(res, { ok: false, error: 'entries in flight: ' + relBusy }, 409);
-    if (relRec.neutral) { await lnurlpNameAt('release', relName); }   // 0.68.0: free the neutral name too
+    // 0.116.0 (S63, Kimi round 2 K1 — DP "Agreed"): a release that names the provider the wallet moves to becomes a signed
+    // TRANSFER at the registry (worker 0.15.0) — the name is never free in between; a plain release frees it as before
+    const relTo = String((rel && rel.transfer_to) || '').toLowerCase();
+    let transferred = false;
+    if (relRec.neutral) {
+      if (/^[0-9a-f]{66}$/.test(relTo) && relTo !== String(CONFIG.node.pubkey || '').toLowerCase()) { transferred = (await lnurlpNameAt('transfer', relName, relTo)) === 'ok'; if (!transferred) await lnurlpNameAt('release', relName); }
+      else await lnurlpNameAt('release', relName);   // 0.68.0: free the neutral name too
+    }
     delete lnurlpRegistry[relName];
     lnurlpPersist();
-    console.log(`[LNURLP] release: ${relName} freed by ${relPk.slice(0, 16)}…`);
-    return jsonResponse(res, { ok: true, released: true });
+    console.log(`[LNURLP] release: ${relName} freed by ${relPk.slice(0, 16)}…${transferred ? ' — transferred at the registry to ' + relTo.slice(0, 16) + '…' : (relTo ? ' (the transfer did not land; released)' : '')}`);
+    return jsonResponse(res, { ok: true, released: true, transferred });
   }
 
   // ── PENDING INTENTS GET (v0.38.0, S31) — Pulse W2 wake poll ────────────
@@ -6597,7 +7118,8 @@ const server = http.createServer(async (req, res) => {
       const c = String(q.get('client') || '').trim().toLowerCase();
       if (/^[0-9a-f]{66}$/.test(c)) clientQ = c;
     } catch (_) {}
-    if (clientQ) touchWalletActive(clientQ);  /* (d): wake-poll = awake proof */
+    if (!clientQ) return jsonResponse(res, { ok: false, error: 'client required — one wallet\'s pending, by its pubkey; the operator\'s whole view is the console\'s JIT · now pane' }, 400);   // 0.115.0 (S63, Kimi round 2 F14 — DP "Yes"): no list of every wallet's held payments to a route-token holder
+    // 0.116.0 (F10): a GET names a pubkey anyone can type — it answers but proves nothing; the signed POST stamps
     const byHash = {};
     // held-HTLC map: authoritative amounts + expiry for HOLDING forwards
     try {
@@ -6874,7 +7396,14 @@ const server = http.createServer(async (req, res) => {
     if (!pubkey || pubkey.length !== 66 || !/^[0-9a-f]{66}$/.test(pubkey)) {
       return errResponse(res, 'client_pubkey must be 66 lowercase hex chars');
     }
-    touchWalletActive(pubkey);  /* (d): a pending poll proves the wallet is awake */
+    // 0.116.0 (F10): the poll stamps "awake" only with the node key's proof over `pending:<unix s>` (engine v355); a poll
+    // without one still answers — it just proves nothing
+    if (body.signature || body.nonce || body.node_pubkey) {
+      if (!proofTsOk(body.ts)) return errResponse(res, 'ts outside the 90-s window', 400);
+      const ppr = lnurlpAuthCheck(body, 'lsps2-pending', pubkey, 'pending:' + String(Math.floor(Number(body.ts))));
+      if (!ppr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + ppr.code }, ppr.status);
+      touchWalletActive(pubkey);  /* (d): a PROVEN pending poll proves the wallet is awake */
+    }
     const pending = [];
     for (const [paymentHashHex, held] of pendingHtlcsForOfflineWallets) {
       if (held.client_pubkey.toLowerCase() === pubkey) {
@@ -6920,9 +7449,11 @@ const server = http.createServer(async (req, res) => {
       // stored over the wallet's. The same values again (a retry) are fine. The store is bounded by count AND age:
       // nothing younger than two hours is evicted to make room, so a flood of junk hashes cannot flush a live
       // invoice's secret; when every entry is young the store is full and says so.
+      const jitScid = String((body && body.jit_scid) || '').toLowerCase().trim();   // 0.117.0 (B-19 b, engine v356): a JIT invoice's hash names its promise
+      if (jitScid && !/^[0-9a-f]{16}$/.test(jitScid)) return errResponse(res, 'jit_scid must be 16 lowercase hex chars');
       const prior = invoiceSecretsByHash.get(ph);
       if (prior) {
-        if (prior.payment_secret === sec && prior.total_msat === String(tm)) return jsonResponse(res, { ok: true, keyed: 'payment_hash', already: true });
+        if (prior.payment_secret === sec && prior.total_msat === String(tm)) { if (jitScid && !prior.jit_scid) { prior.jit_scid = jitScid; } return jsonResponse(res, { ok: true, keyed: 'payment_hash', already: true }); }
         console.warn(`[B-10] invoice secret for hash=${ph.slice(0,16)}... is ALREADY registered with other values — refused (first registration wins)`);
         return errResponse(res, 'a payment_secret is already registered for this payment_hash', 409);
       }
@@ -6939,8 +7470,8 @@ const server = http.createServer(async (req, res) => {
         }
         if (evicted) console.log(`[B-10] invoice secret store: ${evicted} entries older than ${INVOICE_SECRETS_KEEP_MS / 3600000} h evicted`);
       }
-      invoiceSecretsByHash.set(ph, { payment_secret: sec, total_msat: String(tm), at: Date.now() });
-      console.log(`[B-10] invoice secret registered for hash=${ph.slice(0,16)}...`);
+      invoiceSecretsByHash.set(ph, Object.assign({ payment_secret: sec, total_msat: String(tm), at: Date.now() }, jitScid ? { jit_scid: jitScid } : {}));
+      console.log(`[B-10] invoice secret registered for hash=${ph.slice(0,16)}...${jitScid ? ' (a JIT invoice — promise scid=' + jitScid + ', B-19 may bind an early shard to it)' : ''}`);
       try { SM.emit('secret_registered', { hash: ph }); } catch (_) {}
       return jsonResponse(res, { ok: true, keyed: 'payment_hash' });
     }
@@ -6981,7 +7512,7 @@ const server = http.createServer(async (req, res) => {
     }
     promise.payment_secret = Buffer.from(secretHex, 'hex');
     promise.total_amt_msat = totalMsat;
-    touchWalletActive(promise.client_pubkey);  /* v0.55.1 R2 */
+    // 0.116.0 (F10): a typed pubkey stamps nothing — the signed heartbeat is the awake proof
     console.log(`[LSPS2] register_secret: scid=${scid} total_msat=${totalMsat} (payment_secret stored on promise)`);
     try { SM.emit('secret_registered', { scid: String(scid) }); } catch (_) {}
     return jsonResponse(res, { ok: true, scid });
@@ -7067,7 +7598,7 @@ const server = http.createServer(async (req, res) => {
                   + `You'll be able to receive up to ${fmtNum(Math.floor(sizeMsat / 1000))} sats after this. `
                   + `Offer valid for ${validMin} minutes.`;
 
-    touchWalletActive(clientPubkey);  /* v0.55.1 R2: a buy proves awake */
+    // 0.116.0 (F10): a buy names a pubkey anyone can type — it stamps nothing; the signed heartbeat is the awake proof
     console.log(`[LSPS2] Buy: scid=${scid} size=${sizeMsat}msat fee=${feeMsat}msat expires=${new Date(expiresAt).toISOString()} ip=${ip}`);
 
     return jsonResponse(res, {
@@ -7178,6 +7709,7 @@ const server = http.createServer(async (req, res) => {
     const routeHints    = body.route_hints;
     const feeLimitSat   = body.fee_limit_sat;
     const ignoredPairs  = body.ignored_pairs;  // v0.13: wallet retry exclusions
+    const ignoredNodes  = body.ignored_nodes;  // 0.113.0 (§3c): the nodes that refused — avoided whole (engine v353)
 
     if (!destination || !/^[0-9a-f]{66}$/.test(destination)) {
       return errResponse(res, 'Invalid or missing destination (expect 66 hex chars)');
@@ -7223,9 +7755,14 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    if (ignoredNodes !== undefined) {   // 0.113.0: 66-hex each, at most 20
+      if (!Array.isArray(ignoredNodes) || ignoredNodes.length > 20) return errResponse(res, 'ignored_nodes must be an array of at most 20 pubkeys (or omitted)');
+      for (const n of ignoredNodes) if (!/^[0-9a-f]{66}$/.test(String(n || ''))) return errResponse(res, 'ignored_nodes[] must be 66 hex chars (compressed pubkey)');
+    }
     const numHints = Array.isArray(routeHints) ? routeHints.length : 0;
     const numExcluded = Array.isArray(ignoredPairs) ? ignoredPairs.length : 0;
-    console.log(`[Phase10b] POST route/build: dest=${destination.slice(0,20)}... amount=${amountSat} sats hints=${numHints} excluded=${numExcluded} from ${ip}`);
+    const numNodes = Array.isArray(ignoredNodes) ? ignoredNodes.length : 0;
+    console.log(`[Phase10b] POST route/build: dest=${destination.slice(0,20)}... amount=${amountSat} sats hints=${numHints} excluded=${numExcluded} ignored_nodes=${numNodes} from ${ip}`);
 
     // v0.11: force a peer check before this query — Phase 10b's whole point is
     // multi-hop routing through Umbrel, so we want the upstream channel active
@@ -7255,6 +7792,9 @@ const server = http.createServer(async (req, res) => {
         to:   Buffer.from(pair.to,   'hex').toString('base64'),
       }));
     }
+    if (Array.isArray(ignoredNodes) && ignoredNodes.length > 0) {   // 0.113.0 (§3c): LND's QueryRoutes takes ignored_nodes as bytes
+      lndBody.ignored_nodes = ignoredNodes.map((n) => Buffer.from(n, 'hex').toString('base64'));
+    }
     if (Number.isInteger(feeLimitSat) && feeLimitSat > 0) {
       lndBody.fee_limit = { fixed: String(feeLimitSat) };
     }
@@ -7273,6 +7813,14 @@ const server = http.createServer(async (req, res) => {
       // (same-LSP recipient offline, or JIT promise unknown to the graph).
       // The B-2 alias rewrite below dialect-corrects synthesized hops too.
       const lndResp = await routeBuildWithSynthesis(destination, amountSat, lndBody, routeHints);
+      // 0.113.0 (§3c): LND's REST answers "no path" as a body, not a throw (lndRequest's contract) — said as a plain
+      // no_route answer so the wallet (engine v353) can ask once more avoiding only the refusing channels; an older
+      // engine reads it as "no routes", as it read the bare error body before
+      if (lndResp && !Array.isArray(lndResp.routes) && /unable to find a path|no path|no route/i.test(String(lndResp.message || (lndResp.error && lndResp.error.message) || ''))) {
+        const lmsg = String(lndResp.message || (lndResp.error && lndResp.error.message) || '').slice(0, 200);
+        console.log(`[Phase10b] route answer: none (${lmsg})`);
+        return jsonResponse(res, { ok: false, error: 'no_route', routes: [], lnd_error: lmsg }, 200);
+      }
       // v0.12: attach our own outgoing-channel policy for the first hop so the
       // wallet can correctly compute the LSP self-hop fee. Without this the
       // wallet falls back to ChannelDetails.counterparty.forwarding_info which
@@ -7327,6 +7875,14 @@ const server = http.createServer(async (req, res) => {
       // not the real scid (which it refuses by design). Runs AFTER the
       // policy/cltv steps so those keep using the real scid for lookups.
       if (lndResp && lndResp.routes) { await rewriteHopsToAliases(lndResp.routes); }
+      // 0.113.0 (§3b): every route ask's answer on the journal, hop by hop; and remembered for 15 min so a routing report
+      // may name only pairs this adapter itself handed out for that hash
+      try {
+        const hh = routeHints && routeHints[0] && routeHints[0].hop_hints && routeHints[0].hop_hints[0];
+        const rhash = String((body && body.payment_hash) || '').toLowerCase();
+        console.log(`[Phase10b] route answer: ${routeHopsLine(lndResp && lndResp.routes)}${rhash ? ' (hash ' + rhash.slice(0, 12) + '…)' : ''}${hh ? ' hint ' + String(hh.chan_id || '') : ''}`);
+        if (/^[0-9a-f]{64}$/.test(rhash)) routeHandoutRemember(rhash, lndResp && lndResp.routes);
+      } catch (_) {}
       // B-7: hold signal for the sender. _synth marks answers we built
       // because LND had none -- destination offline (channel) or
       // unchanneled (jit). Tell the wallet a bounded hold is in play.
@@ -7349,6 +7905,12 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(res, lndResp);
     } catch (e) {
       console.error(`[Phase10b POST] LND route query failed: ${e.message}`);
+      // 0.113.0 (§3c): no path at all — said as a plain answer, so the wallet (engine v353) can ask once more avoiding
+      // only the refusing channels instead of counting the try as lost; an older engine reads it as "no routes" as before
+      if (/unable to find a path|no path|no route/i.test(String(e.message))) {
+        console.log(`[Phase10b] route answer: none (${String(e.message).slice(0, 120)})`);
+        return jsonResponse(res, { ok: false, error: 'no_route', routes: [], lnd_error: String(e.message).slice(0, 200) }, 200);
+      }
       return errResponse(res, `LND route query failed: ${e.message}`, 502);
     }
   }
@@ -7384,6 +7946,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   return errResponse(res, 'Not found', 404);
+};
+// 0.113.1 (S63, Kimi round 2 F18): a throw anywhere in the handler used to be an unhandled rejection — Node 22 exits on
+// those, with every held HTLC, promise and watcher in memory. Now it is logged and answered 500; the process stays up.
+let _httpThrows = 0;
+const server = http.createServer((req, res) => {
+  handleHttp(req, res).catch((e) => {
+    _httpThrows += 1;
+    console.error(`[HTTP] handler threw on ${req.method} ${String(req.url || '').slice(0, 120)}: ${e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e}`);
+    try { if (!res.headersSent) jsonResponse(res, { ok: false, error: 'internal' }, 500); else res.end(); } catch (_) {}
+  });
+});
+process.on('unhandledRejection', (e) => {   // 0.113.1 (F18): never fatal — the LSP keeps its held state; the line is the alarm
+  console.error(`[Fatal?] unhandled rejection kept from exiting the process: ${e && e.stack ? e.stack.split('\n').slice(0, 4).join(' | ') : e}`);
 });
 
 // ── Startup ───────────────────────────────────────────────────────────────────

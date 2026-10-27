@@ -1,4 +1,4 @@
-// push.js — 0.82.0 (S49, DP GO 2026-09-25 01:07 — PUSH KEY, step B: the provider's half).
+// push.js — 0.82.0 (S49, DP GO 2026-09-25 01:07 — PUSH KEY, step B: the provider's half). 0.113.0: see the S63 note below.
 // 0.83.0 (S49, DP GO 15:37 — the first field finding): RECEIVABILITY FIRST. The recipient's provider asks
 // walletReceivable (the deliverToWallet law: room in the channel → in full; else a JIT open at the one
 // opening fee, or a refusal) before it mints a claim invoice or tries a direct delivery, and offers the
@@ -19,6 +19,21 @@
 // 0.84.0: a delivery our own LND refuses (TEMPORARY_CHANNEL_FAILURE from our link — no room after all) is retried
 // three times, then burned as no_room so the wallet reads it in words; the room itself is now computed right
 // (lij-adapter.js channelRoomMsat), so this is the rare race, not the rule.
+// 0.113.0 (S63, DP 2026-10-26 — his five Push points after his own test, B claiming while A was offline):
+//   (1) THE SENDER IS WOKEN when its push is TAKEN (and when it is RETURNED): the holder's LND can settle or fail the
+//       sender's HTLC only when the sender's wallet is online; a wallet that stays closed past the HTLC's timelock
+//       risks a force close (the holder's LND goes to chain to collect a settled HTLC; the sender's own LDK goes to
+//       chain to reclaim an expired one). The wake carries the time by which to open (the HTLC's expiry height less
+//       LND's 10-block broadcast delta, at ten minutes a block).
+//   (2) THE TIMELOCK MARGIN IS 144 BLOCKS (PUSH_CLTV_MARGIN_BLOCKS; was 40): after a last-minute claim the sender
+//       has about a day to come online before the holder must collect on-chain.
+//   (3) A HOLD FEE: PUSH_HOLD_FEE_PPM_PER_DAY — per million of the amount, per day of the window (rounded up to whole
+//       days), inside the lock's fee; the holder's liquidity sits behind the lock for the window and, after a take,
+//       until the sender's wallet settles it. Default 0 until the operator sets it.
+//   (4) (the lease: lij-adapter.js leaseCycle skips a channel with HTLCs on it.)
+//   (5) A CLAIM IS REFUSED WHEN THE SENDER'S CHANNEL IS GONE: before paying the recipient (direct or by invoice) the
+//       holder looks for the lock's HTLC on the sender's open channel (senderHtlc); a lock whose channel is closing or
+//       closed is one the holder could only collect on-chain — the claim answers sender_channel_closed, nothing is paid.
 // 0.85.0 (DP GO — "sealed"): THE NOTE. The sender's wallet seals its note with a key derived from the preimage and
 // hands this provider the ciphertext plus a lookup token derived the same way; this provider keeps a blob it
 // cannot read, and GET /push/note/<hash>?token= hands it to whoever holds the Push Key. Kept 7 days past the
@@ -55,10 +70,20 @@ function createPushRail(deps) {
     dataDir, lndGet, lndPost, deliverToWallet, isPeerConnected, sendWakePush, authOk, buildPublicHints,
     plRecord, leaseTouch, touchWalletActive, localPubkey, log, env = process.env, now = () => Date.now(), timers = { set: setTimeout, clear: clearTimeout },
     walletReceivable = async () => ({ ok: true, mode: 'channel', fee_msat: '0' }),   // 0.83.0: the deliverToWallet law, asked first
+    senderHtlc = async () => ({ ok: true }),   // 0.113.0 (5): the sender's lock on its open channel — {ok, chan_point, active, expiration_height, height} | {ok:false, reason} | {error}
+    proofCheck = null,   // 0.116.0 (F4): (fields, action, clientPk, recordId) → {ok} | {ok:false, code, status} — the node key's proof (lnurlpAuthCheck); null = not required (tests)
+    lndDelete = null,    // 0.116.0 (F6): DELETE a canceled invoice (DeleteCanceledInvoice) so a burned claim's hash can be claimed again here
   } = deps;
+  const sha256Hex = (s) => crypto.createHash('sha256').update(String(s), 'utf8').digest('hex');
+  const proofOf = (fields, action, clientPk, recordId) => (typeof proofCheck === 'function') ? proofCheck(fields, action, clientPk, recordId) : { ok: true };
+  const claimOpenBlock = new Map();   // 0.116.0 (F6): claimant pubkey → until ms — a key whose claim delivery burned after a JIT open waits 24 h before another claim that needs an open
+  const CLAIM_OPEN_BLOCK_MS = int(env.PUSH_CLAIM_OPEN_BLOCK_MS, 24 * 3600 * 1000);
   const FEE_BASE_MSAT = int(env.PUSH_DELIVERY_FEE_BASE_MSAT, 1000);
   const FEE_PPM = int(env.PUSH_DELIVERY_FEE_PPM, 2000);
-  const CLTV_MARGIN_BLOCKS = int(env.PUSH_CLTV_MARGIN_BLOCKS, 40);
+  const CLTV_MARGIN_BLOCKS = int(env.PUSH_CLTV_MARGIN_BLOCKS, 144);   // 0.113.0 (2): was 40 (DP 2026-10-26: "raise … for example to 144 (about a day)")
+  const HOLD_FEE_PPM_PER_DAY = int(env.PUSH_HOLD_FEE_PPM_PER_DAY, 0);   // 0.113.0 (3): the hold fee, per million per day of the window; 0 until the operator sets it
+  const LND_INCOMING_BROADCAST_DELTA = 10;   // LND goes to chain for a settled incoming HTLC this many blocks before its expiry
+  const DEFAULT_WINDOW_S = 72 * 3600;
   const MIN_AMOUNT_SATS = int(env.PUSH_MIN_SATS, 100);
   const MAX_AMOUNT_SATS = int(env.PUSH_MAX_SATS, 5_000_000);
   const WINDOW_MIN_S = 600, WINDOW_MAX_S = 7 * 24 * 3600;
@@ -77,7 +102,9 @@ function createPushRail(deps) {
   const watchers = new Map();   // hash → timeout id
   const expiryTimers = new Map();
 
-  const feeMsat = (amountMsat) => Math.max(FEE_BASE_MSAT + Math.ceil(Number(amountMsat) * FEE_PPM / 1_000_000), 1000);
+  const holdDays = (windowS) => Math.max(1, Math.ceil(Number(windowS || DEFAULT_WINDOW_S) / 86400));
+  const holdFeeMsat = (amountMsat, windowS) => HOLD_FEE_PPM_PER_DAY > 0 ? Math.ceil(Number(amountMsat) * HOLD_FEE_PPM_PER_DAY * holdDays(windowS) / 1_000_000) : 0;   // 0.113.0 (3)
+  const feeMsat = (amountMsat, windowS) => Math.max(FEE_BASE_MSAT + Math.ceil(Number(amountMsat) * FEE_PPM / 1_000_000) + holdFeeMsat(amountMsat, windowS), 1000);
   const blocksFor = (windowS) => Math.ceil(windowS / 600) + CLTV_MARGIN_BLOCKS;
   const short = (h) => String(h || '').slice(0, 16);
   const b64 = (hex) => Buffer.from(hex, 'hex').toString('base64');
@@ -114,6 +141,7 @@ function createPushRail(deps) {
     { uri: '/lnrpc.Lightning/ListPayments', call: () => lndGet('/v1/payments?max_payments=1') },
     { uri: '/routerrpc.Router/SendPaymentV2', call: () => lndPost('/v2/router/send', { timeout_seconds: 1 }) },
   ];
+  const DELETE_RPC = { uri: '/lnrpc.Lightning/DeleteCanceledInvoice', call: () => (typeof lndDelete === 'function' ? lndDelete('/v1/invoices?invoice_hash=' + '00'.repeat(32)) : Promise.resolve({ message: 'no lndDelete' })) };   // 0.116.0 (F6): probed apart — not a holder RPC
   async function probeKey() {
     const missing = [];
     for (const r of HOLDER_RPCS) {
@@ -121,23 +149,43 @@ function createPushRail(deps) {
       if (isPermErr(a)) missing.push(r.uri);
     }
     capability.cross_provider = missing.length === 0; capability.missing_rpcs = missing;
+    try { const a = await DELETE_RPC.call(); capability.delete_canceled = !isPermErr(a); if (!capability.delete_canceled) log('[PUSH-KEY] key probe: the macaroon lacks ' + DELETE_RPC.uri + ' — a burned claim\'s hash stays unclaimable here until the key is re-baked (MACAROON.md, 0.116.0)'); } catch (_) {}   // 0.116.0 (F6)
     if (missing.length) log(`[PUSH-KEY] THIS KEY CANNOT PASS A PUSH KEY TO ANOTHER PROVIDER (nor verify a void): the macaroon lacks ${missing.join(', ')} — re-bake with bake-permissions-nodelegate.json (0.83.1) or the full recipe; same-provider pushes still work`);
     else log('[PUSH-KEY] key probe: this provider can hold, deliver across providers and verify voids');
     return missing;
   }
 
+  // 0.114.0 (S63, Kimi round 2 F3 — DP "Fix this hole"): the settle call's answer is READ. lndRequest hands an LND error
+  // body back as data (never a throw), so "invoice already canceled" used to count as settled. Throws on any error body.
+  async function settleInvoice(preimageHex) {
+    const r = await lndPost('/v2/invoices/settle', { preimage: b64(preimageHex) });
+    const m = msgOf(r);
+    if (r && (m || r.code !== undefined)) throw new Error(m || ('LND code ' + r.code));
+    return r;
+  }
   // ── the outer settle, guarded: the preimage must open THIS hash ──
+  // 0.114.0 (F3): a settle that fails leaves the record settle_pending with the preimage KEPT and the watcher on — it
+  // retries the settle alone (never the inner delivery, which succeeded); the sender's wake waits for the real settle.
   async function settleOuter(rec, preimageHex, how) {
     if (sha256(preimageHex) !== rec.hash) { log(`[PUSH-KEY] ${short(rec.hash)}: a preimage that does not open the hash — refusing to settle (${how})`); return false; }
-    try { await lndPost('/v2/invoices/settle', { preimage: b64(preimageHex) }); }
-    catch (e) { log(`[PUSH-KEY] ${short(rec.hash)}: OUTER SETTLE FAILED after ${how} (${e.message}) — MANUAL ATTENTION`); return false; }
-    rec.status = 'taken'; rec.taken_at = now(); rec.preimage = preimageHex; delete rec.deliver_inflight_at; noteEnd(rec);   // 0.85.0
+    try { await settleInvoice(preimageHex); }
+    catch (e) {
+      rec.status = 'settle_pending'; rec.preimage = preimageHex; rec.settle_error = String(e.message || e).slice(0, 160); rec.settle_tries = (rec.settle_tries || 0) + 1; delete rec.deliver_inflight_at; persist();
+      log(`[PUSH-KEY] ${short(rec.hash)}: OUTER SETTLE FAILED after ${how} (${rec.settle_error}) — the recipient is paid; settle_pending, the watcher retries (try ${rec.settle_tries})`);
+      watchOut(rec.hash);
+      return false;
+    }
+    markTaken(rec, preimageHex, how);
+    return true;
+  }
+  function markTaken(rec, preimageHex, how) {
+    rec.status = 'taken'; rec.taken_at = now(); rec.preimage = preimageHex || rec.preimage || null; delete rec.deliver_inflight_at; delete rec.settle_error; noteEnd(rec);   // 0.85.0
     persist(); stopWatch(rec.hash);
     const t = expiryTimers.get(rec.hash); if (t) { timers.clear(t); expiryTimers.delete(rec.hash); }
     const kept = Math.max(0, Number(rec.fee_msat) - Number(rec.fee_spent_msat || 0));
     try { plRecord('push_fee', { msat: kept, moved_msat: Number(rec.amount_msat), wallet: rec.client_pubkey, hash: rec.hash }); } catch (_) {}
     log(`[PUSH-KEY] ${short(rec.hash)}: TAKEN — ${rec.amount_msat} msat delivered (${how}); fee kept ${kept} msat`);
-    return true;
+    wakeSender(rec, 'push_taken').catch(() => {});   // 0.113.0 (1): the sender's wallet settles the HTLC only when it is open
   }
 
   async function cancelOuter(rec, why, status) {
@@ -147,12 +195,49 @@ function createPushRail(deps) {
     persist(); stopWatch(rec.hash);
     const t = expiryTimers.get(rec.hash); if (t) { timers.clear(t); expiryTimers.delete(rec.hash); }
     log(`[PUSH-KEY] ${short(rec.hash)}: ${status.toUpperCase()} — ${why}`);
+    if (status === 'returned') wakeSender(rec, 'push_returned').catch(() => {});   // 0.113.0 (1): the fail-back reaches the sender's wallet only when it is open
+  }
+
+  // 0.113.0 (1): the sender's wake — the time by which to open is the lock's HTLC expiry less LND's broadcast delta,
+  // read from the sender's channel when it can be; without it the wake carries no time.
+  async function wakeSender(rec, kind) {
+    let untilMs = 0;
+    try {
+      const lk = await senderHtlc(rec.client_pubkey, rec.hash);
+      if (lk && lk.ok && Number.isFinite(Number(lk.expiration_height)) && Number.isFinite(Number(lk.height))) {
+        const left = Number(lk.expiration_height) - Number(lk.height) - LND_INCOMING_BROADCAST_DELTA;
+        if (left > 0) untilMs = left * 600 * 1000;
+      }
+    } catch (_) {}
+    log(`[PUSH-KEY] ${short(rec.hash)}: waking the sender ${rec.client_pubkey.slice(0, 16)}… (${kind}${untilMs ? ', open within ~' + Math.round(untilMs / 3600000) + ' h' : ''})`);
+    try { await sendWakePush(rec.client_pubkey, untilMs > 0 ? untilMs : undefined, kind); } catch (_) {}
+  }
+
+  // 0.113.0 (5): the holder pays nobody against a lock it could only collect on-chain — the lock's HTLC must sit on
+  // the sender's OPEN channel. Answers null when it does, else the refusal to send.
+  async function senderLockRefusal(rec) {
+    let lk; try { lk = await senderHtlc(rec.client_pubkey, rec.hash); } catch (e) { lk = { error: String(e.message || e) }; }
+    if (!lk || lk.error) { log(`[PUSH-KEY] ${short(rec.hash)}: could not read the sender's channel (${lk && lk.error || 'no answer'}) — not paying`); return { ok: false, error: 'sender_channel_unknown', reason: 'the holder could not check the sender\'s channel — try again in a minute', status: 503 }; }
+    if (!lk.ok) { log(`[PUSH-KEY] ${short(rec.hash)}: the sender's channel is closing or closed — REFUSING the claim (${lk.reason || 'no lock on an open channel'})`); return { ok: false, error: 'sender_channel_closed', reason: 'the sender\'s channel that holds this lock is closing or closed — this key can no longer be taken; the sats return to the sender on-chain', status: 409 }; }
+    return null;
   }
 
   function armExpiry(rec) {
     if (expiryTimers.has(rec.hash)) return;
     const left = rec.expiry * 1000 - now();
-    const fire = () => { expiryTimers.delete(rec.hash); const r = reg.out[rec.hash]; if (r && r.status === 'locked') cancelOuter(r, 'window over — nobody brought the key', 'returned').catch(() => {}); };
+    const fire = () => {
+      expiryTimers.delete(rec.hash); const r = reg.out[rec.hash];
+      if (!r || r.status !== 'locked') return;
+      // 0.114.0 (S63, Kimi round 2 F2 — DP "Fix this hole"): never cancel the hold while a delivery is in flight — the
+      // inner leg could still pay the recipient after the sender was refunded. A minute later, again; the probe meanwhile.
+      if (r._delivering || r.deliver_inflight_at) {
+        log(`[PUSH-KEY] ${short(rec.hash)}: window over but a delivery is in flight — the hold stays a minute more`);
+        if (r.deliver_inflight_at) probeDelivery(r).catch(() => {});
+        expiryTimers.set(rec.hash, timers.set(fire, 60000));
+        return;
+      }
+      cancelOuter(r, 'window over — nobody brought the key', 'returned').catch(() => {});
+    };
     if (left <= 0) { fire(); return; }
     expiryTimers.set(rec.hash, timers.set(fire, Math.min(left, 2_147_000_000)));
   }
@@ -187,12 +272,16 @@ function createPushRail(deps) {
         } else if (state === 'ACCEPTED' && rec.status === 'locked') {
           armExpiry(rec);
           if (rec.deliver_inflight_at) await probeDelivery(rec);
+        } else if (state === 'ACCEPTED' && rec.status === 'settle_pending') {   // 0.114.0 (F3): the retry — the settle alone, every 15 s
+          if (rec.preimage && (!rec.settle_last_try || now() - rec.settle_last_try >= 15000)) { rec.settle_last_try = now(); await settleOuter(rec, rec.preimage, 'settle retry'); }
         } else if (state === 'SETTLED') {
-          if (rec.status !== 'taken') { rec.status = 'taken'; rec.taken_at = now(); persist(); }
+          if (rec.status === 'settle_pending') markTaken(rec, rec.preimage, 'settled on retry');
+          else if (rec.status !== 'taken') { rec.status = 'taken'; rec.taken_at = now(); persist(); }
           stopWatch(hash);
         } else if (state === 'CANCELED') {
           if (rec.status === 'minted') { rec.status = 'unpaid'; rec.ended_at = now(); persist(); }
           else if (rec.status === 'locked') { rec.status = 'returned'; rec.ended_at = now(); rec.end_reason = rec.end_reason || 'canceled by LND'; persist(); }
+          else if (rec.status === 'settle_pending') { rec.status = 'paid_unsettled'; rec.ended_at = now(); rec.end_reason = 'the recipient was paid but LND cancelled the sender\'s hold before the settle — MANUAL ATTENTION'; persist(); log(`[PUSH-KEY] ${short(hash)}: PAID BUT UNSETTLED — the recipient has the sats, the sender's hold was cancelled (${rec.settle_error || 'settle failed'}) — MANUAL ATTENTION`); }   // 0.114.0 (F3)
           stopWatch(hash);
         } else if (state === 'OPEN' && rec.status === 'minted' && now() - rec.created > (LOCK_INVOICE_LIFE_S + 300) * 1000) {
           rec.status = 'unpaid'; rec.ended_at = now(); persist(); stopWatch(hash);
@@ -203,16 +292,56 @@ function createPushRail(deps) {
     watchers.set(hash, timers.set(tick, 250));
   }
 
+  // 0.114.0 (F3): the claim's settle, read. The recipient is paid; a settle that fails leaves settle_pending with the
+  // preimage kept, and the watcher retries the settle alone. The bookkeeping (PL, the lease touch) follows the real settle.
+  async function settleIn(rec, how) {
+    try { await settleInvoice(rec.preimage); }
+    catch (e) {
+      rec.status = 'settle_pending'; rec.settle_error = String(e.message || e).slice(0, 160); rec.settle_tries = (rec.settle_tries || 0) + 1; delete rec.deliver_inflight_at; persist();
+      log(`[PUSH-KEY] claim ${short(rec.hash)}: OUTER SETTLE FAILED after ${how} (${rec.settle_error}) — the recipient is paid; settle_pending, the watcher retries (try ${rec.settle_tries})`);
+      return false;
+    }
+    rec.status = 'settled'; rec.settled_at = now(); delete rec.settle_error; delete rec.deliver_inflight_at; persist(); stopWatch(rec.hash);
+    const ht = expiryTimers.get('in:' + rec.hash); if (ht) { timers.clear(ht); expiryTimers.delete('in:' + rec.hash); }
+    const fee = BigInt(rec.open_fee_msat || 0), inner = BigInt(rec.delivered_msat || rec.amount_msat);
+    try { plRecord(fee > 0n ? 'open_fee' : 'hold_fee', { msat: Number(fee), moved_msat: Number(inner), wallet: rec.client_pubkey, hash: rec.hash }); } catch (_) {}
+    try { leaseTouch(rec.client_pubkey, 'push:claimed'); } catch (_) {}
+    log(`[PUSH-KEY] claim ${short(rec.hash)}: SETTLED — ${inner} msat delivered to ${rec.client_pubkey.slice(0, 16)}… (fee ${fee} msat, ${how})`);
+    return true;
+  }
+  // 0.114.0 (F2, the claim side): a delivery that outran the RPC — LND still owns it; ask LND, never a second send
+  async function probeIn(rec) {
+    let r; try { r = await lndGet('/v1/payments?include_incomplete=true&reversed=true&max_payments=100'); } catch (_) { return; }
+    const pay = ((r && r.payments) || []).find((x) => String(x.payment_hash || '').toLowerCase() === rec.hash);
+    if (!pay) { if (now() - rec.deliver_inflight_at > 120000) { delete rec.deliver_inflight_at; persist(); } return; }
+    if (pay.status === 'SUCCEEDED' && /^[0-9a-f]{64}$/i.test(String(pay.payment_preimage || ''))) {
+      const pre = String(pay.payment_preimage).toLowerCase();
+      if (sha256(pre) !== rec.hash) { log(`[PUSH-KEY] claim ${short(rec.hash)}: the late preimage does not open the hash — not settling`); delete rec.deliver_inflight_at; persist(); return; }
+      rec.preimage = pre; if (!rec.delivered_msat) rec.delivered_msat = String(pay.value_msat || rec.amount_msat); if (!rec.open_fee_msat) rec.open_fee_msat = '0';
+      await settleIn(rec, 'late delivery success');
+    } else if (pay.status === 'FAILED') {
+      delete rec.deliver_inflight_at; rec.inner_fails = (rec.inner_fails || 0) + 1; persist();
+      log(`[PUSH-KEY] claim ${short(rec.hash)}: the in-flight delivery FAILED (${pay.failure_reason || 'FAILED'}) — try ${rec.inner_fails}, the next tick delivers again`);
+    }
+  }
   // ── the recipient's provider: the claim invoice and its delivery (the LNURLP shape) ──
   async function deliverIn(rec) {
     if (rec.status !== 'accepted' || rec._delivering) return;
+    if (rec.deliver_inflight_at) { await probeIn(rec); return; }   // 0.114.0 (F2): LND owns a delivery — probe, never a second send
     if (!(await isPeerConnected(rec.client_pubkey))) return;
     rec._delivering = true;
     try {
       const out = await deliverToWallet({ client: rec.client_pubkey, hashHex: rec.hash, secretHex: rec.secret, amountMsat: BigInt(rec.amount_msat), tag: 'PUSH claim', jitTag: 'push:' + short(rec.hash) });
       if (out.kind === 'refuse') { await cancelIn(rec, out.reason, refuseCode(out.reason)); return; }
-      if (out.kind === 'retry' || out.kind === 'rejected') { if (out.kind === 'rejected') log(`[PUSH-KEY] claim ${short(rec.hash)}: sendToRoute rejected: ${out.error}`); return; }
+      if (out.kind === 'retry' || out.kind === 'rejected') {
+        if (out.kind === 'rejected') {
+          if (/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(out.error || ''))) { rec.deliver_inflight_at = now(); persist(); log(`[PUSH-KEY] claim ${short(rec.hash)}: sendToRoute says LND still owns a delivery (${out.error}) — probing`); return; }   // 0.114.0 (F2)
+          log(`[PUSH-KEY] claim ${short(rec.hash)}: sendToRoute rejected: ${out.error}`);
+        }
+        return;
+      }
       const a = out.attempt;
+      if (a && a.status === 'HARD_TIMEOUT') { rec.deliver_inflight_at = now(); persist(); log(`[PUSH-KEY] claim ${short(rec.hash)}: the delivery hit the hard timeout — LND still owns it; probing, no second send`); return; }   // 0.114.0 (F2): a hard timeout is not a failed try
       if (!a || a.status !== 'SUCCEEDED') {
         const fc = a && a.failure ? a.failure.code : 'unknown';
         if (['INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', 'INVALID_ONION_VERSION', 'INVALID_ONION_HMAC', 'INVALID_ONION_KEY', 'INVALID_ONION_PAYLOAD'].includes(String(fc))) { await cancelIn(rec, 'recipient refused: ' + fc, 'recipient_refused'); return; }
@@ -225,13 +354,8 @@ function createPushRail(deps) {
       }
       const pre = preHex(a.preimage);
       if (sha256(pre) !== rec.hash) { log(`[PUSH-KEY] claim ${short(rec.hash)}: inner preimage does not open the hash — not settling`); return; }
-      try { await lndPost('/v2/invoices/settle', { preimage: b64(pre) }); }
-      catch (e) { log(`[PUSH-KEY] claim ${short(rec.hash)}: OUTER SETTLE FAILED after inner success (${e.message}) — MANUAL ATTENTION`); }
-      rec.status = 'settled'; rec.settled_at = now(); rec.delivered_msat = String(out.innerMsat); rec.open_fee_msat = String(out.feeMsat); persist(); stopWatch(rec.hash);
-      const ht = expiryTimers.get('in:' + rec.hash); if (ht) { timers.clear(ht); expiryTimers.delete('in:' + rec.hash); }
-      try { plRecord(out.feeMsat > 0n ? 'open_fee' : 'hold_fee', { msat: Number(out.feeMsat), moved_msat: Number(out.innerMsat), wallet: rec.client_pubkey, hash: rec.hash }); } catch (_) {}
-      try { leaseTouch(rec.client_pubkey, 'push:claimed'); } catch (_) {}
-      log(`[PUSH-KEY] claim ${short(rec.hash)}: SETTLED — ${out.innerMsat} msat delivered to ${rec.client_pubkey.slice(0, 16)}… (fee ${out.feeMsat} msat)`);
+      rec.preimage = pre; rec.delivered_msat = String(out.innerMsat); rec.open_fee_msat = String(out.feeMsat); persist();
+      await settleIn(rec, 'inner success');   // 0.114.0 (F3)
     } finally { delete rec._delivering; }
   }
   async function cancelIn(rec, why, code) {
@@ -239,6 +363,18 @@ function createPushRail(deps) {
     rec.status = 'burned'; rec.end_reason = why; rec.end_code = code || 'refused'; rec.ended_at = now(); persist(); stopWatch(rec.hash);
     const ht = expiryTimers.get('in:' + rec.hash); if (ht) { timers.clear(ht); expiryTimers.delete('in:' + rec.hash); }
     log(`[PUSH-KEY] claim ${short(rec.hash)}: BURNED — ${why}`);
+    // 0.116.0 (F6): a delivery that burned after a channel was opened for the claimant — that key waits 24 h before
+    // another claim that needs an open; and the canceled invoice is deleted from LND so the hash can be claimed here
+    // again by the real recipient (the squat's residue)
+    if (rec.rx_mode === 'open' && code !== 'claim_window_over' && code !== 'no_room') { claimOpenBlock.set(rec.client_pubkey, now() + CLAIM_OPEN_BLOCK_MS); log(`[PUSH-KEY] claim ${short(rec.hash)}: ${rec.client_pubkey.slice(0, 16)}… burned after a channel open — its claims that need an open wait ${Math.round(CLAIM_OPEN_BLOCK_MS / 3600000)} h`); }
+    if (typeof lndDelete === 'function') {
+      try {
+        const d = await lndDelete('/v1/invoices?invoice_hash=' + rec.hash);
+        if (isPermErr(d)) { if (capability.delete_canceled !== false) { capability.delete_canceled = false; log('[PUSH-KEY] this key cannot delete a canceled claim invoice (the macaroon lacks /lnrpc.Lightning/DeleteCanceledInvoice) — a burned claim\'s hash stays unclaimable on this provider until the key is re-baked (MACAROON.md, 0.116.0)'); } }
+        else if (msgOf(d)) log(`[PUSH-KEY] claim ${short(rec.hash)}: the canceled invoice stays in LND (${msgOf(d)})`);
+        else { capability.delete_canceled = true; rec.invoice_deleted = true; persist(); log(`[PUSH-KEY] claim ${short(rec.hash)}: the canceled claim invoice deleted from LND — the real recipient may claim this key here`); }
+      } catch (e) { log(`[PUSH-KEY] claim ${short(rec.hash)}: delete of the canceled invoice failed (${e.message})`); }
+    }
   }
   function watchIn(hash) {
     if (watchers.has(hash)) return;
@@ -251,16 +387,19 @@ function createPushRail(deps) {
         if (state === 'ACCEPTED' && rec.status === 'reserved') {
           rec.status = 'accepted'; rec.accepted_at = now(); persist();
           log(`[PUSH-KEY] claim ${short(hash)}: the holder's payment ACCEPTED (${inv.amt_paid_msat || rec.amount_msat} msat) — delivering to ${rec.client_pubkey.slice(0, 16)}…`);
-          if (!expiryTimers.has('in:' + hash)) expiryTimers.set('in:' + hash, timers.set(() => { expiryTimers.delete('in:' + hash); const r = reg.in[hash]; if (r && r.status === 'accepted') cancelIn(r, 'claim window over — the wallet did not take it', 'claim_window_over').catch(() => {}); }, CLAIM_HOLD_MS));
+          if (!expiryTimers.has('in:' + hash)) { const fireIn = () => { expiryTimers.delete('in:' + hash); const r = reg.in[hash]; if (!r || r.status !== 'accepted') return; if (r._delivering || r.deliver_inflight_at) { log(`[PUSH-KEY] claim ${short(hash)}: claim window over but a delivery is in flight — a minute more`); if (r.deliver_inflight_at) probeIn(r).catch(() => {}); expiryTimers.set('in:' + hash, timers.set(fireIn, 60000)); return; } cancelIn(r, 'claim window over — the wallet did not take it', 'claim_window_over').catch(() => {}); }; expiryTimers.set('in:' + hash, timers.set(fireIn, CLAIM_HOLD_MS)); }   // 0.114.0 (F2): never while a delivery is in flight
           try { Promise.resolve(sendWakePush(rec.client_pubkey, CLAIM_HOLD_MS)).catch(() => {}); } catch (_) {}   // 0.88.1: the wake states the claim window (it was the wallet's dial)
           deliverIn(rec).catch((e) => log(`[PUSH-KEY] claim deliver error: ${e.message}`));
         } else if (state === 'ACCEPTED' && rec.status === 'accepted') {
           deliverIn(rec).catch((e) => log(`[PUSH-KEY] claim deliver error: ${e.message}`));
+        } else if (state === 'ACCEPTED' && rec.status === 'settle_pending') {   // 0.114.0 (F3): the settle alone, retried every 15 s
+          if (rec.preimage && (!rec.settle_last_try || now() - rec.settle_last_try >= 15000)) { rec.settle_last_try = now(); await settleIn(rec, 'settle retry'); }
         } else if (state === 'SETTLED') {
-          if (rec.status !== 'settled') { rec.status = 'settled'; rec.settled_at = now(); persist(); }
+          if (rec.status !== 'settled') { rec.status = 'settled'; rec.settled_at = now(); delete rec.settle_error; persist(); }
           stopWatch(hash);
         } else if (state === 'CANCELED') {
-          if (rec.status !== 'burned') { rec.status = 'burned'; rec.end_reason = rec.end_reason || 'canceled/expired'; persist(); }
+          if (rec.status === 'settle_pending') { rec.status = 'paid_unsettled'; rec.end_reason = 'the recipient was paid but the holder\'s payment was cancelled before the settle — MANUAL ATTENTION'; persist(); log(`[PUSH-KEY] claim ${short(hash)}: PAID BUT UNSETTLED (${rec.settle_error || 'settle failed'}) — MANUAL ATTENTION`); }   // 0.114.0 (F3)
+          else if (rec.status !== 'burned') { rec.status = 'burned'; rec.end_reason = rec.end_reason || 'canceled/expired'; persist(); }
           stopWatch(hash);
         } else if (state === 'OPEN' && rec.status === 'reserved' && now() - (rec.armed_at || rec.created) > (LOCK_INVOICE_LIFE_S + 300) * 1000) {
           rec.idle_at = now(); persist(); stopWatch(hash);   // 0.83.2: idle, not burned — the invoice stays OPEN for a retry, which re-arms the watcher
@@ -284,16 +423,25 @@ function createPushRail(deps) {
   // ── same-provider delivery: the holder pays its own recipient directly and settles the sender's hold ──
   async function deliverDirect(rec, client, secret) {
     if (!(await isPeerConnected(client))) return { ok: false, reason: 'wallet not connected' };
-    const out = await deliverToWallet({ client, hashHex: rec.hash, secretHex: secret, amountMsat: BigInt(rec.amount_msat), tag: 'PUSH direct', jitTag: 'push:' + short(rec.hash) });
+    if (rec._delivering || rec.deliver_inflight_at) { if (rec.deliver_inflight_at) probeDelivery(rec).catch(() => {}); return { ok: false, error: 'in_flight', reason: 'a delivery for this key is already in flight', in_flight: true }; }   // 0.114.0 (F2): one delivery at a time
+    rec._delivering = true;   // 0.114.0 (F2): the expiry timer reads this (bootResume clears it)
+    let out;
+    try { out = await deliverToWallet({ client, hashHex: rec.hash, secretHex: secret, amountMsat: BigInt(rec.amount_msat), tag: 'PUSH direct', jitTag: 'push:' + short(rec.hash) }); }
+    finally { delete rec._delivering; }
     if (out.kind === 'refuse') return { ok: false, error: 'cannot_receive', reason: refuseCode(out.reason), detail: out.reason };
     if (out.kind === 'retry') return { ok: false, reason: 'retry: ' + out.reason };
-    if (out.kind === 'rejected') return { ok: false, reason: 'rejected: ' + out.error };
+    if (out.kind === 'rejected') {
+      if (/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(out.error || ''))) { rec.deliver_inflight_at = now(); rec.claimant = client; rec.fee_spent_msat = 0; persist(); log(`[PUSH-KEY] ${short(rec.hash)}: direct delivery — LND still owns a send (${out.error}); probing`); return { ok: false, error: 'in_flight', reason: 'in_flight', in_flight: true }; }   // 0.114.0 (F2)
+      return { ok: false, reason: 'rejected: ' + out.error };
+    }
     const a = out.attempt;
+    if (a && a.status === 'HARD_TIMEOUT') { rec.deliver_inflight_at = now(); rec.claimant = client; rec.fee_spent_msat = 0; persist(); log(`[PUSH-KEY] ${short(rec.hash)}: direct delivery hit the hard timeout — LND still owns it; probing`); return { ok: false, error: 'in_flight', reason: 'in_flight', in_flight: true }; }   // 0.114.0 (F2)
     if (!a || a.status !== 'SUCCEEDED') return { ok: false, reason: 'delivery did not succeed: ' + (a && a.failure ? a.failure.code : (a ? a.status : 'none')) };
     const pre = preHex(a.preimage);
     rec.claimant = client; rec.fee_spent_msat = 0; rec.delivered_msat = String(out.innerMsat); rec.open_fee_msat = String(out.feeMsat);
     const ok = await settleOuter(rec, pre, 'direct delivery');
-    return ok ? { ok: true, status: 'taken', mode: 'direct', delivered_msat: String(out.innerMsat), open_fee_msat: String(out.feeMsat) } : { ok: false, reason: 'outer settle failed — manual attention' };
+    // 0.114.0 (F3): the recipient HAS the sats either way — ok; settle_pending says the sender's hold settles on retry
+    return ok ? { ok: true, status: 'taken', mode: 'direct', delivered_msat: String(out.innerMsat), open_fee_msat: String(out.feeMsat) } : { ok: true, status: 'settle_pending', mode: 'direct', delivered_msat: String(out.innerMsat), open_fee_msat: String(out.feeMsat), note: 'the sats reached the recipient; the sender\'s hold settles on retry' };
   }
 
   // ── cross-provider delivery: the holder pays the recipient's provider's hold invoice for the hash ──
@@ -341,8 +489,8 @@ function createPushRail(deps) {
       const q = new URL(req.url || '', 'http://lsp.local').searchParams;
       const amountSats = Number(q.get('amount_sats'));
       if (!Number.isInteger(amountSats) || amountSats <= 0) return j({ ok: false, error: 'amount_sats required' }, 400);
-      const amountMsat = amountSats * 1000; const fee = feeMsat(amountMsat);
-      return j({ ok: true, amount_msat: String(amountMsat), fee_msat: String(fee), total_msat: String(amountMsat + fee), min_sats: MIN_AMOUNT_SATS, max_sats: MAX_AMOUNT_SATS, window_default_s: 72 * 3600, window_max_s: WINDOW_MAX_S, cltv_expiry: blocksFor(72 * 3600), holder: localPubkey(), cross_provider: capability.cross_provider !== false });   // 0.83.1
+      const amountMsat = amountSats * 1000; const fee = feeMsat(amountMsat, DEFAULT_WINDOW_S);   // 0.113.0 (3): the default window's hold fee inside
+      return j({ ok: true, amount_msat: String(amountMsat), fee_msat: String(fee), total_msat: String(amountMsat + fee), min_sats: MIN_AMOUNT_SATS, max_sats: MAX_AMOUNT_SATS, window_default_s: DEFAULT_WINDOW_S, window_max_s: WINDOW_MAX_S, cltv_expiry: blocksFor(DEFAULT_WINDOW_S), cltv_margin_blocks: CLTV_MARGIN_BLOCKS, hold_fee_ppm_per_day: HOLD_FEE_PPM_PER_DAY, hold_fee_msat: String(holdFeeMsat(amountMsat, DEFAULT_WINDOW_S)), holder: localPubkey(), cross_provider: capability.cross_provider !== false });   // 0.83.1
     }
     if (method === 'GET' && pathname.startsWith('/push/status/')) {
       const hash = pathname.slice('/push/status/'.length).toLowerCase();
@@ -382,6 +530,8 @@ function createPushRail(deps) {
       if (!isHex(hash, 64)) return j({ ok: false, error: 'bad hash' }, 400);
       const q = new URL(req.url || '', 'http://lsp.local').searchParams;
       const pk = String(q.get('client_pubkey') || '').toLowerCase();
+      if (!isHex(pk, 66)) return j({ ok: false, error: 'client_pubkey required' }, 400);
+      { const pr = proofOf({ node_pubkey: q.get('node_pubkey') || '', nonce: q.get('nonce') || '', signature: q.get('signature') || '' }, 'push-claim-status', pk, 'claim-status:' + hash + ':' + pk); if (!pr.ok) return j({ ok: false, error: 'auth: ' + pr.code }, pr.status || 401); }   // 0.116.0 (F4)
       const rec = reg.in[hash];
       if (!rec) return j({ ok: false, error: 'unknown' }, 404);
       if (rec.client_pubkey !== pk) return j({ ok: false, error: 'not yours' }, 403);
@@ -410,7 +560,7 @@ function createPushRail(deps) {
         if (!isHex(noteToken, 32)) return j({ ok: false, error: 'note_token must be 32 hex' }, 400);
       }
       const amountMsat = amountSats * 1000;
-      const fee = feeMsat(amountMsat);
+      const fee = feeMsat(amountMsat, expiry - nowS);   // 0.113.0 (3): the hold fee for this window
       const total = amountMsat + fee;
       const cltv = blocksFor(expiry - nowS);
       let bolt11;
@@ -449,13 +599,17 @@ function createPushRail(deps) {
       if (!authOk(req)) return j({ ok: false, error: 'auth' }, 401);
       const secret = String(body.secret || '').toLowerCase();
       if (!isHex(secret, 64)) return j({ ok: false, error: 'secret required' }, 400);
-      touchWalletActive(pk);
+      // 0.116.0 (S63, Kimi round 2 F4 — DP "Agreed"): the claimant's node key signs the claim — the hash, its own key, the
+      // secret's digest and the cross-provider fields; a stranger with the hash cannot claim under a wallet's pubkey
+      { const cr = proofOf(body, 'push-claim', pk, 'claim:' + hash + ':' + pk + ':' + sha256Hex(secret) + ':' + (Number.isInteger(Number(body.amount_sats)) && Number(body.amount_sats) > 0 ? String(Number(body.amount_sats)) : '0') + ':' + (Number.isInteger(Number(body.expiry)) && Number(body.expiry) > 0 ? String(Number(body.expiry)) : '0') + ':' + String(body.holder_prefix || '').toLowerCase().slice(0, 16)); if (!cr.ok) { log(`[PUSH-KEY] claim ${short(hash)} by ${pk.slice(0, 16)}… refused: ${cr.code}`); return j({ ok: false, error: 'auth: ' + cr.code }, cr.status || 401); } }
+      touchWalletActive(pk);   // proven
       const mine = reg.out[hash];
       if (mine) {
         if (mine.status !== 'locked') return j({ ok: false, error: 'not available', status: mine.status }, 409);
         if (mine.expiry * 1000 <= now()) return j({ ok: false, error: 'expired', status: mine.status }, 409);
         let rx; try { rx = await walletReceivable(pk, Number(mine.amount_msat)); } catch (e) { rx = { ok: true, mode: 'unknown', fee_msat: '0' }; }
         if (!rx.ok) { log(`[PUSH-KEY] ${short(hash)}: claim by ${pk.slice(0, 16)}… on this provider — the wallet cannot take ${mine.amount_msat} msat now (${rx.reason}: fee ${rx.fee_msat}, room ${rx.receivable_msat})`); return j(Object.assign({ ok: false, error: 'cannot_receive' }, rxFields(rx)), 409); }
+        const sr = await senderLockRefusal(mine); if (sr) { const st = sr.status; delete sr.status; return j(sr, st); }   // 0.113.0 (5)
         log(`[PUSH-KEY] ${short(hash)}: claim by ${pk.slice(0, 16)}… on this provider — direct delivery (${rx.mode}${rx.mode === 'open' ? ', opening fee ' + rx.fee_msat + ' msat' : ''})`);
         const r = await deliverDirect(mine, pk, secret);
         return j(r, r.ok ? 200 : 409);
@@ -476,6 +630,14 @@ function createPushRail(deps) {
         log(`[PUSH-KEY] claim ${short(hash)}: ${pk.slice(0, 16)}… asked again but LND holds a CANCELED invoice for the hash — this key cannot be claimed here again`);
         return j({ ok: false, error: 'claim_expired', reason: 'an earlier try of this key on this provider expired; LND will not mint the hash twice — only a new key from the sender can be claimed here' }, 409);
       }
+      // 0.116.0 (F6): a second PROVEN claimant replaces an unpaid (reserved, invoice OPEN) claim — a squat holds nothing once
+      // the real recipient asks; a claim the holder already paid (ACCEPTED) belongs to its claimant until it ends
+      if (existing && lndState === 'OPEN' && existing.bolt11 && existing.client_pubkey !== pk && (existing.status === 'reserved' || existing.status === 'burned')) {
+        log(`[PUSH-KEY] claim ${short(hash)}: ${pk.slice(0, 16)}… replaces the unpaid claim of ${existing.client_pubkey.slice(0, 16)}… (the same invoice; the first claimant's record ends)`);
+        existing.client_pubkey = pk; existing.secret = secret; existing.holder_prefix = String(body.holder_prefix || '').toLowerCase().slice(0, 16); existing.replaced_at = now(); existing.replaced_from = (existing.replaced_from || 0) + 1;
+        delete existing.inner_fails;
+      }
+      if (existing && lndState === 'ACCEPTED' && existing.client_pubkey !== pk) return j({ ok: false, error: 'claimed', reason: 'another wallet\'s claim of this key is being delivered on this provider', status: existing.status }, 409);
       if (existing && (lndState === 'OPEN' || lndState === 'ACCEPTED') && existing.bolt11 && existing.client_pubkey === pk) {
         if (existing.status === 'burned') { existing.status = lndState === 'ACCEPTED' ? 'accepted' : 'reserved'; delete existing.end_reason; delete existing.end_code; }
         existing.armed_at = now(); delete existing.idle_at; persist(); watchIn(hash);
@@ -483,6 +645,7 @@ function createPushRail(deps) {
         return j({ ok: true, mode: 'invoice', bolt11: existing.bolt11, holder_prefix: existing.holder_prefix, rx_mode: existing.rx_mode || null, open_fee_msat: existing.open_fee_msat || '0' });
       }
       let rx; try { rx = await walletReceivable(pk, amountSats * 1000); } catch (e) { rx = { ok: true, mode: 'unknown', fee_msat: '0' }; }
+      if (rx.ok && rx.mode === 'open' && (claimOpenBlock.get(pk) || 0) > now()) { log(`[PUSH-KEY] claim ${short(hash)}: ${pk.slice(0, 16)}… needs a channel opened but its last claim-open burned — refused for ${Math.ceil((claimOpenBlock.get(pk) - now()) / 3600000)} h more`); return j({ ok: false, error: 'claim_open_blocked', reason: 'this wallet\'s last claim burned after a channel was opened for it — a claim that needs an open waits ' + Math.ceil((claimOpenBlock.get(pk) - now()) / 3600000) + ' h', status: 429 }, 429); }   // 0.116.0 (F6)
       if (!rx.ok) { log(`[PUSH-KEY] claim ${short(hash)}: ${pk.slice(0, 16)}… cannot take ${amountSats} sats now (${rx.reason}: fee ${rx.fee_msat} msat, room ${rx.receivable_msat} msat) — nothing minted`); return j(Object.assign({ ok: false, error: 'cannot_receive' }, rxFields(rx)), 409); }
       let hints = []; try { hints = await buildPublicHints(BigInt(amountSats) * 1000n); } catch (_) {}
       let bolt11;
@@ -509,6 +672,8 @@ function createPushRail(deps) {
       if (rec.deliver_inflight_at) { await probeDelivery(rec); if (rec.status === 'taken') return j({ ok: true, status: 'taken' }); if (rec.deliver_inflight_at) return j({ ok: false, error: 'in_flight' }, 409); }
       const bolt11 = String(body.bolt11 || '').trim();
       if (!bolt11) return j({ ok: false, error: 'bolt11 required' }, 400);
+      { const dr = proofOf(body, 'push-deliver', pk, 'deliver:' + hash + ':' + pk + ':' + sha256Hex(bolt11.toLowerCase())); if (!dr.ok) { log(`[PUSH-KEY] ${short(hash)}: delivery ask by ${pk.slice(0, 16)}… refused: ${dr.code}`); return j({ ok: false, error: 'auth: ' + dr.code }, dr.status || 401); } }   // 0.116.0 (F4): the claimant signs the invoice it hands over
+      const sr = await senderLockRefusal(rec); if (sr) { const st = sr.status; delete sr.status; return j(sr, st); }   // 0.113.0 (5)
       log(`[PUSH-KEY] ${short(hash)}: delivery asked by ${pk.slice(0, 16)}… — paying the recipient's provider`);
       const r = await deliverByInvoice(rec, bolt11, pk);
       return j(r, r.ok ? 200 : (r.in_flight ? 202 : 409));
@@ -519,8 +684,8 @@ function createPushRail(deps) {
   function bootResume() {
     probeKey().catch((e) => log(`[PUSH-KEY] key probe failed: ${e.message}`));   // 0.83.1: the holder's key, checked once per boot
     let n = 0;
-    for (const rec of Object.values(reg.out)) if (rec.status === 'minted' || rec.status === 'locked') { delete rec._delivering; watchOut(rec.hash); if (rec.status === 'locked') armExpiry(rec); n++; }
-    for (const rec of Object.values(reg.in)) if (rec.status === 'reserved' || rec.status === 'accepted') { delete rec._delivering; watchIn(rec.hash); n++; }
+    for (const rec of Object.values(reg.out)) if (rec.status === 'minted' || rec.status === 'locked' || rec.status === 'settle_pending') { delete rec._delivering; watchOut(rec.hash); if (rec.status === 'locked') armExpiry(rec); n++; }
+    for (const rec of Object.values(reg.in)) if (rec.status === 'reserved' || rec.status === 'accepted' || rec.status === 'settle_pending') { delete rec._delivering; watchIn(rec.hash); n++; }   // 0.114.0 (F3)
     if (n) log(`[PUSH-KEY] boot: resumed ${n} watcher(s)`);
     return n;
   }
@@ -528,10 +693,10 @@ function createPushRail(deps) {
     const o = Object.values(reg.out), i = Object.values(reg.in);
     return { locked: o.filter((r) => r.status === 'locked').length, taken: o.filter((r) => r.status === 'taken').length, returned: o.filter((r) => r.status === 'returned' || r.status === 'void').length, claims_open: i.filter((r) => r.status === 'reserved' || r.status === 'accepted').length };
   }
-  const settings = () => ({ fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, cltv_margin_blocks: CLTV_MARGIN_BLOCKS, min_sats: MIN_AMOUNT_SATS, max_sats: MAX_AMOUNT_SATS, window_max_s: WINDOW_MAX_S });
+  const settings = () => ({ fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, hold_fee_ppm_per_day: HOLD_FEE_PPM_PER_DAY, cltv_margin_blocks: CLTV_MARGIN_BLOCKS, min_sats: MIN_AMOUNT_SATS, max_sats: MAX_AMOUNT_SATS, window_max_s: WINDOW_MAX_S });
   const capability = { holder: true, claim: true, window_max_s: WINDOW_MAX_S, fee_base_msat: FEE_BASE_MSAT, fee_ppm: FEE_PPM, cross_provider: true, missing_rpcs: [], sealed_note: true };   // 0.83.1: cross_provider set by probeKey at boot; 0.85.0: sealed_note
 
-  return { handle, bootResume, summary, settings, capability, feeMsat, blocksFor, probeKey, pruneNotes, _reg: () => reg, _tickOut: watchOut, _tickIn: watchIn };
+  return { handle, bootResume, summary, settings, capability, feeMsat, holdFeeMsat, blocksFor, probeKey, pruneNotes, _reg: () => reg, _tickOut: watchOut, _tickIn: watchIn };
 }
 
 module.exports = { createPushRail, VOID_DOMAIN };

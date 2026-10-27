@@ -64,7 +64,7 @@ const check = (cond, m) => { if (!cond) { fails++; console.log('FAIL · ' + m); 
   check(holds.length === 5, 'the five held-payment wakes each state the watchdog\'s own window (found ' + holds.length + ')');
   check(!/sendWakePush\([a-z_.]+\)\.catch/.test(src), 'no wake is sent without a window or an explicit "none"');
   check(/sendWakePush\(c\.remote_pubkey, null\)\.catch\(\(\) => \{\}\);  \/\* v0\.41\.0: notify-on-uncertain-resume/.test(src), 'the uncertain resume (nothing held) states no time');
-  check(/sendWakePush: \(pk, ms\) => sendWakePush\(pk, ms\), authOk/.test(src), 'the Push Key hook carries the number through');
+  check(/sendWakePush: \(pk, ms, kind\) => sendWakePush\(pk, ms, kind\), authOk/.test(src), 'the Push Key hook carries the number through (and, since 0.113.0, the kind)');
   check(/if \(_lh > 0\) sendWakePush\(rec\.client_pubkey, _lh\)/.test(src), 'a Lightning-address payment to a wallet set to Off (returned at once) wakes nobody');
   check(/sendWakePush\(rec\.client_pubkey, CLAIM_HOLD_MS\)/.test(pushSrc), 'the Push Key claim wake states the claim window');
   check(!/sendWakePush\(rec\.client_pubkey\)\./.test(pushSrc), 'push.js has no dial-quoting wake left');

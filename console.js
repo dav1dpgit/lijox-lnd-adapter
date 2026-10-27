@@ -185,6 +185,12 @@ function render(d){
     var ht=hd.length?'<div class="dim" style="margin:6px 0">held payments (the wallet is being woken)</div><div class="tbl"><table><tr><th>hash</th><th>kind</th><th>wallet</th><th class="n">sats</th><th>held for</th><th>fails at block</th></tr>'+hd.map(function(x){return '<tr><td class="mono">'+esc(x.payment_hash)+'\\u2026</td><td>'+esc(x.kind)+'</td><td class="mono">'+esc(x.client)+'\\u2026</td><td class="n">'+fmt(Math.round(Number(x.amount_msat)/1000))+'</td><td>'+(x.age_s<120?fmt(x.age_s)+' s':fmt(Math.round(x.age_s/60))+' min')+'</td><td>'+(x.auto_fail_height?fmt(x.auto_fail_height):'\\u2014')+'</td></tr>'}).join('')+'</table></div>':'';
     setPane('jitnow',ph+pt+at+ht+(pr.length||ag.length||hd.length?'':'<div class="dim">quiet</div>'));
   }
+  // 0.113.0 (S63): Routing reports — the wallets' signed reports of refusing nodes and what went into LND's routing memory.
+  var rr=d.routing_reports;if(!rr){setPane('routerep','<span class="dim">no report</span>')}else{
+    var rl=(rr.last||[]).slice().reverse();
+    setPane('routerep',kv([['reports received',fmt(rr.received)],['pairs written into LND',fmt(rr.imported)],['reports refused',fmt(rr.refused)],['cap per wallet',fmt(rr.cap_per_hour)+' pairs an hour'],['routes remembered',fmt(rr.handouts_remembered)+' <span class="dim">(15 min, for the check that a report names only routes this node handed out)</span>',1]])
+      +(rl.length?'<div class="dim" style="margin:6px 0">last reports</div>'+rl.map(function(x){return '<div class="mono" style="font-size:11px">'+esc(ago(x.at))+' · '+esc(x.line)+'</div>'}).join(''):'<div class="dim">none yet</div>'));
+  }
   // 0.77.0 (DP): the delegate rail's guardrails — the daily breaker (limit, what it has
   // counted in the rolling 24 h, when it last moved) and its siblings.
   var dg=d.delegate;
@@ -355,6 +361,7 @@ function pageConsole() {
 <main>
 <section class="card"><h2>Guardrails</h2><div id="guard" class="dim">\u2026</div></section>
 <section class="card"><h2>JIT \u00b7 now</h2><div id="jitnow" class="dim">\u2026</div></section>
+<section class="card"><h2>Routing reports</h2><div id="routerep" class="dim">\u2026</div></section>
 <section class="card"><h2>Delegate rail</h2><div id="delegate" class="dim">\u2026</div></section>
 <section class="card"><h2>NWC</h2><div id="nwc" class="dim">\u2026</div></section>
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>

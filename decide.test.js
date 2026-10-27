@@ -45,7 +45,7 @@ check(/row\('Offline hold', 'hold for offline wallets', 'LSPS2_OFFLINE_HOLD_ENAB
 check(/offline_hold:\s+\{ enabled: OFFLINE_HOLD_ENABLED, cap_ms: OFFLINE_HOLD_CAP_MS, headroom_blocks: OFFLINE_MIN_HEADROOM_BLOCKS \}/.test(src), 'get_info carries offline_hold {enabled, cap_ms, headroom_blocks}');
 check(/hold_ms_effective: OFFLINE_HOLD_ENABLED \? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED/.test(src), 'the prefs answer says hold_enabled and answers 0 when the provider does not hold');
 check(/cannot hold \(enabled=\$\{OFFLINE_HOLD_ENABLED\}, wallet dial=/.test(src), 'the cannot-hold line names the wallet\'s dial');
-check((src.match(/SM\.emit\('trampoline'/g) || []).length === 4, 'the trampoline reports start, the two failures and the success to the state machine');
+check((src.match(/SM\.emit\('trampoline'/g) || []).length === 8, 'the trampoline reports start, the two failures, the success, the two in-flight parks (0.114.0 F1) and the park\'s two verdicts to the state machine');
 // the state machine, run for real: a hold delivered by the trampoline ends SETTLED, a failed one returns to HOLDING
 {
   const SM = require(require('path').join(__dirname, 'lij-sm.js'));
