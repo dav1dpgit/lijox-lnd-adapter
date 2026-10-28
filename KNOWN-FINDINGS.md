@@ -171,6 +171,36 @@ must).
   (a1–a2) pins the record rule with the engine's own vectors and the refusals.
 
 
+## 2026-10-27 — Kimi K3.1 Pro's round 2, F13 / F24 / K6a: signed writes sign their effect (0.119.0, with engine v358, page v1074 and lij-worker 0.18.0)
+
+DP 12:21 ("Agreed on all of 0 … and then 3. Go"). Three findings of the second round, each needing the engine, the
+adapter and the worker in lockstep; each reachable only by a party on the path (the tunnel or relay operator, or a
+broken TLS) who keeps a wallet's real signature and swaps what rides beside it:
+- **F13 — three signed writes did not sign the data that decides their effect.** The channel record's proof bound the
+  `channel_id` alone (`registry.js`: the funding outpoint, the value, the keys id and a close could all be swapped);
+  the push subscription's proof bound nothing of the subscription (`handlePushSubscribe`: the endpoint and keys could
+  be replaced — wake pushes to a stranger's endpoint); the Lightning-address registration's record covered each
+  entry's hash alone (`lnurlpRegisterRecordId`: the secret, the life and the index were uncovered). FIXED: the records
+  now bind every field — `post-channel` "<channel_id>:<sha256 over the canonical record's other fields>"
+  (`channelRecordId`), `push-subscribe` "sub:<sha256 over endpoint, p256dh, auth>" (`pushSubscriptionRecordId`),
+  `lnurl-register` lines of `hash:secret:expires:index` — the twins of lij-core registry_client's
+  `channel_record_id`, `push_subscription_record_id` and `lnurlp_register_record_id` (engine v358), pinned by vectors
+  on both sides (registry.test.js, lnurlp-auth.test.js, push-subscribe-proof.test.js). The OLD forms are accepted
+  for THIS ONE RELEASE and logged ("signed in the OLD form … an engine before v358") — this release rides before the
+  engine; 0.120.0 refuses them.
+- **F24 — TapeDrop accepted a tape under any CONNECTED pubkey.** `/tapedrop`'s only check was that the claimed
+  `client_pubkey` was a connected peer, so any connected peer could file evidence under another wallet's key. FIXED:
+  a page from v1074 sends the tape as text (`tape_json`) with the node key's proof over
+  `tapedrop:<tape_id>:<sha256 of the text>` (`tapedropRecordId`, lnurlpAuthCheck — the 0.112.0 digest; "tapedrop"
+  joins the engine's fixed proof list) and the file holds that text; an older page's unsigned drop is still taken this
+  one release through the old peer check, its file named `claimed-…` and the journal saying the attribution was never
+  proven; 0.120.0 refuses unsigned drops. tapedrop-proof.test.js (10).
+- **K6a — the cloud-copy push's proof bound no copy** (the worker's finding 6a: the digest was action‖nonce‖pubkey, so a
+  captured authorisation could push any copy at any number). Not this repository's code: FIXED in lij-worker 0.18.0
+  (`lij-backup-v2`: the digest carries the copy's fingerprint and its number; v1 still taken from older engines for one
+  release) and engine v358 (signs v2, says `auth_v: 2`). Recorded here because the three ride together.
+- **/recover** carried in this release is the wallet repo's v989 (the directory's two doors, the direct door first).
+
 ## 2026-10-26 — Phase C: the registry's two doors (0.118.0, with lij-worker 0.17.0 and lij-registry on the UM890)
 
 DP 21:41: "keep the worker as the Cloudflare door. Agreed that the box has the same rules as the worker so they

@@ -209,6 +209,28 @@ function canonicalizeRecord(rec) {
   return out;
 }
 
+// ── 0.119.0 (S64, Kimi K3.1 Pro round 2 F13 — engine v358): SIGNED WRITES SIGN THEIR EFFECT ───────────────────────
+// The channel record's proof used to bind the channel_id alone and the push subscription's proof nothing of the
+// subscription — a party on the path could keep a wallet's signature and swap the rest. The records now:
+//   post-channel    "<channel_id>:<sha256 hex over 'funding_txid\nfunding_vout\nchannel_value_sat\ncommit_type\n
+//                   channel_keys_id_hex\nclose_height|\nclosing_txid|'>" — the CANONICAL record's own fields in its own
+//                   order; an absent optional is the empty string
+//   push-subscribe  "sub:<sha256 hex over 'endpoint\np256dh\nauth'>" — verbatim (the keys are base64url; case is content)
+// The twins of lij-core registry_client::channel_record_id / push_subscription_record_id; registry.test.js pins the
+// engine's own vectors. For ONE release (0.119.0) the old forms are still accepted — the engine ride follows this ride —
+// and logged as such; 0.120.0 refuses them.
+function channelRecordId(canonical) {
+  const opt = (v) => (v === undefined || v === null) ? '' : String(v);
+  const line = [String(canonical.funding_txid).toLowerCase(), String(canonical.funding_vout), String(canonical.channel_value_sat), String(canonical.commit_type),
+    String(canonical.channel_keys_id_hex).toLowerCase(), opt(canonical.close_height), opt(canonical.closing_txid).toLowerCase()].join('\n');
+  return String(canonical.channel_id).toLowerCase() + ':' + crypto.createHash('sha256').update(line, 'utf8').digest('hex');
+}
+function pushSubscriptionRecordId(subscription) {
+  const s = subscription || {}; const k = s.keys || {};
+  if (typeof s.endpoint !== 'string' || typeof k.p256dh !== 'string' || typeof k.auth !== 'string') return null;
+  return 'sub:' + crypto.createHash('sha256').update(s.endpoint + '\n' + k.p256dh + '\n' + k.auth, 'utf8').digest('hex');
+}
+
 /**
  * Byte-exact comparison of two canonicalized records via JSON.
  */
@@ -531,13 +553,16 @@ function makeRegistryRouter({ nonceStore, channelStore, jsonResponse, errRespons
     // Build signed message and verify signature BEFORE consuming the nonce.
     // record_id binds the signature to the specific channel -- replay against
     // a different channel_id is rejected.
-    const message = buildSignedMessage(
-      ACTION_POST_CHANNEL,
-      nonce,
-      node_pubkey,
-      record.channel_id.toLowerCase(),
-    );
-    const sigResult = verifySignature(message, signature, node_pubkey);
+    // 0.119.0 (F13): the record_id binds the WHOLE canonical record (channelRecordId); the old form (the channel id
+    // alone, engines before v358) is accepted for this one release and logged.
+    const canonicalForId = canonicalizeRecord(record);
+    const message = buildSignedMessage(ACTION_POST_CHANNEL, nonce, node_pubkey, channelRecordId(canonicalForId));
+    let sigResult = verifySignature(message, signature, node_pubkey);
+    if (!sigResult.ok) {
+      const old = buildSignedMessage(ACTION_POST_CHANNEL, nonce, node_pubkey, record.channel_id.toLowerCase());
+      sigResult = verifySignature(old, signature, node_pubkey);
+      if (sigResult.ok) console.log(`[Registry] POST channel_id=${String(record.channel_id).slice(0, 16)}… signed in the OLD form (the channel id alone — an engine before v358); accepted this release`);
+    }
     if (!sigResult.ok) {
       return fail(res, 401, sigResult.code);
     }
@@ -645,6 +670,8 @@ module.exports = {
   verifySignature,
   validateChannelRecord,
   canonicalizeRecord,
+  channelRecordId,            // 0.119.0 (F13)
+  pushSubscriptionRecordId,   // 0.119.0 (F13)
   recordsEqual,
   storeAndConfirm,
   // Constants

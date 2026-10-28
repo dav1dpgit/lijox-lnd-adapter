@@ -710,6 +710,15 @@ function tapesSweep(dir, incomingBytes, maxBytes, keepMs, nowMs) {
   }
   return { ok: total + incomingBytes <= maxBytes, total, unlinked };
 }
+// 0.119.0 (S64, Kimi round 2 F24 — engine v358 / page v1074): a tape is evidence filed under a wallet's key. Until now
+// the only check was that the claimed pubkey was a connected peer — any connected peer could file a tape under any other
+// connected wallet's key. A page from v1074 sends the tape as TEXT (tape_json) with the node key's proof over
+// "tapedrop:<tape_id>:<sha256 hex of that text>" (lnurlpAuthCheck, the 0.112.0 digest); the file holds that text. An
+// older page's unsigned drop is still taken this one release, through the old peer check, and its file is named
+// `claimed-…` so a reader knows the attribution was never proven; 0.120.0 refuses unsigned drops.
+function tapedropRecordId(tapeId, tapeJson) {
+  return 'tapedrop:' + String(tapeId) + ':' + crypto.createHash('sha256').update(String(tapeJson), 'utf8').digest('hex');
+}
 async function handleTapeDrop(req, res, ip) {
   const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   if (tdRateLimited(ip)) return reply(429, { ok: false, code: 'RATE_LIMITED' });
@@ -717,22 +726,32 @@ async function handleTapeDrop(req, res, ip) {
   try { b = await readBody(req); } catch (e) { return reply(400, { ok: false, code: 'BAD_JSON' }); }
   const pk = String(b.client_pubkey || '').toLowerCase();
   if (!/^[0-9a-f]{66}$/.test(pk)) return reply(400, { ok: false, code: 'BAD_FIELDS' });
-  const peers = await peersConnectedSet();
-  if (!peers.has(pk)) return reply(403, { ok: false, code: 'PUBKEY_NOT_CONNECTED' });
-  const payload = JSON.stringify(b.tape || b);
-  if (payload.length > 262144) return reply(413, { ok: false, code: 'TOO_LARGE' });
   const id8 = String(b.tape_id || Date.now()).replace(/[^0-9a-zA-Z_-]/g, '').slice(0, 24) || String(Date.now());
-  const fname = require('path').join(TAPES_DIR, Date.now() + '-' + id8 + '.json');
+  let payload, proven = false;
+  if (typeof b.tape_json === 'string' || b.node_pubkey || b.signature) {
+    if (typeof b.tape_json !== 'string') return reply(400, { ok: false, code: 'BAD_FIELDS', field: 'tape_json' });
+    if (b.tape_json.length > 262144) return reply(413, { ok: false, code: 'TOO_LARGE' });
+    const auth = lnurlpAuthCheck(b, 'tapedrop', pk, tapedropRecordId(id8, b.tape_json));
+    if (!auth.ok) return reply(auth.status, { ok: false, code: auth.code });
+    try { JSON.parse(b.tape_json); } catch (e) { return reply(400, { ok: false, code: 'BAD_JSON', field: 'tape_json' }); }
+    payload = b.tape_json; proven = true;
+  } else {
+    const peers = await peersConnectedSet();
+    if (!peers.has(pk)) return reply(403, { ok: false, code: 'PUBKEY_NOT_CONNECTED' });
+    payload = JSON.stringify(b.tape || b);
+    if (payload.length > 262144) return reply(413, { ok: false, code: 'TOO_LARGE' });
+  }
+  const fname = require('path').join(TAPES_DIR, (proven ? '' : 'claimed-') + Date.now() + '-' + id8 + '.json');
   const sw = tapesSweep(TAPES_DIR, Buffer.byteLength(payload), TAPES_MAX_BYTES, TAPES_KEEP_DAYS * 86400000, Date.now());   // 0.115.0 (F17)
   if (sw.unlinked) console.log(`[TapeDrop] store at the cap (${Math.round(sw.total / 1048576)} MiB of ${Math.round(TAPES_MAX_BYTES / 1048576)}) — ${sw.unlinked} tape(s) older than ${TAPES_KEEP_DAYS} days unlinked`);
   if (!sw.ok) { console.warn(`[TapeDrop] store FULL (${Math.round(sw.total / 1048576)} MiB, every tape younger than ${TAPES_KEEP_DAYS} days) — drop from ${pk.slice(0, 16)}… refused`); return reply(507, { ok: false, code: 'TAPES_FULL' }); }
   try { require('fs').writeFileSync(fname, payload); } catch (e) { return reply(500, { ok: false, code: 'WRITE_FAILED' }); }
   let digest = '';
   try {
-    const t = b.tape || b;
+    const t = proven ? JSON.parse(payload) : (b.tape || b);
     digest = ' reason=' + String((t.reason || '')).slice(0, 60) + ' events=' + ((t.tape && t.tape.events) ? t.tape.events.length : '?') + ' tip=' + JSON.stringify((t.tape && t.tape.bridge_tip) || null);
   } catch (e) {}
-  console.log('[TapeDrop] ' + pk.slice(0, 16) + '\u2026 \u2192 ' + fname.split('/').pop() + digest);
+  console.log('[TapeDrop] ' + pk.slice(0, 16) + '\u2026 \u2192 ' + fname.split('/').pop() + digest + (proven ? '' : ' (unsigned — attribution claimed, not proven; refused from 0.120.0)'));
   try { telemetrySeen(pk); } catch (e) {}  // v0.44.0: meter the expectation
   return reply(200, { ok: true });
 }
@@ -819,6 +838,7 @@ const {
   MemoryChannelStore: RegistryMemoryChannelStore,
   buildSignedMessage: registryBuildSignedMessage,
   verifySignature: registryVerifySignature,
+  pushSubscriptionRecordId,   // 0.119.0 (F13)
   NONCE_LENGTH: REGISTRY_NONCE_LENGTH,
 } = require('./registry');
 
@@ -1538,7 +1558,24 @@ async function lnurlpNameAt(kind, name, toPubkey) {   // 0.116.0 (K1): kind 'tra
 // The twin of lij-core registry_client::lnurlp_register_record_id — the rule is pinned by lnurlp-auth.test.js with the
 // engine's own vectors. The signer must be the record's key (node_pubkey = client_pubkey). No grace period: an unsigned
 // call is 401.
+// 0.119.0 (S64, Kimi round 2 F13 — engine v358): the line of an entry is EVERY field that decides its effect —
+// "<hash>:<secret>:<expires>:<index|>\n", hash and secret ASCII-lowercased, numbers as digits, an absent index empty,
+// sorted bytewise — not the hash alone (a party on the path could keep the hash and swap the secret, the life or the
+// index under the wallet's own signature). An empty probe is unchanged (count 0, the sha256 of nothing). The hash-alone
+// form (lnurlpRegisterRecordIdV1, engines before v358) is accepted for this one release — the engine ride follows this
+// ride — and logged; 0.120.0 refuses it.
 function lnurlpRegisterRecordId(name, hashes) {
+  const field = (e, k) => { const v = e[k]; return typeof v === 'string' ? v.replace(/[A-Z]/g, (c) => c.toLowerCase()) : (typeof v === 'number' && Number.isFinite(v)) ? String(v) : ''; };
+  const lines = [];
+  for (const e of (Array.isArray(hashes) ? hashes : [])) {
+    if (e && typeof e === 'object' && !Array.isArray(e) && typeof e.hash === 'string') lines.push(field(e, 'hash') + ':' + field(e, 'secret') + ':' + field(e, 'expires') + ':' + field(e, 'index') + '\n');
+  }
+  lines.sort((a, b) => Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')));
+  const h = crypto.createHash('sha256');
+  for (const x of lines) h.update(x, 'utf8');
+  return String(name).replace(/[A-Z]/g, (c) => c.toLowerCase()) + ':' + lines.length + ':' + h.digest('hex');
+}
+function lnurlpRegisterRecordIdV1(name, hashes) {   // 0.112.0's form, kept for 0.119.0 alone
   const hs = [];
   for (const e of (Array.isArray(hashes) ? hashes : [])) {
     if (e && typeof e === 'object' && !Array.isArray(e) && typeof e.hash === 'string') hs.push(e.hash.replace(/[A-Z]/g, (c) => c.toLowerCase()));
@@ -2415,8 +2452,14 @@ async function handlePushSubscribe(req, res) {
       !subscription.keys || !subscription.keys.p256dh || !subscription.keys.auth) {
     return jsonResponse(res, { error: 'field_bad', field: 'subscription' }, 400);
   }
-  const message = registryBuildSignedMessage('push-subscribe', nonce, node_pubkey);
-  const sig = registryVerifySignature(message, signature, node_pubkey);
+  // 0.119.0 (F13): the proof binds the subscription (pushSubscriptionRecordId); the old form (nothing bound, engines
+  // before v358) is accepted for this one release and logged.
+  const subRecord = pushSubscriptionRecordId(subscription);
+  let sig = registryVerifySignature(registryBuildSignedMessage('push-subscribe', nonce, node_pubkey, subRecord), signature, node_pubkey);
+  if (!sig.ok) {
+    sig = registryVerifySignature(registryBuildSignedMessage('push-subscribe', nonce, node_pubkey), signature, node_pubkey);
+    if (sig.ok) console.log(`[PUSH] subscription for ${String(node_pubkey).toLowerCase().slice(0, 16)}… signed in the OLD form (nothing of it bound — an engine before v358); accepted this release`);
+  }
   if (!sig.ok) {
     return jsonResponse(res, { error: sig.code || 'bad_signature' }, 401);
   }
@@ -7006,7 +7049,11 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     }
     const name = body.name.toLowerCase();
     // 0.112.0 (S63, F7): the node key's proof over THIS body — the name, the count and the hashes — or nothing happens
-    const auth = lnurlpAuthCheck(body, 'lnurl-register', body.client_pubkey, lnurlpRegisterRecordId(name, body.hashes));
+    let auth = lnurlpAuthCheck(body, 'lnurl-register', body.client_pubkey, lnurlpRegisterRecordId(name, body.hashes));
+    if (!auth.ok && auth.status === 401 && auth.code !== 'signature required') {   // 0.119.0: the hash-alone form (engines before v358), this release only
+      const old = lnurlpAuthCheck(body, 'lnurl-register', body.client_pubkey, lnurlpRegisterRecordIdV1(name, body.hashes));
+      if (old.ok) { console.log(`[LNURLP] register: ${name} signed in the OLD form (the hashes alone — an engine before v358); accepted this release`); auth = old; }
+    }
     if (!auth.ok) {
       console.warn(`[LNURLP] register ${name} by ${String(body.client_pubkey).slice(0, 16)}… refused: ${auth.code}`);
       return jsonResponse(res, { ok: false, error: 'auth: ' + auth.code }, auth.status);

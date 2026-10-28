@@ -30,6 +30,8 @@ const {
   canonicalizeRecord,
   storeAndConfirm,
   ACTION_POST_CHANNEL,
+  channelRecordId,
+  pushSubscriptionRecordId,
   ACTION_GET_CHANNELS,
 } = require('./registry');
 
@@ -301,8 +303,8 @@ async function main() {
     const { nonce } = ch.captured.body;
     assert(/^[0-9a-f]{64}$/.test(nonce));
 
-    // POST /lsps/registry/channels
-    const postMsg = buildSignedMessage(ACTION_POST_CHANNEL, nonce, kp.pubHex, rec.channel_id);
+    // POST /lsps/registry/channels — 0.119.0: the proof binds the whole canonical record (engine v358's form)
+    const postMsg = buildSignedMessage(ACTION_POST_CHANNEL, nonce, kp.pubHex, channelRecordId(canonicalizeRecord(rec)));
     const postSig = sign(postMsg, kp.priv);
     const postReq = mockReqRes({
       method: 'POST',
@@ -389,6 +391,45 @@ async function main() {
     await router.tryHandle(reqB.req, reqB.res, reqB.parsed);
     assert(reqB.captured.status === 401, 'cross-channel replay should 401');
     assertEq(reqB.captured.body.error, 'signature_invalid');
+  });
+
+  // 0.119.0 (S64, F13 — engine v358): the record rules' twins, pinned with the engine's own vectors
+  // (lij-core registry_client::tests::v358_channel_record_and_push_subscription_record_ids), and the old form's
+  // one-release acceptance on the POST.
+  await test('0.119.0: channelRecordId — the engine\'s pinned vector (open and closed records; one sat is another record)', async () => {
+    const rec = { channel_id: 'AA'.repeat(32), funding_txid: 'BB'.repeat(32), funding_vout: 1, channel_value_sat: 100000, commit_type: 'STATIC_REMOTE_KEY', channel_keys_id_hex: 'CC'.repeat(32) };
+    assertEq(channelRecordId(canonicalizeRecord(rec)), 'aa'.repeat(32) + ':4a74956222fdcba3515c4a5b879a1aea98cafb495c137a79da8a7497c9f84f3a');
+    const closed = Object.assign({}, rec, { close_height: 900000, closing_txid: 'DD'.repeat(32) });
+    assertEq(channelRecordId(canonicalizeRecord(closed)), 'aa'.repeat(32) + ':93a344540fe8537ef6acf8098d847d3d55edb0f7f191fccb18bde39d77f977c8');
+    assert(channelRecordId(canonicalizeRecord(Object.assign({}, rec, { channel_value_sat: 100001 }))) !== channelRecordId(canonicalizeRecord(rec)));
+  });
+  await test('0.119.0: pushSubscriptionRecordId — the engine\'s pinned vector; case is content; no keys → null', async () => {
+    assertEq(pushSubscriptionRecordId({ endpoint: 'https://push.example/x/Y-z', expirationTime: null, keys: { p256dh: 'BAbC', auth: 'dEf' } }), 'sub:7a379304389f77ee1a2be6e1d5dea3fd18652df06bea29531e26ca895e78bbdc');
+    assert(pushSubscriptionRecordId({ endpoint: 'https://push.example/x/Y-z', keys: { p256dh: 'BAbC', auth: 'dEF' } }) !== 'sub:7a379304389f77ee1a2be6e1d5dea3fd18652df06bea29531e26ca895e78bbdc');
+    assertEq(pushSubscriptionRecordId({ endpoint: 'https://push.example/x' }), null);
+  });
+  await test('0.119.0: POST signed in the old form (the channel id alone) is still taken this release; a record swapped under either form is refused', async () => {
+    const nonceStore = new NonceStore(); const channelStore = new MemoryChannelStore();
+    const router = makeRegistryRouter({ nonceStore, channelStore, jsonResponse, errResponse, readBody });
+    const kp = makeKeypair(); const rec = makeValidRecord();
+    const ch = mockReqRes({ method: 'GET', path: '/lsps/registry/challenge' }); await router.tryHandle(ch.req, ch.res, ch.parsed);
+    const nonce = ch.captured.body.nonce;
+    const oldSig = sign(buildSignedMessage(ACTION_POST_CHANNEL, nonce, kp.pubHex, rec.channel_id), kp.priv);
+    const r1 = mockReqRes({ method: 'POST', path: '/lsps/registry/channels', body: { node_pubkey: kp.pubHex, nonce, signature: oldSig, record: rec } });
+    await router.tryHandle(r1.req, r1.res, r1.parsed);
+    assert(r1.captured.status === 200, 'old form: ' + r1.captured.status + ' ' + JSON.stringify(r1.captured.body));
+    // the bound form, with the record swapped on the path after signing → refused (the point of F13)
+    const ch2 = mockReqRes({ method: 'GET', path: '/lsps/registry/challenge' }); await router.tryHandle(ch2.req, ch2.res, ch2.parsed);
+    const nonce2 = ch2.captured.body.nonce;
+    const boundSig = sign(buildSignedMessage(ACTION_POST_CHANNEL, nonce2, kp.pubHex, channelRecordId(canonicalizeRecord(rec))), kp.priv);
+    const swapped = Object.assign({}, rec, { channel_value_sat: rec.channel_value_sat + 1 });
+    const r2 = mockReqRes({ method: 'POST', path: '/lsps/registry/channels', body: { node_pubkey: kp.pubHex, nonce: nonce2, signature: boundSig, record: swapped } });
+    await router.tryHandle(r2.req, r2.res, r2.parsed);
+    assert(r2.captured.status === 401, 'a swapped record under a bound signature must be 401, got ' + r2.captured.status);
+    // and the nonce was not spent by the refusal: the honest record still posts under it
+    const r3 = mockReqRes({ method: 'POST', path: '/lsps/registry/channels', body: { node_pubkey: kp.pubHex, nonce: nonce2, signature: boundSig, record: rec } });
+    await router.tryHandle(r3.req, r3.res, r3.parsed);
+    assert(r3.captured.status === 200, 'the honest record after a refused swap: ' + r3.captured.status + ' ' + JSON.stringify(r3.captured.body));
   });
 
   await test('tryHandle: non-registry path returns false', async () => {

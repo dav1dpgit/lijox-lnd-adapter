@@ -21,21 +21,25 @@ const t = (n, ok, extra) => { (ok ? pass++ : fail++); console.log((ok ? 'PASS ' 
 const registryNonceStore = new registry.NonceStore();
 const ctx = { crypto, Buffer, registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore, String, Array, console };
 vm.createContext(ctx);
-vm.runInContext(block + '\nthis.lnurlpRegisterRecordId = lnurlpRegisterRecordId; this.lnurlpAuthCheck = lnurlpAuthCheck;', ctx);
-const { lnurlpRegisterRecordId, lnurlpAuthCheck } = ctx;
+vm.runInContext(block + '\nthis.lnurlpRegisterRecordId = lnurlpRegisterRecordId; this.lnurlpRegisterRecordIdV1 = lnurlpRegisterRecordIdV1; this.lnurlpAuthCheck = lnurlpAuthCheck;', ctx);
+const { lnurlpRegisterRecordId, lnurlpRegisterRecordIdV1, lnurlpAuthCheck } = ctx;
 
 // ── a1 the record rule — the engine's vectors (lij-core registry_client::tests::lnurlp_register_record_id_rule)
 const EMPTY = 'alice:0:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 t('a1 an empty probe: name lowercased, count 0, the sha256 of nothing', lnurlpRegisterRecordId('Alice', []) === EMPTY, lnurlpRegisterRecordId('Alice', []));
 t('a1 not an array → as an empty list (the route already refused it with 400)', lnurlpRegisterRecordId('alice', null) === EMPTY && lnurlpRegisterRecordId('alice', undefined) === EMPTY);
-const two = [{ hash: 'BB', secret: 'x', index: 2 }, { hash: 'aa', secret: 'y' }];
-const want2 = 'alice:2:' + crypto.createHash('sha256').update('aa').update('bb').digest('hex');
-t('a1 two hashes: lowercased, sorted, joined; secrets and indexes never enter', lnurlpRegisterRecordId('alice', two) === want2, lnurlpRegisterRecordId('alice', two));
-t('a1 order and case do not change the record', lnurlpRegisterRecordId('ALICE', [{ hash: 'aa' }, { hash: 'bb' }]) === want2);
-t('a1 an entry without a string hash is skipped, as the engine skips it', lnurlpRegisterRecordId('alice', [{ hash: 'aa' }, { secret: 'zz' }, null, 'aa', 7, [{ hash: 'cc' }], { hash: 5 }]) === 'alice:1:' + crypto.createHash('sha256').update('aa').digest('hex'));
-t('a1 ASCII lowercase only (Rust to_ascii_lowercase): a non-ASCII capital stays', lnurlpRegisterRecordId('alice', [{ hash: 'É' }]) === 'alice:1:' + crypto.createHash('sha256').update('É', 'utf8').digest('hex'));
-t('a1 sorted bytewise (Rust String sort), not by UTF-16 unit', (() => { const r = lnurlpRegisterRecordId('alice', [{ hash: 'Ａ' }, { hash: '😀' }]); const bytewise = ['Ａ', '😀'].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))); return r === 'alice:2:' + crypto.createHash('sha256').update(bytewise.join(''), 'utf8').digest('hex'); })());
-t('a1 a real pool: fifty 64-hex hashes, the count 50', (() => { const hs = Array.from({ length: 50 }, (_, i) => ({ hash: crypto.createHash('sha256').update('h' + i).digest('hex'), secret: 's'.repeat(64), index: i, expires: 4e9 })); const r = lnurlpRegisterRecordId('bob', hs); const sorted = hs.map((e) => e.hash).sort(); return r === 'bob:50:' + crypto.createHash('sha256').update(sorted.join('')).digest('hex'); })());
+// 0.119.0 (F13, engine v358): the line of an entry is hash:secret:expires:index — the engine's vectors
+// (lij-core registry_client::tests::lnurlp_register_record_id_rule); the hash-alone form is lnurlpRegisterRecordIdV1
+const two = [{ hash: 'BB', secret: 'X1', expires: 1900000000, index: 2 }, { hash: 'aa', secret: 'y2', expires: 1900000001 }];
+const want2 = 'alice:2:91302ea322aa9542ace3171ab33a089b3f03e09d9aa879bbcf5d6c22e14c97db';
+t('a1 two entries: every field in the line, lowercased, sorted — the engine\'s pinned vector', lnurlpRegisterRecordId('alice', two) === want2, lnurlpRegisterRecordId('alice', two));
+t('a1 order, case and number-vs-string do not change the record', lnurlpRegisterRecordId('ALICE', [{ hash: 'aa', secret: 'Y2', expires: '1900000001' }, { hash: 'bb', secret: 'x1', expires: 1900000000, index: 2 }]) === want2);
+t('a1 a changed secret is another record (F13)', lnurlpRegisterRecordId('alice', [{ hash: 'BB', secret: 'other', expires: 1900000000, index: 2 }, { hash: 'aa', secret: 'y2', expires: 1900000001 }]) !== want2);
+t('a1 an entry without a string hash is skipped, as the engine skips it', lnurlpRegisterRecordId('alice', [{ hash: 'aa' }, { secret: 'zz' }, null, 'aa', 7, [{ hash: 'cc' }], { hash: 5 }]) === 'alice:1:' + crypto.createHash('sha256').update('aa:::\n').digest('hex'));
+t('a1 ASCII lowercase only (Rust to_ascii_lowercase): a non-ASCII capital stays', lnurlpRegisterRecordId('alice', [{ hash: 'É' }]) === 'alice:1:' + crypto.createHash('sha256').update('É:::\n', 'utf8').digest('hex'));
+t('a1 sorted bytewise (Rust String sort), not by UTF-16 unit', (() => { const r = lnurlpRegisterRecordId('alice', [{ hash: 'Ａ' }, { hash: '😀' }]); const bytewise = ['Ａ:::\n', '😀:::\n'].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b))); return r === 'alice:2:' + crypto.createHash('sha256').update(bytewise.join(''), 'utf8').digest('hex'); })());
+t('a1 a real pool: fifty 64-hex hashes, the count 50', (() => { const hs = Array.from({ length: 50 }, (_, i) => ({ hash: crypto.createHash('sha256').update('h' + i).digest('hex'), secret: 's'.repeat(64), index: i, expires: 4e9 })); const r = lnurlpRegisterRecordId('bob', hs); const lines = hs.map((e) => e.hash + ':' + e.secret + ':' + 4e9 + ':' + e.index + '\n').sort(); return r === 'bob:50:' + crypto.createHash('sha256').update(lines.join('')).digest('hex'); })());
+t('a1 the V1 form (0.112.0, kept this release): the hashes alone, lowercased, sorted, joined', lnurlpRegisterRecordIdV1('alice', two) === 'alice:2:' + crypto.createHash('sha256').update('aa').update('bb').digest('hex') && lnurlpRegisterRecordIdV1('Alice', []) === EMPTY);
 
 // ── a2 the check — a wallet that signs properly
 const priv = crypto.randomBytes(32); const pub = Buffer.from(secp256k1.publicKeyCreate(priv, true)).toString('hex');
