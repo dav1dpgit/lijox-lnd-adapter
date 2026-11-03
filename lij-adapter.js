@@ -421,6 +421,7 @@ const { WebSocketServer } = require('ws');
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
 const { windowLimiter } = require('./wallet-limits');   // 0.96.0 (S58, proposal 1): the wallet checks' own limits
+const lnurlFetch = require('./lnurl-fetch');   // 0.119.3 (S66, item 2): the provider fetches a payee's pay terms or invoice for a phone the payee's server refused
 const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
 const { createTatara, readLndRoom } = require('./tatara');
 const { createJitGuard } = require('./jit-guard');   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
@@ -1713,11 +1714,27 @@ async function routeReportHandle(body, res, ip) {
   routeReportNote(line);
   return jsonResponse(res, { ok: true, received: failures.length, imported, skipped, lnd: lndNote || null });
 }
-function lnurlpMetadata(name, host) {
+// 0.119.1 (S65, DP's Register name — engine v359 "lnurl-display"): the text/plain line is the shop's own display name when
+// the name's owner filed one (POST /lnurl/display, signed), else the provider's line as before. Every sending wallet
+// shows text/plain as the payee (LUD-06), so a Register mode's name reaches the customer's screen.
+function lnurlpMetadata(name, host, display) {
+  const dn = (typeof display === 'string' && display.trim()) ? display.trim() : '';
   return JSON.stringify([
-    ['text/plain', 'Pay ' + name + ' — Lightning in a Jar'],
+    ['text/plain', dn || ('Pay ' + name + ' — Lightning in a Jar')],
     ['text/identifier', name + '@' + host],
   ]);
+}
+// 0.119.1: the display text as the page sends it — NFC, no control / zero-width / bidi / BOM characters, trimmed, at
+// most 40 code points (the Register field's own length); a text that is not already in this form is refused, so the
+// record the proof covers is byte for byte what is stored.
+function lnurlpDisplayClean(t) {
+  return String(t || '').normalize('NFC').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, '').trim();
+}
+function lnurlpDisplayClean40(t) { return Array.from(lnurlpDisplayClean(t)).slice(0, 40).join(''); }
+// 0.119.1: the record rule — "display:<name lowercased>:<sha256 hex of the display text, UTF-8>" (the page's twin; an
+// empty text clears the display name and hashes the empty string)
+function lnurlpDisplayRecordId(name, display) {
+  return 'display:' + String(name).replace(/[A-Z]/g, (c) => c.toLowerCase()) + ':' + crypto.createHash('sha256').update(String(display || ''), 'utf8').digest('hex');
 }
 // v0.31.0 (S30): honest minimum — quoting 1 sat requires the best channel
 // to actually CARRY it at fee 0 (local > 1 sat + the 50-sat delivery
@@ -1872,6 +1889,7 @@ setTimeout(async () => {
   const c = CONFIG.lsps2;
   const _g = jitGrantTerms();   // 0.90.0: the ladder and the grant, live — the ride's receipt
   console.log(`[JIT] self-protection: floor=${c.jit_min_onchain_reserve_sats} ramp_start=${c.jit_scarcity_ramp_start_sats} max_mult=${c.jit_scarcity_max_pct}% | ladder(per wallet, ${Math.round(JIT_WINDOW_MS / 86400000)}d)=${JIT_FEE_LADDER.join('/')} sats${JIT_FEE_LADDER_BAD ? ' (JIT_FEE_LADDER_SATS is not a list of whole numbers — the default is used)' : ''} | live_mult=${scarcityMultPct()}% onchain=${scarcityCache.confirmed} | grant=base ${_g.base} + ${_g.pct}% of the payment above ${_g.from}, ceiling ${_g.ceiling}${_g.bad ? ' (a JIT grant setting is not a whole number ≥ 0 — its default is used)' : ''}${RETIRED_0900_SET.length ? ' | IGNORED (retired): ' + RETIRED_0900_SET.join(', ') : ''}`);
+  console.log(`[JIT] promise clock: quote ${CONFIG.lsps2.promise_validity_secs} s (an ask with no invoice secret), reservation ${CONFIG.lsps2.reservation_validity_hours} h (a registered promise) | caps: ${JIT_PROMISE_CAPS.per_wallet} live promises per wallet (the oldest idle one dropped over it), ${JIT_PROMISE_CAPS.total} in total (refused over it)`);   // 0.119.2
 }, 6000);
 
 async function jitReserveOk(fundingSats, who) {
@@ -2569,6 +2587,9 @@ function isAdminRateLimited(ip) {
 const walletCheckIpLimit   = windowLimiter(CONFIG.security.wallet_check_ip_requests,   CONFIG.security.wallet_check_ip_window_ms);
 const myChannelsKeyLimit   = windowLimiter(CONFIG.security.my_channels_key_requests,   CONFIG.security.wallet_check_key_window_ms);
 const recoverCloseKeyLimit = windowLimiter(CONFIG.security.recover_close_key_requests, CONFIG.security.wallet_check_key_window_ms);
+// 0.119.3 (S66, item 2): the fetch-for-the-phone route's own ceiling per address (LNURL_FETCH_IP_PER_MIN, default 30 a minute)
+const lnurlFetchIpLimit = windowLimiter(parseInt(process.env.LNURL_FETCH_IP_PER_MIN || '30', 10) || 30, 60000);
+let lnurlFetchCounts = { asked: 0, served: 0, refused: 0 };   // the only record kept — never the URL
 
 // 0.103.0 (Phase 1b, §6.3.6): LND's room for pending inbound channels, read from the lnd.conf TATARA_LND_CONF names (null
 // when not set or not readable; the module then refuses channel pools and says so).
@@ -2683,6 +2704,8 @@ setInterval(() => {
     if (now > entry.resetAt) adminRateLimitMap.delete(ip);
   }
   walletCheckIpLimit.sweep(); myChannelsKeyLimit.sweep(); recoverCloseKeyLimit.sweep();   // 0.96.0
+  lnurlFetchIpLimit.sweep();   // 0.119.3
+  reapExpiredJitBuys();   // 0.119.2: the promise clock runs on the timer too, not only on the next ask
 }, 600000);
 
 // v0.16: LSPS2 JIT helpers.
@@ -2692,18 +2715,73 @@ function generateJitScid() {
   return crypto.randomBytes(8).toString('hex');
 }
 
-/** Reap expired entries from pendingJitBuys. Cheap, called inline on writes. */
-function reapExpiredJitBuys() {
-  const now = Date.now();
-  let reaped = 0;
+// ── JIT promise clock (0.119.2, S66 Mon 2026-11-02 — "JIT promise removal clock — write-up v1") ──
+// A promise carries two clocks: the QUOTE (promise_expires_at, LSPS2_PROMISE_VALIDITY_SECS, 10 min — "soft, advisory")
+// and the RESERVATION (reservation_expires_at, LSPS2_RESERVATION_HOURS, 24 h — "hard": the interceptor, the held
+// path, the same-LSP route builder and the console all read it). Until 0.119.1 the reaper deleted EVERY promise on the
+// quote clock, and ran only at the start of the next /lsps2/buy from ANY wallet — so a wallet's invoice (the page gives
+// it 60 min) outlived its promise the moment another wallet asked more than 10 minutes later: a direct payment then
+// failed F4 (no promise), a same-LSP payer was told the invoice was stale, a payment held for a sleeping wallet failed
+// on the wake, a chit held for a sleeping shop read "lapsed". Seen in the code, not yet on a box (no Reaped line in
+// the UM890's last 24 h on 11-02).
+// Now: ONE CLOCK DELETES. A promise whose wallet has registered its invoice secret (the engine does that before the
+// page ever shows the invoice — lib.rs phase 4) lives to the reservation; an ask with no secret can never be paid and
+// still goes at the quote. The reaper also runs on the 10-minute timer, not only on the next ask. And because a
+// registered promise now lives a day, two CAPS (box settings) bound the memory: a wallet over ITS cap loses its oldest
+// idle promise (no shards, no open in flight, no held payment names it) rather than being refused — a shop re-making an
+// invoice after a typo is never turned away; the total cap refuses the ask with a plain message.
+const JIT_PROMISE_CAPS = {
+  per_wallet: parseInt(process.env.LSPS2_MAX_LIVE_PROMISES_PER_WALLET || '10', 10),
+  total:      parseInt(process.env.LSPS2_MAX_LIVE_PROMISES || '2000', 10),
+};
+/** The clock that deletes this promise: the reservation once its secret is registered, the quote until then. */
+function jitPromiseDeadline(entry) {
+  return entry.payment_secret ? (entry.reservation_expires_at || entry.promise_expires_at) : entry.promise_expires_at;
+}
+/** Reap expired entries from pendingJitBuys — on every /lsps2/buy and on the 10-minute timer. */
+function reapExpiredJitBuys(nowMs) {
+  const now = nowMs || Date.now();
+  let quotes = 0, reservations = 0;
   for (const [scid, entry] of pendingJitBuys.entries()) {
-    if (now > entry.promise_expires_at) {
+    if (now > jitPromiseDeadline(entry)) {
       pendingJitBuys.delete(scid);
-      reaped++;
+      if (entry._b16_hash) promiseByPaymentHash.delete(entry._b16_hash);
+      if (entry.payment_secret) reservations++; else quotes++;
     }
   }
-  if (reaped > 0) console.log(`[LSPS2] Reaped ${reaped} expired JIT promise(s)`);
+  if (quotes + reservations > 0) console.log(`[LSPS2] Reaped ${quotes + reservations} expired JIT promise(s): ${quotes} unregistered past the quote clock, ${reservations} registered past the reservation clock`);
+  return { quotes, reservations };
 }
+/** A promise that holds money or an open right now is never evicted by its own wallet's cap. */
+function jitPromiseBusy(scid, entry) {
+  if (entry._shards && entry._shards.size) return true;
+  if (inFlightOpens.has(scid)) return true;
+  for (const h of pendingHtlcsForOfflineWallets.values()) if (h && h.promise_ref === scid) return true;
+  return false;
+}
+/** Room for one more promise from this wallet: { ok: true, evicted? } or { ok: false, error, code }. */
+function jitPromiseRoom(clientPubkey) {
+  const caps = JIT_PROMISE_CAPS;
+  if (Number.isInteger(caps.total) && caps.total > 0 && pendingJitBuys.size >= caps.total) {
+    console.warn(`[LSPS2] promise cap: ${pendingJitBuys.size} live promises on this provider (LSPS2_MAX_LIVE_PROMISES ${caps.total}) — ask from ${String(clientPubkey).slice(0, 16)}… refused`);
+    return { ok: false, code: 429, error: 'this provider has too many open payment requests right now — try again in a few minutes' };
+  }
+  if (!(Number.isInteger(caps.per_wallet) && caps.per_wallet > 0)) return { ok: true };
+  const mine = [];
+  for (const [scid, entry] of pendingJitBuys.entries()) if (entry.client_pubkey === clientPubkey) mine.push([scid, entry]);
+  if (mine.length < caps.per_wallet) return { ok: true };
+  mine.sort((a, b) => (a[1].created_at || 0) - (b[1].created_at || 0));   // oldest first
+  const idle = mine.find(([scid, entry]) => !jitPromiseBusy(scid, entry));
+  if (!idle) {
+    console.warn(`[LSPS2] promise cap: wallet ${String(clientPubkey).slice(0, 16)}… has ${mine.length} live promises (LSPS2_MAX_LIVE_PROMISES_PER_WALLET ${caps.per_wallet}), every one busy — ask refused`);
+    return { ok: false, code: 429, error: `you have ${mine.length} payment requests open on this provider and each one is in use — wait for one to finish` };
+  }
+  pendingJitBuys.delete(idle[0]);
+  if (idle[1]._b16_hash) promiseByPaymentHash.delete(idle[1]._b16_hash);
+  console.log(`[LSPS2] promise cap: wallet ${String(clientPubkey).slice(0, 16)}… at ${mine.length} live promises (LSPS2_MAX_LIVE_PROMISES_PER_WALLET ${caps.per_wallet}) — its oldest idle promise scid=${idle[0]} (asked ${Math.round((Date.now() - (idle[1].created_at || Date.now())) / 60000)} min ago) dropped for the new ask`);
+  return { ok: true, evicted: idle[0] };
+}
+// ── end of the promise clock
 
 /** Format an integer with comma thousands separators (display-only). */
 function fmtNum(n) {
@@ -5684,7 +5762,10 @@ function settingsReport() {
     row('Guardrails', 'open fee ladder', 'JIT_FEE_LADDER_SATS', JIT_FEE_LADDER.map((x) => x.toLocaleString('en-US')).join(' · '), 'sats', 'a wallet\'s 1st, 2nd … JIT open in the window; the last step for every open after; × the scarcity multiplier; never below the open-fee floor or the % of the payment' + (JIT_FEE_LADDER_BAD ? ' · the setting is unreadable — the default is used' : '')),   // 0.90.0
     row('Guardrails', 'window', 'LSPS2_JIT_WINDOW_DAYS', Math.round(JIT_WINDOW_MS / 86400000), 'days', ''),
     row('Guardrails', 'floor opens per day', 'JIT_FLOOR_MAX_OPENS_PER_DAY', JIT_FLOOR_MAX_OPENS_PER_DAY, '', ''),
-    row('Guardrails', 'promise validity', 'LSPS2_PROMISE_VALIDITY_SECS', L.promise_validity_secs, 's', ''),
+    row('Guardrails', 'promise validity', 'LSPS2_PROMISE_VALIDITY_SECS', L.promise_validity_secs, 's', 'the quote clock — an ask with no invoice secret yet is dropped after this'),
+    row('Guardrails', 'promise reservation', 'LSPS2_RESERVATION_HOURS', L.reservation_validity_hours, 'h', 'the reservation clock — a promise with its invoice secret registered lives this long (0.119.2); payments after it fail'),
+    row('Guardrails', 'live promises per wallet', 'LSPS2_MAX_LIVE_PROMISES_PER_WALLET', JIT_PROMISE_CAPS.per_wallet, '', 'over it, the wallet\'s oldest idle promise is dropped for the new ask (0.119.2)'),
+    row('Guardrails', 'live promises in total', 'LSPS2_MAX_LIVE_PROMISES', JIT_PROMISE_CAPS.total, '', 'over it, the ask is refused (0.119.2)'),
     row('Offline hold', 'hold for offline wallets', 'LSPS2_OFFLINE_HOLD_ENABLED', OFFLINE_HOLD_ENABLED, '', 'on by default (0.80.0) — the wallet\'s Privacy dial picks its window, Off included; false here fails every offline send at once'),
     row('Offline hold', 'ceiling', 'LSPS2_OFFLINE_HOLD_CAP_MS', OFFLINE_HOLD_CAP_MS, 'ms', Math.round(OFFLINE_HOLD_CAP_MS / 60000) + ' min — the most a wallet\'s dial can ask for'),
     row('Offline hold', 'CLTV headroom', 'LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS', OFFLINE_MIN_HEADROOM_BLOCKS, 'blocks', 'the least room an HTLC must have left to be held at all'),
@@ -5917,7 +5998,7 @@ async function consoleSnapshot() {
   if (unconfirmed.error && !unconfirmed.sweeps) unconfirmed.error += ' — add lnrpc.Lightning/GetTransactions and walletrpc.WalletKit/PendingSweeps to the macaroon (MACAROON.md) to see this pane';
   const pend = [];
   for (const [kind, key] of [['opening', 'pending_open_channels'], ['closing', 'pending_closing_channels'], ['force-closing', 'pending_force_closing_channels'], ['waiting close', 'waiting_close_channels']]) {
-    for (const x of (pending[key] || [])) { const ch = x.channel || {}; pend.push({ kind, remote_pubkey: ch.remote_node_pub || '', capacity: Number(ch.capacity || 0), channel_point: ch.channel_point || '' }); }
+    for (const x of (pending[key] || [])) { const ch = x.channel || {}; pend.push({ kind, remote_pubkey: ch.remote_node_pub || '', capacity: Number(ch.capacity || 0), channel_point: ch.channel_point || '', closing_txid: String(x.closing_txid || ''), limbo: Number(x.limbo_balance || 0) }); }   // 0.119.3 (item 5): the closing txid (closing, force-closing and waiting-close rows carry one) and the limbo balance
   }
   const backups = {};
   const SCB_DIR = process.env.LIJ_SCB_STATE_DIR || '/var/lib/lij-scb';
@@ -5932,9 +6013,14 @@ async function consoleSnapshot() {
   let tapes = 0, lastTape = 0;
   try { for (const f of fs.readdirSync(TAPES_DIR)) { tapes++; const t = parseInt(f.split('-')[0], 10); if (t > lastTape) lastTape = t; } } catch (_) {}
   const pendingOpenLocal = (pending.pending_open_channels || []).reduce((a, x) => a + Number((x.channel || {}).local_balance || 0), 0);
+  // 0.119.3 (DP's item 6): the money that is not yet settled anywhere — unconfirmed on-chain, in flight in channels,
+  // the local side of opens still confirming, and the limbo of closes in progress (LND's total over every closing channel)
+  const limbo = Number(pending.total_limbo_balance || 0);
+  const pendingBox = { total: Number(wb.unconfirmed_balance || 0) + sumUnsettled + pendingOpenLocal + limbo, onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), in_flight: sumUnsettled, opening: pendingOpenLocal, closing: limbo };
+  boxes.pending = pendingBox;
   return {
     node: { alias: info.alias, pubkey: info.identity_pubkey, version: info.version, block_height: info.block_height, synced: !!info.synced_to_chain, synced_to_graph: info.synced_to_graph, num_peers: info.num_peers, num_active: info.num_active_channels, num_inactive: info.num_inactive_channels, num_pending: info.num_pending_channels, uris: info.uris || [] },
-    balances: { onchain_confirmed: Number(wb.confirmed_balance || 0), onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), local: sumLocal, remote: sumRemote, unsettled: sumUnsettled, pending_open_local: pendingOpenLocal, reserved_anchor: Number(wb.reserved_balance_anchor_chan || 0), principles: pr, boxes },
+    balances: { onchain_confirmed: Number(wb.confirmed_balance || 0), onchain_unconfirmed: Number(wb.unconfirmed_balance || 0), local: sumLocal, remote: sumRemote, unsettled: sumUnsettled, pending_open_local: pendingOpenLocal, limbo, reserved_anchor: Number(wb.reserved_balance_anchor_chan || 0), principles: pr, boxes },   // 0.119.3: limbo
     // 0.71.2 (DP: "bring in the guardrail multipliers we set for the desktop" — the
     // [JIT] self-protection boot line, live): the scarcity multiplier and its inputs,
     // the per-wallet open ladder, the JIT sizing and the daily floor cap.
@@ -6611,14 +6697,15 @@ function jitNowMemory() {
   const nowMs = Date.now();
   const promises = [], aggregating = [], held = [];
   for (const [scidHex, pr] of pendingJitBuys) {
-    promises.push({ scid: scidHex.slice(0, 12), client: (pr.client_pubkey || '').slice(0, 16), size_msat: String(pr.payment_size_msat || 0), fee_msat: String(pr.fee_msat || 0),
-      mode: pr.mode || 'fixed', secret: !!pr.payment_secret, expires_in_s: Math.round(((pr.reservation_expires_at || 0) - nowMs) / 1000) });
+    promises.push({ scid: scidHex, client: String(pr.client_pubkey || ''), size_msat: String(pr.payment_size_msat || 0), fee_msat: String(pr.fee_msat || 0),   // 0.119.3: full values — the console shortens and copies
+      mode: pr.mode || 'fixed', secret: !!pr.payment_secret, expires_in_s: Math.round(((pr.reservation_expires_at || 0) - nowMs) / 1000),
+      asked_s: Math.round((nowMs - (pr.created_at || nowMs)) / 1000) });   // 0.119.2: how long ago the wallet asked
     if (pr._shards && pr._shards.size) {
-      aggregating.push({ scid: scidHex.slice(0, 12), shards: pr._shards.size, sum_msat: String(pr._shard_sum_msat), window_remaining_s: Math.max(0, Math.round(((pr._agg_deadline || 0) - nowMs) / 1000)) });
+      aggregating.push({ scid: scidHex, shards: pr._shards.size, sum_msat: String(pr._shard_sum_msat), window_remaining_s: Math.max(0, Math.round(((pr._agg_deadline || 0) - nowMs) / 1000)) });
     }
   }
   for (const [ph, h] of pendingHtlcsForOfflineWallets) {
-    held.push({ payment_hash: ph.slice(0, 16), kind: h.kind || 'jit', client: (h.client_pubkey || '').slice(0, 16), amount_msat: String(h.incoming_amount_msat || h.outgoing_amount_msat || 0),
+    held.push({ payment_hash: ph, kind: h.kind || 'jit', client: String(h.client_pubkey || ''), amount_msat: String(h.incoming_amount_msat || h.outgoing_amount_msat || 0),   // 0.119.3: full values
       age_s: Math.round((nowMs - (h.htlc_received_at || nowMs)) / 1000), auto_fail_height: h.auto_fail_height || null });
   }
   return { promises, aggregating, held };
@@ -6724,6 +6811,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
+        lnurl_fetch:     { enabled: true },   // 0.119.3 (S66, item 2): POST /v1/lnurl/fetch — the provider fetches a payee's pay terms or invoice for a phone the payee refused
         nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
         filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it
       };
@@ -6874,7 +6962,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       callback: 'https://' + host + '/lnurl/cb/' + name,
       minSendable: lnurlpMinMsat(chan, rec.client_pubkey),   // v0.31.0 honest / v0.32.0 escalated
       maxSendable: CONFIG.lsps2.variable_ceiling_msat,
-      metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec)),   // 0.68.0: the address host, not necessarily this host
+      metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec), rec.display),   // 0.68.0: the address host, not necessarily this host; 0.119.1: the display name
       commentAllowed: LNURLP_COMMENT_MAX,   // 0.81.0 (S49, DP): the payer may write to the payee (LUD-12)
     });
   }
@@ -6920,7 +7008,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       // SHA-256 of the EXACT metadata string served (no `d`, no memo,
       // no second string to drift). cltv 400→144: a day of hold
       // headroom without demanding 2.8 days of sender HTLC lockup.
-      const metaStr = lnurlpMetadata(name, lnurlpAddrHost(req, rec));   // 0.68.0: sealed under the address host
+      const metaStr = lnurlpMetadata(name, lnurlpAddrHost(req, rec), rec.display);   // 0.68.0: sealed under the address host; 0.119.1: the display name
       const mintBody = {
         hash: Buffer.from(entry.hash, 'hex').toString('base64'),
         value_msat: amt.toString(),
@@ -7027,6 +7115,22 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     console.log(`[HB] awake heartbeat from ${hpk.slice(0, 16)}… (signed)`);
     return jsonResponse(res, { ok: true, active_window_ms: ACTIVE_WINDOW_MS });
   }
+  // 0.119.3 (S66, DP's UX list item 2 — the Bitcoin Jungle case): the provider fetches a payee's pay terms or invoice FOR
+  // the phone, when the payee's server refused the browser (CORS). Route token; the URL checked and the body answered
+  // verbatim by lnurl-fetch.js (https on 443 to a public address only, no redirects, 64 KiB, 10 s); the LUD-06 check
+  // stays on the phone. Nothing is logged but a count: the payee is the wallet's business, not the operator's.
+  if (method === 'POST' && path === '/v1/lnurl/fetch') {
+    if (!authOk(req)) return errResponse(res, 'Unauthorized', 401);
+    const lim = lnurlFetchIpLimit.hit(ip);
+    if (!lim.ok) { lnurlFetchCounts.refused++; return errResponse(res, 'Rate limit exceeded', 429); }
+    let fbody; try { fbody = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
+    try { const cp = String((fbody && fbody.client_pubkey) || '').toLowerCase(); if (/^[0-9a-f]{66}$/.test(cp)) leaseTouch(cp, 'api:/v1/lnurl/fetch'); } catch (_) {}
+    lnurlFetchCounts.asked++;
+    const out = await lnurlFetch.fetchForWallet(fbody && fbody.url);
+    if (out.ok) lnurlFetchCounts.served++; else lnurlFetchCounts.refused++;
+    if (lnurlFetchCounts.asked % 50 === 1) console.log(`[LNURL-FETCH] ${lnurlFetchCounts.asked} asked, ${lnurlFetchCounts.served} served, ${lnurlFetchCounts.refused} refused since start (URLs never logged)`);
+    return jsonResponse(res, out, out.ok ? 200 : (out.error === 'notjson' || out.error === 'unreachable' || out.error === 'timeout' || out.error === 'redirect' || out.error === 'too_big' || out.error === 'resolve' ? 502 : 400));
+  }
   if (method === 'POST' && path === '/v1/route/report') {   // 0.113.0 (S63): the wallet's signed routing report (route token + the node-key proof)
     if (!authOk(req)) return errResponse(res, 'Unauthorized', 401);
     let rbody; try { rbody = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
@@ -7104,6 +7208,40 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // 0.112.0 (S63, F7): and the record's key must PROVE itself — the node key's signature over the name (lnurlpAuthCheck).
   // Refused while any entry is reserved/accepted: a held payment's story
   // must finish (settle or burn) before the name dies.
+  // 0.119.1 (S65, DP's Register name; engine v359's "lnurl-display"): the name's owner files the display name its Register
+  // mode shows — under the node key's proof over "display:<name>:<sha256 of the text>" — and the pay terms' text/plain
+  // carries it from then on; an empty text clears it. The record lives on the name's registry entry (dropped with the
+  // name at release — a new owner never inherits it). Refused: a name this provider does not hold (404), another key's
+  // name (403), a text not in the clean form (400 — the record must be what is stored).
+  if (method === 'POST' && path === '/lnurl/display') {
+    if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
+    const dspStr = await new Promise((resolve) => {
+      let b = '';
+      req.on('data', (c) => { b += c; if (b.length > 8192) { req.destroy(); resolve(null); } });
+      req.on('end', () => resolve(b));
+      req.on('error', () => resolve(null));
+    });
+    let dsp = null;
+    try { dsp = JSON.parse(dspStr); } catch (e) {}
+    const dspName = String((dsp && dsp.name) || '').toLowerCase();
+    const dspPk = String((dsp && dsp.client_pubkey) || '').toLowerCase();
+    const dspText = (dsp && typeof dsp.display === 'string') ? dsp.display : null;
+    if (!lnurlpNameSafe(dspName) || !/^[0-9a-f]{66}$/.test(dspPk) || dspText === null) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
+    if (lnurlpDisplayClean40(dspText) !== dspText) return jsonResponse(res, { ok: false, error: 'display not clean (NFC, no control characters, trimmed, at most 40)' }, 400);
+    const dspAuth = lnurlpAuthCheck(dsp, 'lnurl-display', dspPk, lnurlpDisplayRecordId(dspName, dspText));
+    if (!dspAuth.ok) {
+      console.warn(`[LNURLP] display for ${dspName} by ${dspPk.slice(0, 16)}… refused: ${dspAuth.code}`);
+      return jsonResponse(res, { ok: false, error: 'auth: ' + dspAuth.code }, dspAuth.status);
+    }
+    const dspRec = lnurlpRegistry[dspName];
+    if (!dspRec) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
+    if (dspRec.client_pubkey.toLowerCase() !== dspPk) return jsonResponse(res, { ok: false, error: 'pubkey mismatch' }, 403);
+    if (dspText) dspRec.display = dspText; else delete dspRec.display;
+    lnurlpPersist();
+    console.log(`[LNURLP] display: ${dspName} ${dspText ? 'now reads \u201c' + dspText + '\u201d' : 'cleared'} (owner ${dspPk.slice(0, 16)}…)`);
+    return jsonResponse(res, { ok: true, name: dspName, display: dspText || null });
+  }
+
   if (method === 'POST' && path === '/lnurl/release') {
     if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
     const relStr = await new Promise((resolve) => {
@@ -7609,6 +7747,9 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
 
     // Reap expired promises before insert (cheap; bounded by map size).
     reapExpiredJitBuys();
+    // 0.119.2: the caps — a wallet over its own cap loses its oldest idle promise; the provider's total cap refuses
+    const room = jitPromiseRoom(clientPubkey);
+    if (!room.ok) return errResponse(res, room.error, room.code || 429);
 
     const scid = generateJitScid();
     const now = Date.now();

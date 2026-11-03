@@ -17,7 +17,7 @@ const src = fs.readFileSync(path.join(__dirname, 'lij-adapter.js'), 'utf8');
 const from = src.indexOf('function lnurlpRegisterRecordId(name, hashes) {');
 const to = src.indexOf('// 0.68.0: one boot sweep');
 const from2 = src.indexOf('// ── 0.113.0 (S63, DP 2026-10-26 — docs/design/pathfinding/pathfinding-r9.md');
-const to2 = src.indexOf('function lnurlpMetadata(name, host) {');
+const to2 = src.indexOf('function lnurlpMetadata(name, host');   // 0.119.1: the metadata takes the display name
 if (from < 0 || to < 0 || to < from || from2 < 0 || to2 < 0 || to2 < from2) { console.log('FAIL cannot find the auth/report blocks in lij-adapter.js'); process.exit(1); }
 const block = src.slice(from, to) + '\n' + src.slice(from2, to2);
 for (const must of ['function routeReportRecordId(', 'function routeHandoutRemember(', 'async function routeReportHandle(', 'function routeHopsLine(']) {

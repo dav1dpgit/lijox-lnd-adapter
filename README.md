@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.119.0, 2026-10-27). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.119.3, 2026-11-02). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.119.0         # the newest tag — the last row of RELEASES.md
+       git checkout v0.119.3         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -139,6 +139,16 @@ WHAT YOU NEED BEFORE STARTING
    - Your money exposure: JIT opens spend YOUR onchain funds within
      the limits you set (CHANNEL_SIZE/MIN/MAX, JIT_MIN_ONCHAIN_
      RESERVE_SATS). Set them deliberately.
+   - Ask-the-provider fetches (0.119.3): a wallet whose payee's site
+     refuses browser wallets asks this box to fetch the pay terms and
+     the invoice for it (POST /v1/lnurl/fetch) — https on 443 to a
+     public address only, nothing stored, the URL never logged;
+     LNURL_FETCH_IP_PER_MIN (30) caps asks per address.
+   - JIT promises (0.119.2): a wallet's promise lives for
+     LSPS2_RESERVATION_HOURS (24) once its invoice secret is in, so the
+     invoice can be paid for its whole life; LSPS2_MAX_LIVE_PROMISES_PER_WALLET
+     (10) and LSPS2_MAX_LIVE_PROMISES (2,000) bound the memory. Promises
+     are memory-only: a restart drops them and every held payment.
 
 Design documents live in the LiJ repo:
 docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
