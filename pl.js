@@ -47,7 +47,9 @@ function emptyRow(key) {
     payment_fee_msat: 0, payment_count: 0, delivery_count: 0, computed_at: 0, partial: [],
     // 0.76.0: the sats that moved for each fee line (msat where the fee is msat)
     routing_out_msat: 0, open_moved_msat: 0, open_moved_count: 0, open_moved_fee_msat: 0, hold_moved_msat: 0, hold_moved_count: 0, hold_moved_fee_msat: 0,
-    payment_value_msat: 0, chain_moved_open_sats: 0, chain_moved_close_sats: 0, chain_moved_sweep_sats: 0, chain_moved_other_sats: 0 };
+    payment_value_msat: 0, chain_moved_open_sats: 0, chain_moved_close_sats: 0, chain_moved_sweep_sats: 0, chain_moved_other_sats: 0,
+    // 0.120.0 (S66): Lightning pays on-chain — the provider's fees earned (revenue) and the chain costs it bore (bumps, take-backs)
+    onchain_pay_fee_msat: 0, onchain_pay_count: 0, onchain_pay_moved_msat: 0, chain_fee_onchain_pay_sats: 0, onchain_pay_chain_count: 0 };
 }
 
 function createPL(deps) {
@@ -134,6 +136,8 @@ function createPL(deps) {
       if (e.ts < start || e.ts >= end) continue;
       if (e.kind === 'open_fee') { row.open_fee_msat += Number(e.msat || 0); row.open_count++; if (Number(e.moved_msat) > 0) { row.open_moved_msat += Number(e.moved_msat); row.open_moved_count++; row.open_moved_fee_msat += Number(e.msat || 0); } }
       else if (e.kind === 'hold_fee') { row.hold_fee_msat += Number(e.msat || 0); row.hold_count++; if (Number(e.moved_msat) > 0) { row.hold_moved_msat += Number(e.moved_msat); row.hold_moved_count++; row.hold_moved_fee_msat += Number(e.msat || 0); } }
+      else if (e.kind === 'onchain_pay_fee') { row.onchain_pay_fee_msat += Number(e.msat || 0); row.onchain_pay_count++; row.onchain_pay_moved_msat += Number(e.moved_msat || 0); }   // 0.120.0
+      else if (e.kind === 'onchain_pay_lock' || e.kind === 'onchain_pay_bump' || e.kind === 'onchain_pay_takeback') { if (e.kind !== 'onchain_pay_lock') { row.chain_fee_onchain_pay_sats += Number(e.chain_fee_sats || 0); row.onchain_pay_chain_count++; } }   // 0.120.0: the lock's own fee is the sender's; bumps and take-backs are the provider's
     }
     for (const p of b.payments) {
       const t = Number(p.creation_time_ns ? p.creation_time_ns / 1e6 : Number(p.creation_date) * 1000);

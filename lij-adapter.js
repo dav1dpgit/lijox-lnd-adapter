@@ -421,7 +421,9 @@ const { WebSocketServer } = require('ws');
 // v0.7: ChainNotifier + WalletKit clients added for Step 3 chainnotifier
 const { startBridge } = require('./cooperative-chain-bridge');
 const { windowLimiter } = require('./wallet-limits');   // 0.96.0 (S58, proposal 1): the wallet checks' own limits
-const lnurlFetch = require('./lnurl-fetch');   // 0.119.3 (S66, item 2): the provider fetches a payee's pay terms or invoice for a phone the payee's server refused
+const lnurlFetch = require('./lnurl-fetch');
+const { createOnchainPayRail } = require('./onchain-pay');   // 0.120.0 (S66, DP "Go on Phase 1"): LIGHTNING PAYS ON-CHAIN — the provider's half (docs/design/onchain-pay/lightning-paying-onchain-v0.6.md in the wallet repo)
+const { createCoreRpc } = require('./core-rpc');             // 0.120.0: the float wallet's door — Bitcoin Core, a whitelisted RPC user, twelve commands   // 0.119.3 (S66, item 2): the provider fetches a payee's pay terms or invoice for a phone the payee's server refused
 const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
 const { createTatara, readLndRoom } = require('./tatara');
 const { createJitGuard } = require('./jit-guard');   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
@@ -643,6 +645,35 @@ const pushRail = createPushRail({
   proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),   // 0.116.0 (F4): the node key's proof on the claim routes
   lndDelete: (p) => lndRequest('DELETE', p, null),   // 0.116.0 (F6): DeleteCanceledInvoice
 });
+// 0.120.0 (S66 Mon 2026-11-02, DP 23:12 "Go on Phase 1" — LIGHTNING PAYS ON-CHAIN, design v0.6): the rail. The float
+// wallet's door opens only when ONCHAIN_PAY_RPC_URL/_USER/_PASS are set; the take-back key from ONCHAIN_PAY_TAKEBACK_SEED;
+// without either the rail answers "off" and does nothing (open payments, if any, are named at boot). The notifiers are
+// LND's — the spend notifier fires when the spend is IN A BLOCK, which is when B is collected (v0.6 §4, DP 20:43).
+const onchainPayCore = (() => { try { return process.env.ONCHAIN_PAY_RPC_URL ? createCoreRpc({ url: process.env.ONCHAIN_PAY_RPC_URL, user: process.env.ONCHAIN_PAY_RPC_USER, pass: process.env.ONCHAIN_PAY_RPC_PASS }) : null; } catch (e) { console.error(`[ONCHAIN-PAY] float wallet door: ${e.message}`); return null; } })();
+const onchainPay = createOnchainPayRail({
+  dataDir: DATA_DIR, env: process.env, log: (m) => console.log(m),
+  lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
+  coreRpc: onchainPayCore,
+  watchConf: ({ txid, numConfs, script, heightHint }, cb) => {
+    try {
+      // chainrpc wants the txid in internal byte order (the display txid reversed); 0.120.2: and the output's script — required; 0.120.3: and a height hint > 0 — required (LND's txnotifier)
+      return subscribeConfirmations(tataraNotifier(), { txid: Buffer.from(txid, 'hex').reverse(), script: script || Buffer.alloc(0), numConfs: numConfs || 1, heightHint: heightHint || 0 },
+        (ev) => { if (ev.conf) cb({ height: Number(ev.conf.block_height) || 0 }); }, `OnchainPayConf:${txid.slice(0, 8)}…`);
+    } catch (e) { console.error(`[ONCHAIN-PAY] confirmation stream for ${txid.slice(0, 12)}… could not be opened: ${e.message}`); return null; }
+  },
+  watchSpend: ({ txid, vout, script, heightHint }, cb) => {
+    try {
+      const hash = Buffer.from(txid, 'hex').reverse();
+      return subscribeSpend(tataraNotifier(), { outpoint: { hash, index: vout }, script: script || Buffer.alloc(0), heightHint: heightHint || 0 },   // 0.120.2: the output's script — required; 0.120.3: the height hint — required
+        (ev) => { if (ev.spend) cb({ spending_txid: Buffer.from(ev.spend.spending_tx_hash).reverse().toString('hex'), height: Number(ev.spend.spending_height) || 0, raw_hex: ev.spend.raw_spending_tx ? Buffer.from(ev.spend.raw_spending_tx).toString('hex') : '' }); },
+        `OnchainPaySpend:${txid.slice(0, 8)}…:${vout}`);
+    } catch (e) { console.error(`[ONCHAIN-PAY] spend stream for ${txid.slice(0, 12)}…:${vout} could not be opened: ${e.message}`); return null; }
+  },
+  sendWakePush: (pk, ms, kind) => sendWakePush(pk, ms, kind),
+  proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),
+  plRecord: (k, f) => plRecord(k, f), leaseTouch: (pk, s) => leaseTouch(pk, s), localPubkey: () => LOCAL_PUBKEY,
+  network: 'bc',   // mainnet addresses — the UM890's chain (CONFIG is defined further down; the adapter has no testnet mode)
+});
 // 0.72.0 (S45 #10): the PL engine — fee ledger + daily snapshots (pl.js). Created
 // at boot next to the console; the fee-realization points below write through
 // plRecord, which is a no-op until then.
@@ -817,6 +848,7 @@ const {
   makeRouterClient,
   makeLightningOpenChannelClient,
   subscribeSpend,   // 0.103.0: the channel watch's spend streams
+  subscribeConfirmations,   // 0.120.0: the lock's confirmation (Lightning pays on-chain)
   subscribeHtlcInterceptor,
   openChannelSync,
   sendToRouteV2,
@@ -2381,6 +2413,7 @@ function lnurlpBootResume() {
 }
 setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
 setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PUSH-KEY] boot resume failed: ${e.message}`); } }, 9000);   // 0.82.0
+setTimeout(() => { onchainPay.boot().catch((e) => console.error(`[ONCHAIN-PAY] boot failed: ${e.message}`)); }, 9500);   // 0.120.0: the float probe, the records, the watches re-armed
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
@@ -5779,6 +5812,15 @@ function settingsReport() {
     row('Routing reports', 'cap per wallet', 'ROUTE_REPORT_MAX_PAIRS_PER_HOUR', ROUTE_REPORT_MAX_PAIRS_PER_HOUR, 'pairs/h', 'a wallet\'s signed routing report may write this many refused pairs an hour into LND\'s routing memory (0.113.0)'),
     row('Push Key', 'amount floor', 'PUSH_MIN_SATS', pushRail.settings().min_sats, 'sats', ''),
     row('Push Key', 'amount ceiling', 'PUSH_MAX_SATS', pushRail.settings().max_sats, 'sats', ''),
+    // 0.120.0 (S66): Lightning pays on-chain — design v0.6 §8
+    row('Lightning pays on-chain', 'offered', 'ONCHAIN_PAY_ENABLED', onchainPay.settings().enabled ? 'true' : 'false', '', 'false stops NEW payments only — the open ones run to their end (take-backs, collections, status)'),
+    row('Lightning pays on-chain', 'provider\'s fee', 'ONCHAIN_PAY_FEE_SATS', onchainPay.settings().fee_sats, 'sats', 'flat, not refundable once the lock is sent (DP: 1,000)'),
+    row('Lightning pays on-chain', 'share of the amount', 'ONCHAIN_PAY_FEE_PPM', onchainPay.settings().fee_ppm, 'ppm', 'optional, on top of the flat fee — 0 (DP)'),
+    row('Lightning pays on-chain', 'amount floor', 'ONCHAIN_PAY_MIN_SATS', onchainPay.settings().min_sats, 'sats', ''),
+    row('Lightning pays on-chain', 'amount ceiling', 'ONCHAIN_PAY_MAX_SATS', onchainPay.settings().max_sats, 'sats', 'per payment'),
+    row('Lightning pays on-chain', 'take-back window', 'ONCHAIN_PAY_REFUND_BLOCKS', onchainPay.settings().refund_blocks, 'blocks', 'T = the block at the lock + this; the wallet stops releasing 12 blocks before T'),
+    row('Lightning pays on-chain', 'daily ceiling', 'ONCHAIN_PAY_DAILY_SATS', onchainPay.settings().daily_sats, 'sats', 'locked in any rolling 24 hours, all wallets; the float\'s balance is the hard stop'),
+    row('Lightning pays on-chain', 'open at once', 'ONCHAIN_PAY_MAX_OPEN', onchainPay.settings().max_open, '', 'box-wide; no per-wallet cap (DP)'),
     row('NWC', 'switch', 'NWC_ENABLED', nwc.settings().enabled ? 'on' : 'off', '', 'off by default; on = this provider keeps and relays NWC requests for its wallets (never pays, never reads one) — 0.86.0'),
     row('NWC', 'request ttl ceiling', 'NWC_REQUEST_TTL_CEILING_S', nwc.settings().request_ttl_ceiling_s, 's', 'the longest a waiting request is kept; the wallet\'s own dial governs within it'),
     row('NWC', 'relay', '', nwc.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /nwc'),
@@ -5870,8 +5912,11 @@ async function consoleSnapshot() {
     if (!leaseIsWalletPeer(c.remote_pubkey)) { const r = Number(c.remote_balance || 0); extInActive += r; if (!top || r > top.sats) top = { pubkey: c.remote_pubkey, alias: c.peer_alias || '', label: (consoleNotes.wallets[c.remote_pubkey] || {}).label || '', sats: r }; }
   }
   const onchainTotal = Number(wb.confirmed_balance || 0) + Number(wb.unconfirmed_balance || 0);
+  // 0.120.4 (DP 11-03 13:01): the float wallet (Bitcoin Core, Lightning pays on-chain) — its own box, and inside Treasury
+  const fl = (() => { try { const f = onchainPay.summary().float; return (f && f.ok) ? { sats: Number(f.balance_sats || 0), unconfirmed: Number(f.unconfirmed_sats || 0), probed_at: f.probed_at || 0 } : null; } catch (_) { return null; } })();
+  const floatTotal = fl ? fl.sats + fl.unconfirmed : 0;
   const boxes = {
-    treasury: sumLocal + onchainTotal, onchain_total: onchainTotal, anchor_reserve: Number(wb.reserved_balance_anchor_chan || 0),
+    treasury: sumLocal + onchainTotal + floatTotal, onchain_total: onchainTotal, anchor_reserve: Number(wb.reserved_balance_anchor_chan || 0), float: fl,
     can_send: localActive, can_receive: remoteActive, n_active: nActive,
     top_inbound: top ? { alias: top.label || top.alias || top.pubkey.slice(0, 12) + '…', sats: top.sats, pct: extInActive ? top.sats / extInActive : 0 } : null,
   };
@@ -6036,6 +6081,7 @@ async function consoleSnapshot() {
     channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
     delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
+    onchain_pay: (() => { try { return onchainPay.summary(); } catch (_) { return null; } })(),   // 0.120.0: the Float pane — the float, the open payments, the take-backs due, fees and chain costs
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', urls: CONFIG.registries, doors: registryStatus.doors, last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
@@ -6812,6 +6858,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
         lnurl_fetch:     { enabled: true },   // 0.119.3 (S66, item 2): POST /v1/lnurl/fetch — the provider fetches a payee's pay terms or invoice for a phone the payee refused
+        onchain_pay:     onchainPay.capability(),   // 0.120.0: Lightning pays on-chain — offered or not, the flat fee, the limits, the take-back window
         nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
         filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it
       };
@@ -6878,6 +6925,11 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // and deliver carry the route token; void carries the sender's node-key signature. See push.js.
   if (path.startsWith('/push/')) {
     if (await pushRail.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
+  }
+  // 0.120.0 (S66, Lightning pays on-chain): quote / open / release (POST) and status (GET) — every one signed by the
+  // wallet's node key (lnurlpAuthCheck over "onchain-pay"); a record answers only the wallet whose key is on it. See onchain-pay.js.
+  if (path.startsWith('/v1/onchain-pay/')) {
+    if (await onchainPay.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
   }
   // 0.86.1 (DP's field test, step 2): the NWC routes dispatch on THEIR OWN prefix — 0.86.0 had this line inside the
   // /push/ block above, so /v1/nwc/register fell through to the generic 404 ("Not found") and no [NWC] line was logged.
@@ -7514,6 +7566,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       offline_hold:          { enabled: OFFLINE_HOLD_ENABLED, cap_ms: OFFLINE_HOLD_CAP_MS, headroom_blocks: OFFLINE_MIN_HEADROOM_BLOCKS },
       // 0.82.0 (S49): this provider locks and delivers Push Keys — the wallet's Push tab reads the fee terms here
       push_key:              pushRail.capability,
+      onchain_pay:           onchainPay.capability(),   // 0.120.0
       // 0.86.0 (S50): NWC — offered here or not (the wallet's Dials → NWC greys when not), the relay's wss address, the ceiling
       nwc:                   nwc.capability,
       // v0.56.0 (O5 full balance availability): the payer-funds-the-floor
@@ -8341,6 +8394,7 @@ async function main() {
       // 0.72.4: the one operator action so far — lease exclusions (safety-increasing, so behind the session only)
       setNote: async (kind, key, text) => consoleNoteSet(kind, key, text),   // 0.73.0 notes + labels
       releaseJitGuard: async (by) => jitGuard.release(by),   // 0.104.0: the operator's hand on the guard (session + confirm, audited)
+      floatTopupAddress: async () => onchainPay.topupAddress(),   // 0.120.5: a fresh receive address of the float wallet for the Console
       releaseJitWallet: async (wallet, by) => jitGuard.releaseWallet(wallet, by),   // 0.111.0: one blocked wallet back in
       setLeaseTtl: async (cp, ttl, by) => leaseSetTtl(cp, ttl, by),   // 0.111.0: a channel's lease length (was the public /lease/ttl)
       leaseStatus: () => leaseStatusReport(),   // 0.111.0: GET /console/lease — the old box-local dashboard's read (loopback + the route token)

@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.119.3, 2026-11-02). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.120.5, 2026-11-03). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.119.3         # the newest tag — the last row of RELEASES.md
+       git checkout v0.120.5         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -139,6 +139,17 @@ WHAT YOU NEED BEFORE STARTING
    - Your money exposure: JIT opens spend YOUR onchain funds within
      the limits you set (CHANNEL_SIZE/MIN/MAX, JIT_MIN_ONCHAIN_
      RESERVE_SATS). Set them deliberately.
+   - Lightning pays on-chain (0.120.0): a wallet pays an on-chain
+     address from its Lightning balance through this box. It needs a
+     FLOAT WALLET — a wallet in the box's own Bitcoin Core under an RPC
+     user whose command list is whitelisted (rpcwhitelist, with
+     rpcwhitelistdefault=0 beside it), holding no more than
+     ONCHAIN_PAY_DAILY_SATS, topped up by hand — and a take-back seed
+     (ONCHAIN_PAY_TAKEBACK_SEED; back it up with .env). The adapter
+     gains no right on LND. ONCHAIN_PAY_FEE_SATS (1,000) is the flat,
+     non-refundable fee; the lock's own miner fee is the sender's at
+     the live rate. ONCHAIN_PAY_ENABLED=false stops NEW payments only:
+     open ones run to their end. The Console's Float pane watches it.
    - Ask-the-provider fetches (0.119.3): a wallet whose payee's site
      refuses browser wallets asks this box to fetch the pay terms and
      the invoice for it (POST /v1/lnurl/fetch) — https on 443 to a

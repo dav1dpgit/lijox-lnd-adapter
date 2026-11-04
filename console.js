@@ -225,12 +225,36 @@ function render(d){
       ['waiting now',fmt(nw.waiting)+' request(s) <span class="dim">kept at most '+fmt(nw.request_ttl_ceiling_s)+' s; '+fmt(nw.max_waiting)+' per connection</span> \u00b7 '+fmt(nw.replies_kept)+' repl'+(nw.replies_kept===1?'y':'ies')+' kept',1],
       ['wakes today',fmt(nw.wakes_today)+' <span class="dim">one per wallet per '+fmt(nw.wake_min_interval_s)+' s at most</span> \u00b7 '+fmt(nw.sockets)+' open socket(s)',1]
     ]))}
+  // 0.120.0 (S66, DP 20:22 "Make sure the Float wallet gets its own Pane"): THE FLOAT — the float wallet's balance and
+  // fence, the ceiling and the last 24 hours' locks, every open payment with its state and block numbers, the take-backs
+  // due, the ended ones, fees earned and chain costs. Report only: nothing here moves a coin.
+  var op=d.onchain_pay;
+  if(!op){setPane('float','<span class="dim">no report (module not loaded)</span>')}else if(!op.ready){setPane('float','<span class="dim">off \u2014 no float wallet (ONCHAIN_PAY_RPC_URL / _USER / _PASS) or no take-back seed (ONCHAIN_PAY_TAKEBACK_SEED); this provider does not pay on-chain from Lightning</span>'+(op.open&&op.open.length?'<div class="warn">'+fmt(op.open.length)+' payment(s) are OPEN with the door shut \u2014 restore the settings; nothing is taken back until then</div>':''))}else{
+    var fl=op.float||{};var st=op.settings||{};var fenceTxt=fl.fence==='ok'?'<span class="ok">OK</span>':'<span class="warn">'+esc(String(fl.fence||'?').toUpperCase())+' \u2014 '+esc(fl.note||'')+'</span>';
+    var stateWord=function(x){return {quoted:'quoted',opening:'paying',locked:'locked \u00b7 waiting for a block',lock_confirmed:'lock confirmed \u00b7 the wallet may release',released:'released \u00b7 B to settle',taking_back:'taking back',done:'done',taken_back:'taken back',cancelled:'cancelled',expired:'expired',spent_unknown:'SPENT BY AN UNKNOWN TRANSACTION'}[x]||x};
+    var rows=kv([
+      ['float',fmt(fl.balance_sats)+' sats'+(fl.unconfirmed_sats?' <span class="dim">+ '+fmt(fl.unconfirmed_sats)+' unconfirmed</span>':'')+(op.reserved_sats?' \u00b7 '+fmt(op.reserved_sats)+' reserved by standing quotes \u00b7 <b>'+fmt(op.remaining_sats)+' sats free</b>':'')+' <span class="dim">probed '+ago(fl.probed_at)+' \u00b7 every quote reads the wallet again</span>',1],
+      ['fence',fenceTxt+' <span class="dim">a command outside the RPC user\u2019s list must be refused by Bitcoin Core</span>',1],
+      ['offered',(op.enabled?'<span class="ok">yes</span>':'<span class="warn">no \u2014 new payments off; open ones run to their end</span>')+' <span class="dim">ONCHAIN_PAY_ENABLED</span>',1],
+      ['fee',fmt(st.fee_sats)+' sats flat'+(st.fee_ppm?' + '+fmt(st.fee_ppm)+' ppm':'')+' <span class="dim">not refundable once the lock is sent; the lock\u2019s own miner fee is the sender\u2019s, at the live rate</span>',1],
+      ['limits',fmt(st.min_sats)+' \u2013 '+fmt(st.max_sats)+' sats per payment \u00b7 '+fmt(op.locked_24h_sats)+' of '+fmt(st.daily_sats)+' locked in 24 h \u00b7 '+fmt(op.open?op.open.length:0)+' of '+fmt(st.max_open)+' open',1],
+      ['take-back',fmt(st.refund_blocks)+' blocks after the lock (T) \u00b7 the wallet stops releasing '+fmt(st.stop_release_blocks)+' blocks before T \u00b7 key '+idc(op.take_back_key,16),1],
+      ['earned / spent',fmt(op.provider_fees_sats)+' sats of provider\u2019s fees \u00b7 '+fmt(op.chain_costs_sats)+' sats of chain costs (bumps, take-backs)',1],
+      ['top-up address',(op.topup&&op.topup.address?idc(op.topup.address)+' <span class="dim">made '+ago(op.topup.made_at)+' \u00b7 tap to copy</span>':'<span class="dim">none yet</span>')+' <button class="fa" style="margin-left:8px">New address</button>',1]   /* 0.120.5 (DP): a fresh receive address of the float wallet, on a tap */
+    ]);
+    var tr=function(x){return '<tr><td class="mono">'+idc(x.hash,12)+'</td><td>'+esc(stateWord(x.state))+'</td><td class="n">'+fmt(x.amount_sats)+'</td><td class="n">'+fmt(x.lock_sats)+'</td><td>'+idc(x.handover_address,14)+'</td><td class="n">'+(x.lock_block?fmt(x.lock_block):'')+'</td><td class="n">'+(x.T?fmt(x.T):'')+'</td><td class="mono">'+idc(x.lock_txids&&x.lock_txids.length?x.lock_txids[x.lock_txids.length-1]:'',10)+'</td><td class="mono">'+idc(x.release_txid||(x.takeback_txids&&x.takeback_txids.length?x.takeback_txids[x.takeback_txids.length-1]:''),10)+'</td><td class="dim">'+esc(x.end_reason||'')+'</td></tr>'};
+    var head='<tr><th>hash</th><th>state</th><th class="n">to recipient</th><th class="n">locked</th><th>hand-over address</th><th class="n">lock block</th><th class="n">T</th><th>lock txid</th><th>release / take-back</th><th></th></tr>';
+    var openHtml=(op.open&&op.open.length)?'<div class="tbl"><table>'+head+op.open.map(tr).join('')+'</table></div>':'<div class="dim">no payment open</div>';
+    var endedHtml=(op.ended&&op.ended.length)?'<details><summary class="dim">'+fmt(op.ended.length)+' ended</summary><div class="tbl"><table>'+head+op.ended.map(tr).join('')+'</table></div></details>':'';
+    var refused=(op.boot_refused&&op.boot_refused.length)?'<div class="warn">'+fmt(op.boot_refused.length)+' record(s) on disk failed their HMAC at boot and are ignored: '+op.boot_refused.map(function(h){return idc(h,12)}).join(' ')+'</div>':'';
+    setPane('float',rows+'<div style="margin-top:8px"><b>Open payments</b></div>'+openHtml+endedHtml+refused)}
   var b=d.balances||{};
   var pr=b.principles||{};function cov(x){return x==null?'<span class="dim">n/a</span>':x.toFixed(1)+'\\u00d7'}
   var bx=b.boxes||{};function kpi(t,v,sub,cls){return '<div class="kpi '+(cls||'')+'"><div class="t">'+t+'</div><div class="v">'+v+'</div><div class="s">'+(sub||'')+'</div></div>'}
   var ti=bx.top_inbound;var boxesHtml='<div class="kpis">'
-    +kpi('Treasury',fmt(bx.treasury)+' sats',(Number(bx.treasury||0)/1e8).toFixed(4)+' BTC')
+    +kpi('Treasury',fmt(bx.treasury)+' sats',(Number(bx.treasury||0)/1e8).toFixed(4)+' BTC'+(bx.float?' \u00b7 float wallet included':''))
     +kpi('On-chain',fmt(bx.onchain_total)+' sats',fmt(bx.anchor_reserve)+' anchor reserve',bx.onchain_total<2e6?'bad':bx.onchain_total<5e6?'warn':'')
+    +kpi('Float wallet',bx.float?fmt(bx.float.sats)+' sats':'\u2014',bx.float?('Bitcoin Core \u00b7 Lightning pays on-chain'+(bx.float.unconfirmed?' \u00b7 + '+fmt(bx.float.unconfirmed)+' unconfirmed':'')):'no float wallet',bx.float?'':'warn')
     +kpi('Can send',fmt(bx.can_send)+' sats',fmt(bx.n_active)+' active channels')
     +kpi('Can receive',fmt(bx.can_receive)+' sats','inbound capacity',bx.can_receive<1e6?'warn':'')
     +(bx.pending?kpi('Pending',fmt(bx.pending.total)+' sats','unconfirmed '+fmt(bx.pending.onchain_unconfirmed)+' \\u00b7 in flight '+fmt(bx.pending.in_flight)+' \\u00b7 opening '+fmt(bx.pending.opening)+' \\u00b7 closing '+fmt(bx.pending.closing),bx.pending.total>0?'warn':''):'')   /* 0.119.3 (DP's item 6): the money not settled anywhere yet */
@@ -241,7 +265,7 @@ function render(d){
   /* 0.109.1 (DP 2026-10-19 23:15): the Liquidity · now graphic is OFF THE SCREEN — "looks poor and needs improvement" — the card
      stays in the markup hidden and the drawing code stays; it comes back when the graphic is redone. */
   if(window.LIJ_SHOW_FLOW){var fc=document.getElementById('flowcard');if(fc)fc.hidden=false;setPane('flow',flowSvg(d)||'<span class="dim">no channels yet \u2014 the graphic draws once this node has one</span>')}
-  setPane('bal',boxesHtml+kv([['on-chain confirmed',fmt(b.onchain_confirmed)+' sats'+(b.reserved_anchor?' <span class="dim">('+fmt(b.reserved_anchor)+' reserved for anchors)</span>':''),1],['on-chain unconfirmed',fmt(b.onchain_unconfirmed)+' sats'],['channel local',fmt(b.local)+' sats'+(b.unsettled?' <span class="dim">('+fmt(b.unsettled)+' in flight)</span>':''),1],['channel remote',fmt(b.remote)+' sats'],['pending open local',fmt(b.pending_open_local)+' sats'],['closing (limbo)',fmt(b.limbo||0)+' sats'],
+  setPane('bal',boxesHtml+kv([['on-chain confirmed',fmt(b.onchain_confirmed)+' sats'+(b.reserved_anchor?' <span class="dim">('+fmt(b.reserved_anchor)+' reserved for anchors)</span>':''),1],['on-chain unconfirmed',fmt(b.onchain_unconfirmed)+' sats'],['channel local',fmt(b.local)+' sats'+(b.unsettled?' <span class="dim">('+fmt(b.unsettled)+' in flight)</span>':''),1],['channel remote',fmt(b.remote)+' sats'],['pending open local',fmt(b.pending_open_local)+' sats'],['closing (limbo)',fmt(b.limbo||0)+' sats'],['float wallet',bx.float?fmt(bx.float.sats)+' sats'+(bx.float.unconfirmed?' <span class="dim">(+ '+fmt(bx.float.unconfirmed)+' unconfirmed)</span>':'')+' <span class="dim">Bitcoin Core \u00b7 in Treasury</span>':'<span class="dim">none</span>'],
     ['P1 outbound cover',cov(pr.p1_cover),1],
     ['P2 inbound cover',cov(pr.p2_cover),1],
     ['how figured','<span class="dim">P1 = ex-wallet outbound '+fmt(pr.ext_out)+' \\u00f7 wallets\\u2019 spendable '+fmt(pr.wallet_out)+' \\u2014 how many times over the LSP could push out what every wallet holds.<br>P2 = ex-wallet inbound '+fmt(pr.ext_in)+' \\u00f7 wallets\\u2019 receive room '+fmt(pr.wallet_in)+' \\u2014 how many times over the network could fill what every wallet can still receive.<br>'+fmt(pr.wallet_n)+' wallet channels ('+fmt(pr.wallet_active)+' online now) + '+fmt(pr.ext_n)+' peer channels ('+fmt(pr.ext_active)+' online); all channels count \\u2014 a wallet is offline whenever its phone is closed; wallets\\u2019 spendable = their side of wallet channels, receive room = the LSP\\u2019s side.</span>',1]]));
@@ -280,8 +304,8 @@ function sats(msat){return Math.round(Number(msat||0)/1000)}
 function fiat(satsN,rate){if(!rate)return '';var v=satsN/1e8*rate;return '<span class="dim">'+(v<0?'\\u2212':'')+'$'+Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+'</span>'}
 function renderPL(r){
   var p=r.periods[plPeriod];var rate=r.rates_usd;
-  var rev=sats(p.routing_fee_msat)+sats(p.open_fee_msat)+sats(p.hold_fee_msat);
-  var chain=p.chain_fee_open_sats+p.chain_fee_close_sats+p.chain_fee_sweep_sats+p.chain_fee_other_sats;
+  var rev=sats(p.routing_fee_msat)+sats(p.open_fee_msat)+sats(p.hold_fee_msat)+sats(p.onchain_pay_fee_msat||0);   // 0.120.0: the provider's fees from Lightning pays on-chain
+  var chain=p.chain_fee_open_sats+p.chain_fee_close_sats+p.chain_fee_sweep_sats+p.chain_fee_other_sats+(p.chain_fee_onchain_pay_sats||0);
   var cost=chain+sats(p.payment_fee_msat);var net=rev-cost;
   // 0.76.0 (DP): each line shows the sats that MOVED for it and the rate it earned or cost (fee \\u00f7 moved).
   // Where only part of a line's fees carry a moved amount (ledger events from before 0.76.0), the rate is
@@ -295,11 +319,13 @@ function renderPL(r){
    +row('routing fees',sats(p.routing_fee_msat),sats(p.routing_out_msat),pct(sats(p.routing_fee_msat),sats(p.routing_out_msat)),fmt(p.routing_count)+' forwards')
    +row('channel-open fees',sats(p.open_fee_msat),sats(p.open_moved_msat),pct(sats(p.open_moved_fee_msat),sats(p.open_moved_msat),opPart),fmt(p.open_count)+' opens')
    +row('hold / LNURL fees',sats(p.hold_fee_msat),sats(p.hold_moved_msat),pct(sats(p.hold_moved_fee_msat),sats(p.hold_moved_msat),hdPart),fmt(p.hold_count)+' holds')
+   +row('Lightning pays on-chain fees',sats(p.onchain_pay_fee_msat||0),sats(p.onchain_pay_moved_msat||0),pct(sats(p.onchain_pay_fee_msat||0),sats(p.onchain_pay_moved_msat||0)),fmt(p.onchain_pay_count||0)+' payments')
    +row('revenue',rev,0,'','','tot')
    +'<tr><td class="h" colspan="6">Costs</td></tr>'
    +row('chain fees \\u00b7 opens',p.chain_fee_open_sats,p.chain_moved_open_sats,pct(p.chain_fee_open_sats,p.chain_moved_open_sats))
    +row('chain fees \\u00b7 closes',p.chain_fee_close_sats,p.chain_moved_close_sats,pct(p.chain_fee_close_sats,p.chain_moved_close_sats))
    +row('chain fees \\u00b7 sweeps',p.chain_fee_sweep_sats,p.chain_moved_sweep_sats,pct(p.chain_fee_sweep_sats,p.chain_moved_sweep_sats))
+   +row('chain fees \\u00b7 on-chain pay',p.chain_fee_onchain_pay_sats||0,0,'',fmt(p.onchain_pay_chain_count||0)+' bumps / take-backs')
    +row('chain fees \\u00b7 other',p.chain_fee_other_sats,p.chain_moved_other_sats,pct(p.chain_fee_other_sats,p.chain_moved_other_sats),fmt(p.chain_tx_count)+' txs'+(p.chain_fee_unknown_count?' \u00b7 <span class="warn">fee unknown \u00b7 '+fmt(p.chain_fee_unknown_count)+' tx'+(p.chain_fee_unknown_count===1?'':'s')+'</span>':''))
    +row('payment fees',sats(p.payment_fee_msat),sats(p.payment_value_msat),pct(sats(p.payment_fee_msat),sats(p.payment_value_msat)),fmt(p.payment_count)+' payments, '+fmt(p.delivery_count)+' deliveries')
    +row('costs',cost,0,'','','tot')
@@ -354,6 +380,7 @@ document.addEventListener('DOMContentLoaded',function(){
     var h=e.target.closest?e.target.closest('.card > h2'):null;if(!h)return;var card=h.parentNode;if(fullCard===card){collapseCard()}else if(!fullCard){expandCard(card)}});
   if($('login')){var c=$('code');c.focus();c.addEventListener('input',function(){if(c.value.replace(/\\D/g,'').length===6)login()});$('go').addEventListener('click',login);return}
   $('logout').addEventListener('click',function(){fetch('/console/logout',{method:'POST'}).then(function(){location.reload()})});
+  $('float').addEventListener('click',function(e){var b=e.target.closest?e.target.closest('button.fa'):null;if(!b)return;b.disabled=true;fetch('/console/float-address',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.error||'refused');lastPane['float']=null}).catch(function(){alert('no answer');b.disabled=false})});   /* 0.120.5: a fresh top-up address */
   $('guard').addEventListener('click',function(e){var b=e.target.closest?e.target.closest('button.jr'):null;if(!b)return;if(!confirm('Release the JIT guard?\\n\\nJIT channel opens start again on every rail. The count of funded-but-failed opens starts afresh from now.'))return;b.disabled=true;fetch('/console/jit-release',{method:'POST',headers:{'content-type':'application/json'},body:'{}'}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.error||'refused');lastPane['guard']=null}).catch(function(){alert('no answer');b.disabled=false})});
   $('guard').addEventListener('click',function(e){var b=e.target.closest?e.target.closest('button.jrw'):null;if(!b)return;var w=b.getAttribute('data-w');if(!confirm('Release this wallet from the JIT block?\\n\\n'+w+'\\n\\nJIT channel opens for it start again; its count of failed opens starts afresh. The guard for everyone is not touched.'))return;b.disabled=true;fetch('/console/jit-release-wallet',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet:w})}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.error||'refused');lastPane['guard']=null}).catch(function(){alert('no answer');b.disabled=false})});
   $('chan').addEventListener('click',function(e){var b=e.target.closest?e.target.closest('button.lt'):null;if(!b)return;var cp=b.getAttribute('data-cp'),cur=b.getAttribute('data-ttl'),def=b.getAttribute('data-def');var v=prompt('Lease length for this channel, in days (1 to 3650).\\nEmpty = back to the default of '+def+' days.\\n\\nA channel whose peer has been silent longer than this is force-closed on the next hourly run, unless it is excluded.\\n\\n'+cp,cur||'');if(v===null)return;v=v.trim();if(v!==''&&!(Number(v)>=1&&Number(v)<=3650)){alert('1 to 3650 days, or empty');return}if(!confirm((v===''?'Clear the override \\u2014 back to '+def+' days?':'Set the lease to '+v+' days?')+'\\n\\n'+cp))return;b.disabled=true;fetch('/console/lease-ttl',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({chan_point:cp,ttl_days:v===''?null:Number(v)})}).then(function(r){return r.json()}).then(function(j){if(!j.ok)alert(j.error||'refused');lastPane['chan']=null}).catch(function(){alert('no answer');b.disabled=false})});
@@ -382,6 +409,7 @@ function pageConsole() {
 <section class="card"><h2>Routing reports</h2><div id="routerep" class="dim">\u2026</div></section>
 <section class="card"><h2>Delegate rail</h2><div id="delegate" class="dim">\u2026</div></section>
 <section class="card"><h2>NWC</h2><div id="nwc" class="dim">\u2026</div></section>
+<section class="card"><h2>Float \u00b7 Lightning pays on-chain</h2><div id="float" class="dim">\u2026</div></section>
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>
 <section class="card"><h2>Node</h2><div id="node" class="dim">\u2026</div></section>
 <section class="card"><h2>Balances</h2><div id="bal" class="dim">\u2026</div></section>
@@ -507,6 +535,11 @@ function createConsole(deps) {
       catch (e) { return json(res, 400, { ok: false, error: String(e && e.message || e) }); }
     }
 
+    if (path === '/console/float-address' && req.method === 'POST') {   // 0.120.5 (DP): a fresh receive address of the float wallet (session; audited)
+      if (!deps.floatTopupAddress) return json(res, 503, { ok: false, error: 'not wired' });
+      try { const r = await deps.floatTopupAddress(); log(`[Console] float top-up address ${r.address} made from ${ip}`); return json(res, 200, { ok: true, address: r.address, made_at: r.made_at }); }
+      catch (e) { return json(res, 400, { ok: false, error: String(e && e.message || e) }); }
+    }
     if (path === '/console/jit-release' && req.method === 'POST') {   // 0.104.0: the operator's hand on the JIT guard
       if (!deps.releaseJitGuard) return json(res, 503, { ok: false, error: 'not wired' });
       try { const r = await deps.releaseJitGuard('console ' + ip); log(`[Console] JIT guard ${r.ok ? 'RELEASED' : 'release refused: ' + r.error} from ${ip}`); return json(res, r.ok ? 200 : 400, r); }
