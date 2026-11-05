@@ -60,6 +60,53 @@ enum CommitmentType {
 
 service Lightning {
     rpc OpenChannelSync (OpenChannelRequest) returns (ChannelPoint);
+    // 0.124.0 (wallet trusts LSP): the streaming open — the only call that honours a funding shim (rpcserver.go
+    // 2472–2514 vs 2564–2600 in v0.20.1-beta). Reads node_pubkey (bytes, field 2), never the hex string.
+    rpc OpenChannel (OpenChannelRequest) returns (stream OpenStatusUpdate);
+}
+
+// 0.124.0: every message and field below is copied from LND v0.20.1-beta's lnrpc/lightning.proto; the field numbers
+// are pinned by jit-funding.test.js against that text (the v0.18.8 lesson above: never from memory).
+message FundingShim {
+    oneof shim {
+        ChanPointShim chan_point_shim = 1;
+        PsbtShim psbt_shim = 2;
+    }
+}
+message ChanPointShim {
+    int64 amt = 1;
+    ChannelPoint chan_point = 2;
+    bytes remote_key = 4;
+    bytes pending_chan_id = 5;
+    uint32 thaw_height = 6;
+    bool musig2 = 7;
+}
+message PsbtShim {
+    bytes pending_chan_id = 1;
+    bytes base_psbt = 2;
+    bool no_publish = 3;
+}
+message OpenStatusUpdate {
+    oneof update {
+        PendingUpdate chan_pending = 1;
+        ChannelOpenUpdate chan_open = 3;
+        ReadyForPsbtFunding psbt_fund = 5;
+    }
+    bytes pending_chan_id = 4;
+}
+message PendingUpdate {
+    bytes txid = 1;
+    uint32 output_index = 2;
+    int64 fee_per_vbyte = 3;
+    bool local_close_tx = 4;
+}
+message ChannelOpenUpdate {
+    ChannelPoint channel_point = 1;
+}
+message ReadyForPsbtFunding {
+    string funding_address = 1;
+    int64 funding_amount = 2;
+    bytes psbt = 3;
 }
 
 message OpenChannelRequest {
@@ -68,14 +115,18 @@ message OpenChannelRequest {
     // would be re-parsed by LND as a FundingShim and fail. The deprecated
     // node_pubkey_string is at field 3; OpenChannelSync REQUIRES the hex
     // string form (it doesn't read the bytes node_pubkey field).
+    // 0.124.0: the streaming OpenChannel reads the BYTES form (field 2) and the funding shim (field 14).
+    bytes node_pubkey = 2;
     string node_pubkey_string = 3;
     int64 local_funding_amount = 4;
     int64 push_sat = 5;
+    uint64 sat_per_vbyte = 1;
     int32 target_conf = 6;
     int64 sat_per_byte = 7;
     bool private = 8;
     int64 min_htlc_msat = 9;
     int32 min_confs = 11;
+    FundingShim funding_shim = 14;   // 0.124.0
     CommitmentType commitment_type = 18;
     bool zero_conf = 19;
     bool scid_alias = 20;

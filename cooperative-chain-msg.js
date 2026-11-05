@@ -49,6 +49,10 @@ const TYPE_BROADCAST_ACK          = 32819;
 // sat/vB (whose u32 fields and hard-required protocol version cannot change without breaking every older wallet). Sent
 // right after every ChainDataBundle; an older wallet ignores the unknown odd type (BOLT 1); a v362 engine prefers it.
 const TYPE_FEE_RATES_KW           = 32821;
+// 0.124.0 (wallet trusts LSP — the wallet repo's docs/design/jit-trust/wallet-trusts-lsp-v0.1.md §5.4): the provider
+// abandoned a JIT channel whose funding it had held back (the payment was refused) — the funding was never published and
+// never will be. The wallet drops the channel only under its own rule (nothing owned in it). Odd = an older wallet ignores it.
+const TYPE_JIT_FUNDING_ABANDONED  = 32823;
 
 const MAX_RAW_TX_BYTES = 1_000_000;
 
@@ -305,6 +309,27 @@ function decodeFeeRatesKw(buf) {
   return { fast_sat_per_kw: r.u32(), medium_sat_per_kw: r.u32(), slow_sat_per_kw: r.u32(), relay_floor_sat_per_kw: r.u32() };
 }
 
+// ── Message 12 (0.124.0): JitFundingAbandoned (LSP → wallet, type 32823) ────────
+// The funding outpoint: the txid's 32 bytes in LDK's OWN order (the display hex REVERSED — as every txid on this wire;
+// the engine's `Txid::write` writes the internal bytes), then the output index as a u32. The caller hands the DISPLAY hex
+// (LND's channel_point form); the encoder reverses. Pinned against the engine's test vector in jit-funding.test.js.
+function encodeJitFundingAbandoned(msg) {
+  const w = new Writer();
+  writeVersion(w);
+  const disp = String(msg.funding_txid_display_hex || '');
+  if (!/^[0-9a-f]{64}$/i.test(disp)) throw new Error('funding_txid_display_hex must be 64 hex chars');
+  writeHash32(w, Buffer.from(disp, 'hex').reverse());
+  if (!Number.isInteger(msg.output_index) || msg.output_index < 0 || msg.output_index > 0xFFFFFFFF) throw new Error('output_index must be a u32');
+  w.u32(msg.output_index);
+  return w.finish();
+}
+function decodeJitFundingAbandoned(buf) {
+  const r = new Reader(buf);
+  readVersion(r);
+  const internal = readHash32(r);
+  return { funding_txid_display_hex: Buffer.from(internal).reverse().toString('hex'), output_index: r.u32() };
+}
+
 // ── Message 3: BlockHeightUpdate (LSP → wallet, type 32805) ──────────────────
 
 function encodeBlockHeightUpdate(msg) {
@@ -528,6 +553,8 @@ function decodeByType(typeId, buf) {
       return { name: 'BroadcastTx',         msg: decodeBroadcastTx(buf) };
     case TYPE_BROADCAST_ACK:
       return { name: 'BroadcastAck',        msg: decodeBroadcastAck(buf) };
+    case TYPE_JIT_FUNDING_ABANDONED:
+      return { name: 'JitFundingAbandoned', msg: decodeJitFundingAbandoned(buf) };
     default:
       return null;
   }
@@ -549,6 +576,7 @@ module.exports = {
   TYPE_BROADCAST_TX,
   TYPE_BROADCAST_ACK,
   TYPE_FEE_RATES_KW,   // 0.122.0
+  TYPE_JIT_FUNDING_ABANDONED,   // 0.124.0
   CHANNEL_STATE,
   CHANNEL_STATE_NAMES,
   BROADCAST_RESULT,
@@ -564,6 +592,7 @@ module.exports = {
   encodeFundingTxConfirmed,   decodeFundingTxConfirmed,
   encodeFeeScheduleUpdate,    decodeFeeScheduleUpdate,
   encodeFeeRatesKw,           decodeFeeRatesKw,   // 0.122.0
+  encodeJitFundingAbandoned,  decodeJitFundingAbandoned,   // 0.124.0
   encodeChannelStateUpdate,   decodeChannelStateUpdate,
   encodeRegisterWatchTx,      decodeRegisterWatchTx,
   encodeRegisterWatchOutput,  decodeRegisterWatchOutput,

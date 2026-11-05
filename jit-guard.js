@@ -21,6 +21,13 @@
 //   payments because its block height lagged — a transient fault a one-strike rule would have locked out.
 // The thresholds are settings (JIT_GUARD_ARM_AT, JIT_GUARD_HALT_AT, JIT_GUARD_WALLET_AT; 0 disables that step).
 // Records are kept 14 days.
+//
+// 0.124.0 (S67, DP 2026-11-04 "Go on all", question 3 — WALLET TRUSTS LSP): an open whose funding was HELD (jit-funding.js)
+// publishes nothing when the payment fails — the channel is abandoned, the coins released, no chain fee paid. Such a
+// failure is counted in ITS OWN column (`abandoned_24h`) and toward the wallet's own block (its second failure still
+// blocks that wallet — LND's channel churn and the wallet-side cleanup are real costs), but NEVER toward the arm or the
+// halt: the halt exists to stop chain fees bleeding, and none bleed here; counting them would hand a griefer with three
+// throw-away wallets a free switch that turns JIT off for everyone. Published failures (old-flow wallets) count as before.
 const fs = require('fs');
 const path = require('path');
 
@@ -57,11 +64,12 @@ function createJitGuard(deps) {
   const keyOf = (o) => (o.wallet ? String(o.wallet).toLowerCase() : 'cp:' + o.cp);
   const walletKey = (w) => String(w || '').toLowerCase();
 
-  /// A JIT channel's funding is published: remember it until its payment's outcome is known.
-  function recordOpen(channelPoint, wallet, amountSats, rail) {
+  /// A JIT channel is open: remember it until its payment's outcome is known. `held` (0.124.0): its funding is not
+  /// published — a failure costs no chain fee and counts in its own column, never toward the halt.
+  function recordOpen(channelPoint, wallet, amountSats, rail, held) {
     const cp = String(channelPoint || '');
     if (!cp) return;
-    st.opens.push({ ts: now(), cp, wallet: String(wallet || '').slice(0, 66), sats: Number(amountSats) || 0, rail: String(rail || ''), outcome: 'open' });
+    st.opens.push({ ts: now(), cp, wallet: String(wallet || '').slice(0, 66), sats: Number(amountSats) || 0, rail: String(rail || ''), outcome: 'open', held: !!held });
     prune(); persist();
   }
   /// The forwarded payment settled: the open earned its fee.
@@ -69,7 +77,8 @@ function createJitGuard(deps) {
     const o = find(String(channelPoint || '')); if (!o) return;
     o.outcome = 'settled'; o.at = now(); persist();
   }
-  /// The forwarded payment FAILED after the funding was published: counted; the guard's level moves.
+  /// The forwarded payment FAILED after the channel was open: counted; the guard's level moves — unless the funding was
+  /// HELD (0.124.0): nothing was published, so it counts in its own column and toward the wallet's block only.
   function fail(channelPoint, code) {
     const cp = String(channelPoint || '');
     const o = find(cp); if (!o) return null;
@@ -77,7 +86,12 @@ function createJitGuard(deps) {
     const c = counts();
     const mine = walletFailures(keyOf(o));
     if (walletAt > 0 && mine.length === walletAt) {
-      log(`[JIT-GUARD] wallet ${keyOf(o).slice(0, 16)}… BLOCKED from JIT opens — ${mine.length} funded-but-failed opens in 24 h (the last ${cp}, ${o.code || 'no code'}); it clears 24 h after the last failure, or from the Console`);
+      log(`[JIT-GUARD] wallet ${keyOf(o).slice(0, 16)}… BLOCKED from JIT opens — ${mine.length} failed opens in 24 h (the last ${cp}, ${o.code || 'no code'}${o.held ? ', funding held — nothing published' : ''}); it clears 24 h after the last failure, or from the Console`);
+    }
+    if (o.held) {
+      log(`[JIT-GUARD] a held-funding JIT open failed and was abandoned: ${cp} (${o.code || 'no code'}) — nothing published, no chain fee; ${c.abandoned_24h} such in 24 h (not counted toward the halt)`);
+      persist();
+      return counts();
     }
     if (haltAt > 0 && c.failed_wallets_24h >= haltAt && !st.halted) {
       st.halted = { at: now(), count: c.failed_24h, wallets: c.failed_wallets_24h, last_cp: cp };
@@ -117,13 +131,15 @@ function createJitGuard(deps) {
   function counts() {
     const t = now(), cut = t - WINDOW_MS, since = Math.max(cut, lastRelease());
     const w = st.opens.filter((o) => o.ts >= cut);
-    const failed = w.filter((o) => o.outcome === 'failed' && Number(o.at || o.ts) > since);
+    const failed = w.filter((o) => o.outcome === 'failed' && !o.held && Number(o.at || o.ts) > since);   // 0.124.0: held failures are not here
+    const abandoned = w.filter((o) => o.outcome === 'failed' && o.held);
     const n = failed.length;
     const nw = new Set(failed.map(keyOf)).size;
     const halted = st.halted || null;
     const level = halted ? 3 : haltAt > 0 && nw >= haltAt ? 3 : armAt > 0 && nw >= armAt ? 2 : nw >= 1 ? 1 : 0;
     return {
       window_h: 24, failed_24h: n, failed_wallets_24h: nw, settled_24h: w.filter((o) => o.outcome === 'settled').length, open_24h: w.filter((o) => o.outcome === 'open').length,
+      abandoned_24h: abandoned.length, abandoned_wallets_24h: new Set(abandoned.map(keyOf)).size, held_settled_24h: w.filter((o) => o.outcome === 'settled' && o.held).length,   // 0.124.0: the held-funding column
       level, armed: !halted && armAt > 0 && nw >= armAt, halted,
       last_failed: failed.length ? { at: failed[failed.length - 1].at, cp: failed[failed.length - 1].cp, code: failed[failed.length - 1].code || '', wallet: failed[failed.length - 1].wallet, sats: failed[failed.length - 1].sats } : null,
       arm_at: armAt, halt_at: haltAt, wallet_at: walletAt, last_release: lastRelease() || null, released_count: st.released.length,

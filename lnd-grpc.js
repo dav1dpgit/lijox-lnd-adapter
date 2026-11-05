@@ -433,6 +433,54 @@ function openChannelSync(client, params, timeoutMs) {
   });
 }
 
+// ── Lightning (OpenChannel, streaming) — the HELD open (0.124.0, wallet trusts LSP) ──────────────────────────────
+/**
+ * Open a channel through LND's streaming OpenChannel so a PSBT funding shim can be used (OpenChannelSync ignores
+ * shims). The stream's first update is `psbt_fund` (the funding address, the exact amount, a PSBT with the one
+ * output): `onPsbtFund(update)` must fund it, sign it and call FundingStateStep(psbt_verify) itself — the funding
+ * manager then goes on to funding_created. Resolves with the ChannelPoint of `chan_pending` (for a zero-conf channel
+ * the channel is marked open a moment later; `chan_open` is logged when it comes). Rejects on a stream error before
+ * chan_pending, on an onPsbtFund failure (the stream is cancelled), or at the deadline.
+ *
+ * @param client   Lightning client from makeLightningOpenChannelClient() (the extended proto)
+ * @param params   OpenChannelRequest fields — node_pubkey as a Buffer (the stream reads the bytes form), the shim in
+ *                 funding_shim.psbt_shim { pending_chan_id, no_publish }
+ * @returns Promise<{ funding_txid_bytes: Buffer, output_index: number }>
+ */
+function openChannelHeld(client, params, { onPsbtFund, timeoutMs } = {}) {
+  return new Promise((resolve, reject) => {
+    if (!client) { reject(new Error('openChannelHeld: client required')); return; }
+    if (!params || !Buffer.isBuffer(params.node_pubkey) || params.node_pubkey.length !== 33) { reject(new Error('openChannelHeld: params.node_pubkey must be a 33-byte Buffer')); return; }
+    if (typeof onPsbtFund !== 'function') { reject(new Error('openChannelHeld: onPsbtFund required')); return; }
+    let settled = false;
+    const done = (fn, v) => { if (settled) return; settled = true; clearTimeout(timer); fn(v); };
+    const call = client.openChannel(params);
+    const timer = setTimeout(() => { try { call.cancel(); } catch (_) {} const e = new Error(`open deadline (${timeoutMs || 30000} ms) — no chan_pending from LND`); e.lijTimeout = true; done(reject, e); }, timeoutMs || 30000);
+    call.on('data', (upd) => {
+      if (!upd) return;
+      if (upd.psbt_fund) {
+        Promise.resolve().then(() => onPsbtFund(upd.psbt_fund)).catch((e) => { try { call.cancel(); } catch (_) {} done(reject, e); });
+        return;
+      }
+      if (upd.chan_pending) {
+        const cp = upd.chan_pending;
+        done(resolve, { funding_txid_bytes: Buffer.from(cp.txid || []), output_index: Number(cp.output_index) || 0 });
+        // 0.124.1: the stream has said what it was opened for; LND's RPC loop would otherwise sit until chan_open or
+        // its shutdown (rpcserver.go 2520–2553) — a goroutine per abandoned channel. The funding flow itself does not
+        // depend on this stream (it runs in the funding manager), so cancelling here changes nothing about the channel.
+        setImmediate(() => { try { call.cancel(); } catch (_) {} });
+        return;
+      }
+      if (upd.chan_open) { /* zero-conf: channel_ready exchanged — nothing more to do here */ }
+    });
+    call.on('error', (err) => {
+      if (err && err.code === grpc.status.CANCELLED) { done(reject, new Error('open cancelled')); return; }
+      done(reject, new Error(`OpenChannel stream error (code=${err && err.code}): ${err && err.message}`));
+    });
+    call.on('end', () => { done(reject, new Error('OpenChannel stream ended before chan_pending')); });
+  });
+}
+
 // ── Router (SendToRouteV2) unary wrapper (v0.4 NEW) ──────────────────────────
 
 /**
@@ -689,6 +737,7 @@ module.exports = {
   subscribeSpend,
   // WalletKit wrappers (v0.2)
   publishTransaction,
+  openChannelHeld,   // 0.124.0
   // Router wrappers (v0.3)
   subscribeHtlcInterceptor,
   // OpenChannelSync + SendToRouteV2 (v0.4 — LSPS2 Phase D.2)

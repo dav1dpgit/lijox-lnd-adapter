@@ -12,6 +12,101 @@ origin lists → REQUIRED with startup refusal; delegate store path →
 LIJ_DATA_DIR/__dirname). Gate rule stands: full-tree scan with the
 maintainer's private patterns file before any release tag.
 
+## 2026-11-05 — wallet trusts LSP: the funding is published only once the wallet has claimed (0.124.0)
+
+**The hole.** A JIT open published the channel's funding transaction BEFORE the wallet had claimed the payment
+(`OpenChannelSync` builds, signs and publishes in one call). When the wallet refused — Oct 6: the wallet rejected its own
+payment; the provider was out ~519 sats of chain fees and 35,400 sats of capital for a day — nothing came in. A hostile
+wallet, or a million throw-away wallets, could repeat it for free. The JIT guard (0.104.0 / 0.111.0) limited the damage;
+it did not remove the hole. The adapter had advertised `client_trusts_lsp: true` since v1 without doing it.
+
+**The fix (jit-funding.js; the wallet repo's docs/design/jit-trust/wallet-trusts-lsp-v0.1.md).** For a wallet whose init
+features carry bit 261 (LiJ engine v363+; read from LND's `ListPeers`), the channel is opened through LND's streaming
+`OpenChannel` with a PSBT funding shim and `no_publish`: LND sets `NoFundingTxBit` and never stores or publishes the
+transaction (v0.20.1-beta lnwallet/reservation.go 400–403, funding/manager.go 758–773 and 2811 — not at funding_signed,
+not at a restart). The adapter funds it with `FundPsbt` (the coins leased under its own lock id for 48 h), signs it with
+`FinalizePsbt` (publishes nothing), writes the record — the signed bytes included — to `DATA_DIR/jit-held-funding.json`
+BEFORE LND learns the txid, then `FundingStateStep(psbt_verify, skip_finalize)`; LND goes on to funding_created; the
+zero-conf channel is open with its funding unpublished; the payment is forwarded exactly as before. Claimed → the record
+says `paid` before the payer is settled, then `PublishTransaction`. Refused → `AbandonChannel` (i_know_what_i_am_doing —
+the PSBT shim sets no thaw height), `ReleaseOutput` for every coin, and the peer message `JitFundingAbandoned` (32823) so
+the wallet drops a channel it owns nothing in (LND itself tells a peer nothing about an abandoned channel —
+peer/brontide.go 2178–2194). ONE open function serves both rails (the interceptor's and the delivery rail's). Wallets
+without the bit get the publish-first open, unchanged.
+
+**The sweep** (boot + every minute) finishes what a crash interrupted: a `funded` record LND never listed → coins
+released; a `held` channel with the wallet's balance > 0 → published (the promise is kept); `held`, empty and idle ten
+minutes → abandoned; a channel gone from LND that this adapter did not abandon → `orphan`, RED on the Console (if the
+wallet had claimed, the provider owes it); `paid` → published; `published` → sent again every ten minutes until one
+confirmation; stray leases released. `GET /v1/jit-funding/status` answers a wallet's question about its own record — the
+engine's audit drops a channel it owns nothing in only when this provider says `abandoned`.
+
+**The guard.** A held-funding failure counts in its own column (`abandoned_24h`) and toward the wallet's own block, never
+toward the arm or the halt: nothing was published, no chain fee bled, and counting it would hand three throw-away wallets
+a free switch that turns JIT off for everyone (DP, question 3 of the design).
+
+**The key.** Six more RPCs — OpenChannel, FundingStateStep, FundPsbt, FinalizePsbt, ReleaseOutput, ListLeases (MACAROON.md).
+The boot probe ("[JIT-HOLD] key probe") says whether the key has them; without them every open publishes first, as
+before, and `/health` and `get_info` say `jit_funding_hold.key_ok: false`.
+
+**Not changed.** The forward itself, the fee law, the promise clock, the offline hold, the Terminus channel type (the same
+parser arm serves both open calls — fork rpcserver.go 2327–2341), the funding fee (1 sat/vB, as the old open).
+
+## 2026-11-05 — the review's fixes (0.124.1): the timeout trap, the fail-closed abandon, the polled fee
+
+**How it was found.** Before 0.124.0 rode, an independent review (fresh eyes; it read the adapter, the engine and LND
+v0.20.1-beta's source) was asked eight questions about the held open's money paths. Three findings could lose money; a
+dozen were smaller. DP: "Go ahead." The design round is the wallet repo's docs/design/jit-trust/wallet-trusts-lsp-v0.3.md.
+
+**1. The timeout trap (money).** Once `FundingStateStep(psbt_verify)` has been sent, LND finishes the channel ON ITS OWN:
+the one-shot signal in `PsbtIntent.Verify` fires (lnwallet/chanfunding/psbt_assembler.go 293–303), `Cancel` shares that
+one-shot and so changes nothing afterwards (439–446), the funding manager's zombie sweeper never expires PSBT reservations
+(funding/manager.go 5233–5252), and the `OpenChannel` RPC loop does not watch the stream's context. 0.124.0's open, on its
+25-s deadline or a dropped connection, sent `shim_cancel`, released the coins and closed the record as `cancelled` — while
+LND could still open the channel when the wallet answered late. A payment could then land over a channel whose record was
+closed; the payer would be settled; nothing would publish; the released coins could be spent elsewhere, making the held
+transaction unpublishable for good. FIX: after the verify is sent (`verify_sent_at`, stamped before the call) nothing is
+released on a failure; the record stays `funded`; the sweep frees the coins only on LND's own proof that the reservation
+is dead — the wallet peer absent from `ListPeers`, or its `last_flap_ns` after the verify (LND cancels a peer's
+reservations when it disconnects: server.go 4616 → `CancelPeerReservations`). A channel in LND's pending list counts as
+present. A channel LND lists against a `cancelled`/`abandoned` record is RED and revived to `held`. The stream is
+cancelled once `chan_pending` has been read (LND's RPC loop would otherwise sit until `chan_open`).
+
+**2. The abandon's race (money, narrow).** `abandon()` read the channel once (balance, HTLCs) and then told LND to abandon;
+a payment landing between the two calls would be the wallet's sats in a channel LND then wipes (`AbandonChannel` checks
+nothing — rpcserver.go 3283–3301). FIX: the record goes to `abandoning` FIRST and the payment paths refuse it from that
+moment (`lnurlpClientChannel` skips it; the interceptor FAILs a real-channel forward whose scid maps to it); a 2-s grace
+lets a send that picked the channel a moment ago reach LND; then LND is read; only a channel just read EMPTY is abandoned.
+
+**3. Fail-open on an LND read error.** The abandon went ahead "by the verdict" when LND could not be read. FIX: it stops,
+the record goes back to `held`, the sweep retries. Only an empty channel just read is ever abandoned.
+
+**The smaller ones, all fixed.** The sweep honoured a flow's claim on a record (`live`) before publishing — a claim could
+wait up to ten minutes; publishes now come first. The late settle (the in-flight park) wrote the SETTLE before `paid`;
+the order is now `paid` first on all three rails. The delivery rail published the held funding when the payment went over
+ANOTHER listed channel; now only when the paid channel IS the held one. An orphan's lease was released as a stray though
+an orphan can come back; it is kept. A `funded` record whose channel sat in LND's pending list read as "never listed";
+the pending list is read. A crash between `FundPsbt` and the record left a lease nobody knew for 48 h; a pre-fund record
+(`funding`) is written BEFORE `FundPsbt` and released by the sweep after ten minutes. A crash inside `abandon()` made a
+false orphan; the `abandoning` state is finished by the sweep. A claim on a closed record was swallowed; `markPaid` now
+moves any unpublished record with the bytes and says MANUAL ATTENTION. The signed transactions lived in one file; each
+record also has a copy in `DATA_DIR/jit-held-funding.d/`, and a corrupt state file rebuilds from them, loudly. Abandoned
+records were pruned after 14 days so a wallet away longer learned nothing; a tombstone answers "abandoned" for good.
+
+**The fee (DP 00:01, "Go with polling the correct current fee rate, floored at 1 sat/vB", "the dials as variables").**
+Both opens — the held one in `FundPsbt`, the publish-first one in `OpenChannelSync` (`sat_per_vbyte`, field 1) — now
+carry LND's estimate (`/v2/wallet/estimatefee/{target}`, sat/kw × 4 / 1000, rounded up) for `LSPS2_FUNDING_FEE_TARGET_CONF`
+blocks (144), never below `LSPS2_FUNDING_FEE_MIN_SAT_PER_VB` (1), never above `LSPS2_FUNDING_FEE_MAX_SAT_PER_VB` when set
+(0 = no cap); no estimate → the floor. Until 0.124.0 every JIT open carried a hard-coded 1 sat/vB — the Oct 6 fee was the
+same number. The rate used is in the record and on the Console.
+
+**Noted, not changed.** `/v1/jit-funding/status` is gated by the shared route token like every wallet route: a wallet of
+this provider holding the token can read another wallet's held-funding state word if it already knows that wallet's node
+key and the outpoint (information only; it cannot cause a drop). The engine's `funding_known_to_books` input is always
+false for an inbound channel (the wallet's books hold its own transactions) — the on-chain check that matters is
+`confirmations`; the engine note says so.
+
+
 ## 2026-11-04 — the state kit's receipts on the Backups pane (0.123.0; the box recovery v0.1)
 
 **What had one copy.** The float wallet of Lightning pays on-chain (the float itself and the key of every open lock), this

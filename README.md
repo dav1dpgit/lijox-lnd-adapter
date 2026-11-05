@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.123.0, 2026-11-04). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.124.1, 2026-11-05). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.123.0         # the newest tag — the last row of RELEASES.md
+       git checkout v0.124.1         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -135,7 +135,31 @@ WHAT YOU NEED BEFORE STARTING
      failed counts against a rolling 24 h; at JIT_GUARD_ARM_AT the
      console reads "shutdown ARMED", at JIT_GUARD_HALT_AT every JIT
      open is refused until released from the console. Set both
-     deliberately or leave the defaults.
+     deliberately or leave the defaults. From 0.124.0 a held-funding
+     failure (below) publishes nothing and is counted in its own
+     column, never toward the halt.
+   - Wallet trusts LSP (0.124.0): for a wallet that announces it
+     (init feature bit 261 — LiJ engine v363+), a JIT channel's
+     funding transaction is built and signed from your LND wallet but
+     PUBLISHED ONLY ONCE THE WALLET HAS CLAIMED the payment. Refused →
+     the channel is abandoned, the coins released, the wallet told —
+     no chain fee, nothing tied up. Older wallets get the publish-first
+     open as before. Needs six more RPCs in the key (MACAROON.md); the
+     boot line "[JIT-HOLD] key probe" says whether you have them — a
+     key without them keeps today's open and says so. LSPS2_FUNDING_HOLD
+     =false turns it off for all. The signed transaction waits in
+     DATA_DIR/jit-held-funding.json; the Console's "JIT funding" pane
+     shows every record and its state; a RED orphan row means a
+     channel left LND without this adapter abandoning it (read it).
+     0.124.1: a record that says "waiting on LND's proof" is a held
+     open whose stream timed out AFTER LND was told the txid — LND may
+     still open that channel, so the coins stay leased until the
+     wallet peer disconnects (LND cancels the reservation then) or
+     the 48-hour lease ends; nothing to do. The funding's fee (both
+     opens) is LND's estimate for LSPS2_FUNDING_FEE_TARGET_CONF blocks
+     (144), floored at LSPS2_FUNDING_FEE_MIN_SAT_PER_VB (1), capped at
+     LSPS2_FUNDING_FEE_MAX_SAT_PER_VB when set — until 0.124.0 it was
+     a hard-coded 1 sat/vB.
    - Your money exposure: JIT opens spend YOUR onchain funds within
      the limits you set (CHANNEL_SIZE/MIN/MAX, JIT_MIN_ONCHAIN_
      RESERVE_SATS). Set them deliberately.

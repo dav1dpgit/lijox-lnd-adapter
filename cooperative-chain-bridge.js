@@ -839,6 +839,20 @@ function startBridge(opts) {
       registry.clear();
       console.log('[ChainBridge] stopped, all streams torn down, registry cleared');
     },
+    // 0.124.0 (wallet trusts LSP): tell a wallet its JIT channel was abandoned — the funding was never published. The
+    // txid is given as LND writes a channel point (display hex); the encoder puts it on the wire in LDK's byte order.
+    // Resolves true when LND took the message, false otherwise; never throws.
+    sendJitFundingAbandoned: async (peerHex, fundingTxidDisplayHex, outputIndex) => {
+      try {
+        const encoded = m.encodeJitFundingAbandoned({ funding_txid_display_hex: fundingTxidDisplayHex, output_index: Number(outputIndex) });
+        await sendToPeer(String(peerHex).toLowerCase(), m.TYPE_JIT_FUNDING_ABANDONED, encoded);
+        console.log(`[ChainBridge] JitFundingAbandoned ${String(fundingTxidDisplayHex).slice(0, 12)}…:${outputIndex} sent to ${String(peerHex).slice(0, 16)}…`);
+        return true;
+      } catch (e) {
+        console.warn(`[ChainBridge] JitFundingAbandoned to ${String(peerHex).slice(0, 16)}… not sent: ${e.message}`);
+        return false;
+      }
+    },
     // 0.96.0 (S58, proposal 3): a ChainDataBundle sent unasked — the adapter's tunnel calls this the moment a wallet's
     // handshake has passed. Type 32803 is odd, so a peer that does not know it ignores it. Resolves true when LND took
     // the message, false otherwise; never throws; touches no subscription (the wallet still subscribes as before, and

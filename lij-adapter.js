@@ -427,7 +427,8 @@ const { readStateKit } = require('./state-kit-status');   // 0.123.0 (S66, the b
 const { createCoreRpc } = require('./core-rpc');             // 0.120.0: the float wallet's door — Bitcoin Core, a whitelisted RPC user, twelve commands   // 0.119.3 (S66, item 2): the provider fetches a payee's pay terms or invoice for a phone the payee's server refused
 const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
 const { createTatara, readLndRoom } = require('./tatara');
-const { createJitGuard } = require('./jit-guard');   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
+const { createJitGuard } = require('./jit-guard');
+const { createJitFunding } = require('./jit-funding');   // 0.124.0 (S67): WALLET TRUSTS LSP — the held open (the funding published only once the wallet has claimed)   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
 const { createKitHolder } = require('./kits.js');
 const { createNwc } = require('./nwc.js');   // 0.86.0 (S50, DP GO — NWC): the provider's half — registration, the relay at /nwc, the wake; see nwc.js
 const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
@@ -852,6 +853,7 @@ const {
   subscribeConfirmations,   // 0.120.0: the lock's confirmation (Lightning pays on-chain)
   subscribeHtlcInterceptor,
   openChannelSync,
+  openChannelHeld,   // 0.124.0: the streaming open with the PSBT shim — the held funding
   sendToRouteV2,
 } = require('./lnd-grpc');
 
@@ -1993,6 +1995,7 @@ async function lnurlpClientChannel(clientPubkey) {
     let best = null;
     for (const c of (r.channels || [])) {
       if ((c.remote_pubkey || '').toLowerCase() !== clientPubkey.toLowerCase()) continue;
+      if (jitFunding.isBlocked(String(c.channel_point || ''))) continue;   // 0.124.1: a held channel being abandoned takes nothing
       const localMsat = BigInt(c.local_balance || '0') * 1000n;
       const roomMsat = channelRoomMsat(c);   // 0.84.0: what LND will send, not what it holds
       const scid = (Array.isArray(c.alias_scids) && c.alias_scids.length)
@@ -2073,6 +2076,7 @@ const DELIVER_OPEN_HOLD_MS = 90000;
 function deliverReservedFundingSats() { let s = 0; for (const o of deliverOpening.values()) s += Number(o.sizeSats) || 0; return s; }
 async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat: fixedFeeMsat, finalCltvDelta, tag, jitTag }) {
   let guardCp = '';   // 0.104.0: set when THIS call opened the channel; its payment's outcome is reported to the guard below
+  let heldCp = '';    // 0.124.0: set when THIS call opened the channel with its funding HELD — paid → publish, failed → abandon
   const amt = BigInt(amountMsat);
   const T = tag || 'deliver';
   let chan = await lnurlpClientChannel(client);
@@ -2120,19 +2124,9 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
     deliverOpening.set(client, { at: Date.now(), sizeSats, tag: T, deadline: false });
     try {
       leaseRememberWalletPeer(client);   // 0.72.3: a JIT open marks the peer as a wallet for the lease
-      await openChannelSync(lightningOpenChannelClient, {
-        node_pubkey_string: client,
-        local_funding_amount: sizeSats,
-        push_sat: 0,
-        sat_per_byte: 1,
-        private: true,
-        min_confs: 0,
-        zero_conf: true,
-        scid_alias: true,
-        remote_chan_reserve_sat: jitReserveForOpen(sizeSats),   // v0.56.0 (O5): floor-or-percent, governor-gated
-        commitment_type: process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS',
-        ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
-      }, CONFIG.lsps2.openchannel_timeout_ms);
+      // 0.124.0 (wallet trusts LSP): the ONE open — held when the wallet carries the bit, else today's OpenChannelSync
+      const opened = await openJitChannel({ client, sizeSats, tag: T });
+      heldCp = opened.held ? opened.cp : '';
     } catch (e) {
       console.error(`[${T}]: open failed (${e.message}) — will retry`);
       if (/DEADLINE|deadline|timed? ?out/i.test(String(e.message || e))) { const o = deliverOpening.get(client); if (o) o.deadline = true; }   // 0.117.0 (F21): LND may still be opening — the record stays 90 s; the next tick asks LND's pending list first
@@ -2144,9 +2138,14 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       chan = await lnurlpClientChannel(client);
     }
     deliverOpening.delete(client);   // 0.117.0 (F21): the open call returned — listed or not, the next caller reads LND
-    if (!chan) { console.error(`[${T}]: opened channel never listed — retry`); return { kind: 'retry', reason: 'opened channel never listed' }; }
+    if (!chan) {
+      console.error(`[${T}]: opened channel never listed — retry`);
+      if (heldCp) jitHeldFailed(heldCp, 'opened channel never listed');   // 0.124.0: a held channel LND does not list — abandon; the sweep would too
+      return { kind: 'retry', reason: 'opened channel never listed' };
+    }
     jitRecordOpen(client);   // v0.32.0: per-wallet open counter
-    guardCp = chan.channel_point || ''; jitGuard.recordOpen(guardCp, client, sizeSats, T.toLowerCase().split(' ')[0]);   // 0.104.0
+    guardCp = chan.channel_point || ''; jitGuard.recordOpen(guardCp, client, sizeSats, T.toLowerCase().split(' ')[0], !!heldCp);   // 0.104.0 · 0.124.0: held
+    if (heldCp && heldCp !== guardCp) console.warn(`[${T}]: the held funding ${heldCp} is not the channel LND lists for this wallet (${guardCp}) — the sweep sorts it out`);
   }
   const innerMsat = (amt - feeMsat).toString();
   const info = await lndGet('/v1/getinfo').catch(() => null);
@@ -2174,12 +2173,23 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
   try {
     attempt = await sendToRouteV2Hard(routerClient, Buffer.from(hashHex, 'hex'), route, CONFIG.lsps2.sendtoroute_timeout_ms, T);  /* F3 v0.37.0 */
   } catch (e) {
-    if (guardCp && !/DEADLINE_EXCEEDED|hard.?timeout|in flight|already/i.test(String(e.message || e))) jitGuard.fail(guardCp, 'reject: ' + String(e.message || e));   // 0.104.0
+    if (guardCp && !/DEADLINE_EXCEEDED|hard.?timeout|in flight|already/i.test(String(e.message || e))) {
+      jitGuard.fail(guardCp, 'reject: ' + String(e.message || e));   // 0.104.0
+      if (heldCp) jitHeldFailed(heldCp, 'reject: ' + String(e.message || e));   // 0.124.0: a verdict before an attempt existed — abandon
+    }
     return { kind: 'rejected', error: String(e.message || e) };
   }
   if (guardCp) {   // 0.104.0: this call's open — its payment's outcome (a hard timeout is LND's to finish, not a verdict)
-    if (attempt && attempt.status === 'SUCCEEDED' && attempt.preimage && attempt.preimage.length) jitGuard.settle(guardCp);
-    else if (attempt && attempt.status !== 'HARD_TIMEOUT') jitGuard.fail(guardCp, String((attempt.failure && attempt.failure.code) || attempt.status || 'failed'));
+    if (attempt && attempt.status === 'SUCCEEDED' && attempt.preimage && attempt.preimage.length) {
+      jitGuard.settle(guardCp);
+      if (heldCp && heldCp === guardCp) jitHeldPaid(heldCp, 'the wallet claimed (' + T + ')');   // 0.124.0: the funding is published now · 0.124.1: only when the payment went over the held channel (another listed channel carried it → the held one stays unclaimed; the sweep abandons it idle)
+      else if (heldCp) console.warn(`[${T}]: the payment went over ${guardCp}, not the held channel ${heldCp} — the held funding stays unpublished; the sweep decides`);
+    } else if (attempt && attempt.status !== 'HARD_TIMEOUT') {
+      jitGuard.fail(guardCp, String((attempt.failure && attempt.failure.code) || attempt.status || 'failed'));
+      if (heldCp) jitHeldFailed(heldCp, String((attempt.failure && attempt.failure.code) || attempt.status || 'failed'));   // 0.124.0: refused — abandon
+    }
+    // a HARD_TIMEOUT on a held channel: LND still owns the inner payment; the caller's probe decides, and the sweep
+    // publishes when the wallet's balance shows the claim or abandons an empty channel 10 min idle
   }
   return { kind: 'attempt', attempt, innerMsat, feeMsat, chan };
 }
@@ -2415,6 +2425,7 @@ function lnurlpBootResume() {
 setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
 setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PUSH-KEY] boot resume failed: ${e.message}`); } }, 9000);   // 0.82.0
 setTimeout(() => { onchainPay.boot().catch((e) => console.error(`[ONCHAIN-PAY] boot failed: ${e.message}`)); }, 9500);   // 0.120.0: the float probe, the records, the watches re-armed
+setTimeout(() => { jitFunding.boot().then(() => jitFunding.sweep(true)).catch((e) => console.error(`[JIT-HOLD] boot failed: ${e.message}`)); }, 11000);   // 0.124.0: the key probe, then the records read against LND
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
@@ -2561,6 +2572,7 @@ const registryChannelStore = new RegistryMemoryChannelStore();
 // failed on a cold cache. Used to tell a legitimate forward (RESUME) from a
 // fake/stale JIT SCID (FAIL) when no pending promise matches the outgoing SCID.
 let realChannelScids = null;
+let realChannelPointByScid = new Map();   // 0.124.1: scid (decimal) → channel point, for the held-funding block
 
 // v0.12: cached at startup from /v1/getinfo. Used by lookupChannelPolicy to
 // determine which side of any channel is "us" (i.e. which direction's policy
@@ -2651,6 +2663,112 @@ const JIT_GUARD_ARM_AT = jitGuardSetting('JIT_GUARD_ARM_AT', 2), JIT_GUARD_HALT_
 const JIT_GUARD_WALLET_AT = jitGuardSetting('JIT_GUARD_WALLET_AT', 2);
 const jitGuard = createJitGuard({ dataDir: DATA_DIR, log: (m) => console.log(m), armAt: JIT_GUARD_ARM_AT, haltAt: JIT_GUARD_HALT_AT, walletAt: JIT_GUARD_WALLET_AT });
 if (jitGuard.halted()) console.warn(`[JIT-GUARD] JIT is OFF (halted ${new Date(jitGuard.counts().halted.at).toISOString()} after ${jitGuard.counts().halted.count} funded-but-failed opens) — every JIT open is refused until released from the Console`);
+// ── 0.124.0 (S67, DP 2026-11-04 22:17 "Go on all. Agreed across the board." — WALLET TRUSTS LSP) ─────────────────────
+// The held open (jit-funding.js): for a wallet whose init features carry bit 261 the JIT channel's funding transaction
+// is built and signed from LND's wallet but PUBLISHED ONLY ONCE THE WALLET HAS CLAIMED the payment; refused → the channel
+// is abandoned, the coins released, the wallet told (JitFundingAbandoned, 32823). Everyone else: today's open.
+// LSPS2_FUNDING_HOLD=false turns it off for all. The key needs six RPCs (the boot probe says which are missing).
+const JIT_FUNDING_HOLD_ENABLED = String(process.env.LSPS2_FUNDING_HOLD || 'true').toLowerCase() !== 'false';
+// 0.124.1 (DP 2026-11-05 00:01 "Go with polling the correct current fee rate, floored at 1 sat/vB … the dials as
+// variables"): the JIT funding's fee — BOTH opens — is LND's estimate for LSPS2_FUNDING_FEE_TARGET_CONF blocks (144,
+// about a day: a zero-conf channel is in use at once), floored at LSPS2_FUNDING_FEE_MIN_SAT_PER_VB (1), capped at
+// LSPS2_FUNDING_FEE_MAX_SAT_PER_VB when set (0 = no cap). Until 0.124.0 the open carried a hard-coded 1 sat/vB.
+const JIT_FUNDING_FEE = { target_conf: Number(process.env.LSPS2_FUNDING_FEE_TARGET_CONF) || 144, min_sat_per_vb: Number(process.env.LSPS2_FUNDING_FEE_MIN_SAT_PER_VB) || 1, max_sat_per_vb: Number(process.env.LSPS2_FUNDING_FEE_MAX_SAT_PER_VB) || 0 };
+const lndBodyError = (r) => r ? String(r.message || (r.error && r.error.message) || '') : '';   // LND's REST answers an error as a body
+const lndOrThrow = (r, what) => { const m = lndBodyError(r); if (m || (r && r.code !== undefined && r.code !== 0 && r.message !== undefined)) throw new Error(`${what}: ${m || ('LND code ' + r.code)}`); return r; };
+const jitFunding = createJitFunding({
+  dataDir: DATA_DIR, log: (m) => console.log(m),
+  settings: { enabled: JIT_FUNDING_HOLD_ENABLED, lock_seconds: Number(process.env.LSPS2_FUNDING_HOLD_LOCK_SECONDS) || 172800, fee: JIT_FUNDING_FEE, open_timeout_ms: CONFIG.lsps2.openchannel_timeout_ms },
+  hrp: 'bc',
+  tellWallet: async (client, txid, vout) => (chainBridge && chainBridge.sendJitFundingAbandoned) ? chainBridge.sendJitFundingAbandoned(client, txid, vout) : false,
+  lnd: {
+    openChannelHeld: (params, opts) => openChannelHeld(lightningOpenChannelClient, params, opts),
+    fundPsbt: async (body) => lndOrThrow(await lndPost('/v2/wallet/psbt/fund', body), 'FundPsbt'),
+    finalizePsbt: async (body) => lndOrThrow(await lndPost('/v2/wallet/psbt/finalize', body), 'FinalizePsbt'),
+    fundingStep: async (body) => lndOrThrow(await lndPost('/v1/funding/step', body), 'FundingStateStep'),
+    releaseOutput: async (body) => lndOrThrow(await lndPost('/v2/wallet/utxos/release', body), 'ReleaseOutput'),
+    listLeases: async () => { const r = lndOrThrow(await lndPost('/v2/wallet/utxos/leases', {}), 'ListLeases'); return r.locked_utxos || []; },
+    publishTx: async (hex) => lndOrThrow(await lndPost('/v2/wallet/tx', { tx_hex: Buffer.from(hex, 'hex').toString('base64') }), 'PublishTransaction'),
+    abandonChannel: async (txid, vout) => {
+      const r = await lndRequest('DELETE', `/v1/channels/abandon/${txid}/${vout}?i_know_what_i_am_doing=true`, null);
+      const m = lndBodyError(r); if (m) return { ok: false, error: m }; return { ok: true, status: r && r.status };
+    },
+    listChannels: async () => (await lndGetOk('/v1/channels')).channels || [],
+    pendingChannels: async () => lndGetOk('/v1/channels/pending'),   // 0.124.1: a channel LND has but has not opened yet counts as present
+    listPeers: async () => (await lndGetOk('/v1/peers')).peers || [],   // 0.124.1: LND's proof that a reservation is dead (the peer gone, or flapped since the verify)
+    // 0.124.1: the fee poll — LND's estimate for the target, sat/vB (sat_per_kw × 4 / 1000); null when LND has none
+    estimateFeeSatVb: async (targetConf) => { const r = await lndGet(`/v2/wallet/estimatefee/${Math.max(1, Math.floor(Number(targetConf) || 144))}`).catch(() => null); const kw = Number(r && r.sat_per_kw); return kw > 0 ? kw * 4 / 1000 : null; },
+    peerFeatures: async (client) => {
+      const pl = await lndGet('/v1/peers');
+      const p = (pl.peers || []).find((x) => String(x.pub_key || '').toLowerCase() === String(client).toLowerCase());
+      return new Set(p && p.features ? Object.keys(p.features) : []);
+    },
+    txConfirmations: async (txid) => {
+      const r = await lndGet('/v1/transactions');
+      const t = (r.transactions || []).find((x) => String(x.tx_hash || '').toLowerCase() === String(txid).toLowerCase());
+      return t ? Number(t.num_confirmations) || 0 : 0;
+    },
+    // the boot probe: six calls that cannot move money — a permission body marks the RPC missing (push.js's way)
+    probe: async () => {
+      const isPerm = (r) => /permission denied|macaroon|unauthorized/i.test(lndBodyError(r));
+      const tries = [
+        ['/lnrpc.Lightning/OpenChannel', () => lndRequest('POST', '/v1/channels/stream', { local_funding_amount: '0' })],   // "local funding amount must be non-zero" when permitted
+        ['/lnrpc.Lightning/FundingStateStep', () => lndPost('/v1/funding/step', { shim_cancel: { pending_chan_id: Buffer.alloc(32, 1).toString('base64') } })],
+        ['/walletrpc.WalletKit/FundPsbt', () => lndPost('/v2/wallet/psbt/fund', { psbt: '' })],
+        ['/walletrpc.WalletKit/FinalizePsbt', () => lndPost('/v2/wallet/psbt/finalize', { funded_psbt: '' })],
+        ['/walletrpc.WalletKit/ReleaseOutput', () => lndPost('/v2/wallet/utxos/release', { id: Buffer.alloc(32, 2).toString('base64'), outpoint: { txid_str: '00'.repeat(32), output_index: 0 } })],
+        ['/walletrpc.WalletKit/ListLeases', () => lndPost('/v2/wallet/utxos/leases', {})],
+      ];
+      const missing = [];
+      for (const [uri, call] of tries) { let a; try { a = await call(); } catch (e) { a = { message: String(e.message || e) }; } if (isPerm(a)) missing.push(uri); }
+      return missing;
+    },
+  },
+});
+/// ONE open for both rails (the interceptor's openChannelAndForward and the delivery rail's deliverToWallet): the held
+/// open when the wallet carries the bit and the key allows, else today's OpenChannelSync. Resolves { channelPoint (LND's
+/// gRPC form), cp ("txid:vout"), held (true when the funding is held) }; throws as openChannelSync does.
+async function openJitChannel({ client, sizeSats, tag }) {
+  const common = {
+    local_funding_amount: sizeSats, push_sat: 0, private: true, zero_conf: true, scid_alias: true,
+    remote_chan_reserve_sat: jitReserveForOpen(sizeSats),   // v0.56.0 (O5): floor-or-percent, governor-gated
+    commitment_type: process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS',   // T1 (terminus): STATIC_REMOTE_KEY on the Terminus-patched lnd
+    ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
+  };
+  if (await jitFunding.canHold(client)) {
+    // the PSBT flow forbids fee parameters on the request (rpcserver.go 2036); the fee rides in FundPsbt
+    const params = Object.assign({ node_pubkey: Buffer.from(client, 'hex') }, common);
+    const r = await jitFunding.open({ client, sizeSats, params, tag });
+    return { channelPoint: r.channel_point, cp: r.cp, held: true };
+  }
+  const fee = await jitFunding.feeRate();   // 0.124.1: the same polled rate as the held open (was a hard-coded 1 sat/vB)
+  console.log(`[${tag || 'JIT'}] funding fee ${fee.rate} sat/vB (${fee.source}) — publish-first open`);
+  const channelPoint = await openChannelSync(lightningOpenChannelClient, Object.assign({ node_pubkey_string: client, sat_per_vbyte: String(fee.rate), min_confs: 0 }, common), CONFIG.lsps2.openchannel_timeout_ms);
+  return { channelPoint, cp: channelPointStr(channelPoint), held: false };
+}
+/// The payment over a held channel SUCCEEDED: the record says paid BEFORE the payer is settled (a crash after this line
+/// publishes at the next start); the publish itself follows on the next turn of the loop.
+function jitHeldPaid(cp, why) {
+  if (!cp) return false;
+  if (!jitFunding.markPaid(cp)) {
+    const r = jitFunding._state().records[cp];
+    if (r && (r.state === 'paid' || r.state === 'published' || r.state === 'confirmed')) return true;   // already on its way
+    console.error(`[JIT-HOLD] MANUAL ATTENTION: a claim was reported for ${cp} (${why}) but no publishable record exists (${r ? r.state : 'no record'}) — if the wallet holds sats in that channel the provider owes it the funding`);   // 0.124.1
+    return false;
+  }
+  setImmediate(() => { jitFunding.publish(cp, why).catch((e) => console.error(`[JIT-HOLD] publish ${cp}: ${e.message}`)); });
+  return true;
+}
+/// The payment over a held channel FAILED with a verdict: abandon (async; the FAIL to the payer goes out at once).
+function jitHeldFailed(cp, why) {
+  if (!cp) return false;
+  const rec = jitFunding._state().records[cp];
+  if (!rec || ['paid', 'published', 'confirmed', 'abandoned', 'cancelled'].includes(rec.state)) return false;
+  setImmediate(() => { jitFunding.abandon(cp, why).catch((e) => console.error(`[JIT-HOLD] abandon ${cp}: ${e.message}`)); });
+  return true;
+}
+setInterval(() => { jitFunding.sweep(false).catch((e) => console.error(`[JIT-HOLD] sweep: ${e.message}`)); }, 60000).unref();
+
 /// A channel point as "txid:index" from LND's gRPC ChannelPoint (funding_txid_bytes is little-endian; the display form
 /// — ListChannels, the Console — is the reverse). Empty when the bytes are not there.
 function channelPointStr(channelPoint) {
@@ -2893,6 +3011,9 @@ async function handleInterceptedHtlc(req) {
       // yet; in that cold-start window we RESUME (identical to pre-F4 behavior).
       if (realChannelScids === null) return RESUME;
       if (realChannelScids.has(String(outgoingScidDecimal))) {
+        // 0.124.1 (wallet trusts LSP): a channel whose held funding is being abandoned carries nothing more — a payment
+        // landing between the "empty" read and LND's abandon would be the wallet's sats in a channel LND then wipes
+        { const _bcp = realChannelPointByScid.get(String(outgoingScidDecimal)); if (_bcp && jitFunding.isBlocked(_bcp)) { console.warn(`[JIT-HOLD] a forward over channel ${_bcp} refused — its held funding is being abandoned`); return FAIL_TEMP; } }
         // B-1v2: real channel. RESUME as always when it is active or the peer
         // is live; when the peer is OFFLINE, LND would simply fail this
         // forward, so give it the same bounded hold as JIT (kind:'forward'):
@@ -3927,7 +4048,7 @@ function jitInflightPark(o) {
   for (const c of (o.circuits || [])) add(c);
   const held = o.held || pendingHtlcsForOfflineWallets.get(o.hash) || null;
   if (held) for (const e of (held.entries || [{ incoming_circuit_key: held.incoming_circuit_key }])) add(e.incoming_circuit_key);
-  const rec = { hash: o.hash, circuits, promise: o.promise || null, scidHex: o.scidHex || null, guardCp: o.guardCp || '', forwardAmountMsat: String(o.forwardAmountMsat || '0'),
+  const rec = { hash: o.hash, circuits, promise: o.promise || null, scidHex: o.scidHex || null, guardCp: o.guardCp || '', held_funding: !!o.held_funding, forwardAmountMsat: String(o.forwardAmountMsat || '0'),
     auto_fail_height: parseInt(o.autoFailHeight, 10) || (held && parseInt(held.auto_fail_height, 10)) || 0, at: Date.now(), kind: o.kind || 'jit', held, why: o.why || '' };
   jitInflight.set(o.hash, rec);
   console.warn(`[LSPS2] 0.114.0: inner payment for ${o.hash.slice(0,16)}… is LND's (${rec.why}) — ${circuits.length} inbound circuit(s) HELD, probing ListPayments (FAIL by block ${rec.auto_fail_height ? rec.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS : '?'})`);
@@ -3951,6 +4072,7 @@ function jitInflightClear(rec) {
   jitInflight.delete(rec.hash);
 }
 function jitInflightSettle(rec, preimageHex) {
+  if (rec.held_funding) { try { jitHeldPaid(rec.guardCp, 'the wallet claimed (late)'); } catch (_) {} }   // 0.124.0 · 0.124.1: 'paid' on disk BEFORE the SETTLE, as on the other two rails
   const n = jitInflightWrite(rec, { action: 'SETTLE', preimage: Buffer.from(preimageHex, 'hex') });
   console.log(`[LSPS2] 0.114.0: inner payment for ${rec.hash.slice(0,16)}… SUCCEEDED late — ${n} inbound circuit(s) SETTLED with the preimage`);
   trampolineForwardsSucceeded += 1;
@@ -3968,6 +4090,7 @@ function jitInflightFail(rec, reason, tellGuard) {
   const n = jitInflightWrite(rec, { action: 'FAIL', failure_code: 15 });
   console.warn(`[LSPS2] 0.114.0: inner payment for ${rec.hash.slice(0,16)}… ${reason} — ${n} inbound circuit(s) FAILed back to the payer`);
   trampolineForwardsFailed += 1;
+  if (rec.held_funding) { try { jitHeldFailed(rec.guardCp, String(reason)); } catch (_) {} }   // 0.124.0: the inner failed or the deadline passed — nothing published, abandon
   if (rec.promise) {
     if (tellGuard) { try { jitGuard.fail(rec.guardCp, String(reason)); } catch (_) {} }
     if (['INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', 'FINAL_INCORRECT_CLTV_EXPIRY', 'FINAL_INCORRECT_HTLC_AMOUNT'].some((c) => String(reason).includes(c))) rec.promise._finalVerdict = String(reason);
@@ -4115,27 +4238,15 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   console.log(`[LSPS2] opening ${channelSizeSats}-sat channel to ${promise.client_pubkey.slice(0,16)}…`);
   const _dtOpenT0 = Date.now();  /* v0.40.0 */
   let channelPoint;
+  let _held = false;   // 0.124.0: the funding is held back until the wallet has claimed
   try {
     leaseRememberWalletPeer(promise.client_pubkey);   // 0.72.3
-    channelPoint = await openChannelSync(lightningOpenChannelClient, {
-      node_pubkey_string: promise.client_pubkey,
-      local_funding_amount: channelSizeSats,
-      push_sat: 0,
-      sat_per_byte: 1,
-      private: true,
-      min_confs: 0,
-      zero_conf: true,
-      scid_alias: true,
-      remote_chan_reserve_sat: jitReserveForOpen(channelSizeSats),   // v0.56.0 (O5): floor-or-percent, governor-gated
-      // T1 (terminus): env-gated commitment type. STATIC_REMOTE_KEY
-      // requires the terminus-patched lnd (zero-conf x no-anchors
-      // whitelist). Default ANCHORS preserves today's behavior until
-      // .env sets LSPS2_COMMITMENT_TYPE.
-      commitment_type: process.env.LSPS2_COMMITMENT_TYPE || 'ANCHORS',
-      ...openPolicyFields(),   // 0.66.0: the channel's fee policy, set in the open
-    }, CONFIG.lsps2.openchannel_timeout_ms);
+    // 0.124.0 (wallet trusts LSP): ONE open for both rails — held when the wallet carries the bit, else today's
+    // OpenChannelSync (private, zero-conf, scid alias, the Terminus commitment type, the reserve, the fee policy)
+    const opened = await openJitChannel({ client: promise.client_pubkey, sizeSats: channelSizeSats, tag: 'LSPS2' });
+    channelPoint = opened.channelPoint; _held = opened.held;
     jitRecordOpen(promise.client_pubkey);   // v0.32.0: per-wallet open counter (success only)
-    _guardCp = channelPointStr(channelPoint); jitGuard.recordOpen(_guardCp, promise.client_pubkey, channelSizeSats, 'lsps2');   // 0.104.0: the funding is public from here
+    _guardCp = opened.cp; jitGuard.recordOpen(_guardCp, promise.client_pubkey, channelSizeSats, 'lsps2', _held);   // 0.104.0: the funding is public from here · 0.124.0: or held
   } catch (e) {
     // B-13: mid-open peer-disconnect -> HOLD + retry-open-on-reconnect.
     // The wallet passed the D-1 2b liveness gate but dropped mid-negotiation
@@ -4238,6 +4349,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] findChannelScid failed: ${e.message}`);
     jitGuard.fail(_guardCp, 'no scid: ' + e.message);   // 0.104.0
+    if (_held) jitHeldFailed(_guardCp, 'no scid: ' + e.message);   // 0.124.0: nothing published — abandon
     jitFailSiblings(promise, req, 'no scid');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
@@ -4245,6 +4357,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] new channel has no usable SCID yet — FAIL`);
     jitGuard.fail(_guardCp, 'no usable scid');   // 0.104.0
+    if (_held) jitHeldFailed(_guardCp, 'no usable scid');   // 0.124.0
     jitFailSiblings(promise, req, 'no usable scid');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
@@ -4269,6 +4382,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] no MPP payment_secret in incoming HTLC for scid=${scidHex} — FAIL`);
     jitGuard.fail(_guardCp, 'no payment secret');   // 0.104.0
+    if (_held) jitHeldFailed(_guardCp, 'no payment secret');   // 0.124.0
     jitFailSiblings(promise, req, 'no payment secret');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
@@ -4298,19 +4412,20 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     htlcAttempt = await sendToRouteV2Hard(routerClient, paymentHash, route, CONFIG.lsps2.sendtoroute_timeout_ms, 'jit-or-trampoline');  /* F3 v0.37.0 */
   } catch (e) {
     if (/DEADLINE_EXCEEDED|hard.?timeout|in flight/i.test(String(e && e.message || ''))) {   // 0.114.0 (F1): LND still owns it — HOLD every circuit and probe
-      jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'rejected as in flight: ' + (e && e.message || '?') });
+      jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, held_funding: _held, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'rejected as in flight: ' + (e && e.message || '?') });
       return null;
     }
     trampolineForwardsFailed += 1;
     console.error(`[LSPS2] sendToRouteV2 rejected for scid=${scidHex}: ${e.message}`);
     try { SM.emit('forward_result', { hash: paymentHashHex, ok: false, code: 'reject:' + ((e && e.message) || '?') }); } catch (_) {}  /* F3 v0.37.0 */
     jitGuard.fail(_guardCp, 'reject: ' + (e && e.message || '?'));   // 0.104.0
+    if (_held) jitHeldFailed(_guardCp, 'reject: ' + (e && e.message || '?'));   // 0.124.0
     jitFailSiblings(promise, req, 'send rejected');   // 0.113.1 (F7)
     return FAIL_TEMP;
   }
 
   if (htlcAttempt.status === 'HARD_TIMEOUT') {   // 0.114.0 (F1): the 30-s bomb — LND still owns the inner; HOLD every circuit and probe, never FAIL_TEMP
-    jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'hard timeout' });
+    jitInflightPark({ hash: paymentHashHex, req, promise, scidHex, guardCp: _guardCp, held_funding: _held, forwardAmountMsat, autoFailHeight: req.auto_fail_height, why: 'hard timeout' });
     return null;
   }
   if (htlcAttempt.status !== 'SUCCEEDED' || !htlcAttempt.preimage || htlcAttempt.preimage.length === 0) {
@@ -4318,6 +4433,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     const failCode = htlcAttempt.failure && htlcAttempt.failure.code;
     console.error(`[LSPS2] sendToRouteV2 did not succeed: status=${htlcAttempt.status} failure_code=${failCode}`);
     if (htlcAttempt.status !== 'HARD_TIMEOUT') jitGuard.fail(_guardCp, String(failCode || htlcAttempt.status || 'failed'));   // 0.104.0: a hard timeout is LND's to finish, not a verdict
+    if (_held && htlcAttempt.status !== 'HARD_TIMEOUT') jitHeldFailed(_guardCp, String(failCode || htlcAttempt.status || 'failed'));   // 0.124.0: the wallet refused — nothing published, abandon
     /* v0.55.0 A2: a FINAL-NODE verdict means the recipient's wallet itself
        refused this payment's details — no retry can ever succeed. Latch. */
     try {
@@ -4335,6 +4451,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
   trampolineForwardsSucceeded += 1;
   console.log(`[LSPS2] sendToRouteV2 succeeded — preimage received, SETTLING inbound`);
   jitGuard.settle(_guardCp);   // 0.104.0: the open earned its fee
+  if (_held) jitHeldPaid(_guardCp, 'the wallet claimed (LSPS2)');   // 0.124.0: 'paid' on disk before the SETTLE below; the publish follows at once
   plRecord('open_fee', { msat: Number(promise.fee_msat || 0), moved_msat: Number(forwardAmountMsat), wallet: promise.client_pubkey, hash: paymentHashHex, scarcity_pct: promise.scarcity_mult_pct || 100 });   // 0.72.0 PL ledger · 0.76.0: moved_msat = what was forwarded
   leaseTouch(promise.client_pubkey, 'jit:settled');   // 0.73.0
   // B-16: payment settled — release the hash→promise binding.
@@ -4435,14 +4552,17 @@ async function refreshRealChannelScids() {
   try {
     const channels = (await lndGetOk('/v1/channels')).channels || [];
     const next = new Set();
+    const points = new Map();
     for (const ch of channels) {
-      if (ch.chan_id && ch.chan_id !== '0') next.add(String(ch.chan_id));
+      const cp = String(ch.channel_point || '');
+      if (ch.chan_id && ch.chan_id !== '0') { next.add(String(ch.chan_id)); points.set(String(ch.chan_id), cp); }
       if (Array.isArray(ch.alias_scids)) {
-        for (const a of ch.alias_scids) if (a && a !== '0') next.add(String(a));
+        for (const a of ch.alias_scids) if (a && a !== '0') { next.add(String(a)); points.set(String(a), cp); }
       }
-      if (ch.peer_scid_alias && ch.peer_scid_alias !== '0') next.add(String(ch.peer_scid_alias));
+      if (ch.peer_scid_alias && ch.peer_scid_alias !== '0') { next.add(String(ch.peer_scid_alias)); points.set(String(ch.peer_scid_alias), cp); }
     }
     realChannelScids = next;
+    realChannelPointByScid = points;
   } catch (e) {
     console.warn(`[LSPS2] F4: refreshRealChannelScids failed: ${e.message} (keeping ${realChannelScids === null ? 'null/cold' : realChannelScids.size + ' cached'})`);
   }
@@ -5801,6 +5921,12 @@ function settingsReport() {
     row('Guardrails', 'promise reservation', 'LSPS2_RESERVATION_HOURS', L.reservation_validity_hours, 'h', 'the reservation clock — a promise with its invoice secret registered lives this long (0.119.2); payments after it fail'),
     row('Guardrails', 'live promises per wallet', 'LSPS2_MAX_LIVE_PROMISES_PER_WALLET', JIT_PROMISE_CAPS.per_wallet, '', 'over it, the wallet\'s oldest idle promise is dropped for the new ask (0.119.2)'),
     row('Guardrails', 'live promises in total', 'LSPS2_MAX_LIVE_PROMISES', JIT_PROMISE_CAPS.total, '', 'over it, the ask is refused (0.119.2)'),
+    // 0.124.0 (S67): wallet trusts LSP — the held JIT funding
+    row('Wallet trusts LSP', 'hold the funding', 'LSPS2_FUNDING_HOLD', JIT_FUNDING_HOLD_ENABLED ? 'true' : 'false', '', (jitFunding.capability().key_ok ? 'the key holds the six RPCs' : 'KEY LACKS ' + (jitFunding.capability().missing_rpcs.join(', ') || '(not probed yet)') + ' — every open publishes first until re-baked') + ' · a wallet gets it only with init feature bit ' + jitFunding.FEATURE_BIT + ' (engine v363+); refused payments publish nothing (0.124.0)'),
+    row('Wallet trusts LSP', 'coin lease', 'LSPS2_FUNDING_HOLD_LOCK_SECONDS', Number(process.env.LSPS2_FUNDING_HOLD_LOCK_SECONDS) || 172800, 's', 'the funding\'s inputs are leased under the adapter\'s own lock id for this long; released on abandon, spent on publish'),
+    row('Wallet trusts LSP', 'funding fee target', 'LSPS2_FUNDING_FEE_TARGET_CONF', JIT_FUNDING_FEE.target_conf, 'blocks', 'the JIT funding\'s fee (BOTH opens) is LND\'s estimate for this many blocks, polled at each open; 144 = about a day — a zero-conf channel is in use at once (0.124.1; was a hard-coded 1 sat/vB)'),
+    row('Wallet trusts LSP', 'funding fee floor', 'LSPS2_FUNDING_FEE_MIN_SAT_PER_VB', JIT_FUNDING_FEE.min_sat_per_vb, 'sat/vB', 'the polled rate never goes below this (and the floor is used when LND has no estimate)'),
+    row('Wallet trusts LSP', 'funding fee cap', 'LSPS2_FUNDING_FEE_MAX_SAT_PER_VB', JIT_FUNDING_FEE.max_sat_per_vb || 'off', JIT_FUNDING_FEE.max_sat_per_vb ? 'sat/vB' : '', 'the polled rate never goes above this when set; 0 = no cap'),
     row('Offline hold', 'hold for offline wallets', 'LSPS2_OFFLINE_HOLD_ENABLED', OFFLINE_HOLD_ENABLED, '', 'on by default (0.80.0) — the wallet\'s Privacy dial picks its window, Off included; false here fails every offline send at once'),
     row('Offline hold', 'ceiling', 'LSPS2_OFFLINE_HOLD_CAP_MS', OFFLINE_HOLD_CAP_MS, 'ms', Math.round(OFFLINE_HOLD_CAP_MS / 60000) + ' min — the most a wallet\'s dial can ask for'),
     row('Offline hold', 'CLTV headroom', 'LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS', OFFLINE_MIN_HEADROOM_BLOCKS, 'blocks', 'the least room an HTLC must have left to be held at all'),
@@ -6103,6 +6229,7 @@ async function consoleSnapshot() {
     delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     onchain_pay: (() => { try { return onchainPay.summary(); } catch (_) { return null; } })(),   // 0.120.0: the Float pane — the float, the open payments, the take-backs due, fees and chain costs
+    jit_funding: (() => { try { return jitFunding.snapshot(); } catch (_) { return null; } })(),   // 0.124.0: the held fundings — the records, the counts, the key
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', urls: CONFIG.registries, doors: registryStatus.doors, last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
@@ -6894,6 +7021,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
         lnurl_fetch:     { enabled: true },   // 0.119.3 (S66, item 2): POST /v1/lnurl/fetch — the provider fetches a payee's pay terms or invoice for a phone the payee refused
         onchain_pay:     onchainPay.capability(),   // 0.120.0: Lightning pays on-chain — offered or not, the flat fee, the limits, the take-back window
+        jit_funding_hold: jitFunding.capability(),   // 0.124.0: wallet trusts LSP — held funding offered (enabled, the key, the wallet's bit)
         nwc:             Object.assign({}, nwc.capability, nwc.summary()),   // 0.86.0: NWC offered here? the relay's address, the counts
         filter_server:   (filterStatus.ok && filterStatus.url) ? { url: filterStatus.url, sp: filterStatus.sp } : null,   // 0.87.0: this box's block-filter server, as the LIJOX record offers it
       };
@@ -6965,6 +7093,20 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // wallet's node key (lnurlpAuthCheck over "onchain-pay"); a record answers only the wallet whose key is on it. See onchain-pay.js.
   if (path.startsWith('/v1/onchain-pay/')) {
     if (await onchainPay.handle(req, res, path, method, ip, readBody, jsonResponse)) return;
+  }
+  // 0.124.0 (wallet trusts LSP): the wallet asks what became of a held JIT funding — its own records only, by its node
+  // pubkey and the funding outpoint "txid:vout". The engine's audit drops a channel it owns nothing in when the answer
+  // is "abandoned" (the message never reached it — it was away); any other answer, or none, leaves the channel alone.
+  if (method === 'GET' && path === '/v1/jit-funding/status') {
+    if (!authOk(req)) return errResponse(res, 'Unauthorized', 401);
+    const q = new URL(req.url, 'http://lsp.local').searchParams;
+    const client = String(q.get('client_pubkey') || '').toLowerCase(), funding = String(q.get('funding') || '').toLowerCase();
+    if (!/^0[23][0-9a-f]{64}$/.test(client)) return errResponse(res, 'client_pubkey must be a node pubkey', 400);
+    if (!/^[0-9a-f]{64}:[0-9]{1,5}$/.test(funding)) return errResponse(res, 'funding must be txid:vout', 400);
+    try { leaseTouch(client, 'api:/v1/jit-funding/status'); } catch (_) {}
+    const st = jitFunding.status(client, funding);
+    if (!st) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
+    return jsonResponse(res, Object.assign({ ok: true }, st), 200);
   }
   // 0.86.1 (DP's field test, step 2): the NWC routes dispatch on THEIR OWN prefix — 0.86.0 had this line inside the
   // /push/ block above, so /v1/nwc/register fell through to the generic 404 ("Not found") and no [NWC] line was logged.
@@ -7602,6 +7744,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       // 0.82.0 (S49): this provider locks and delivers Push Keys — the wallet's Push tab reads the fee terms here
       push_key:              pushRail.capability,
       onchain_pay:           onchainPay.capability(),   // 0.120.0
+      jit_funding_hold:      jitFunding.capability(),   // 0.124.0: wallet trusts LSP — the held open is offered to wallets with feature bit 261
       // 0.86.0 (S50): NWC — offered here or not (the wallet's Dials → NWC greys when not), the relay's wss address, the ceiling
       nwc:                   nwc.capability,
       // v0.56.0 (O5 full balance availability): the payer-funds-the-floor

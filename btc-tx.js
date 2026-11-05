@@ -173,12 +173,15 @@ function buildTakeBack({ lockTxid, lockVout, lockValue, script, T, destScript, f
 }
 
 /** Read a serialized transaction (hex) — enough to check a handed-over release: inputs' outpoints, outputs, the witness items. */
-function parse(hexTx) {
+/** `allowWitness: false` (0.124.0) reads a transaction known to carry no witness — a PSBT's unsigned transaction (BIP-174
+ *  stores it without witness data) — so a transaction with ZERO inputs and one output ("00 01") is not mistaken for the
+ *  segwit marker. */
+function parse(hexTx, { allowWitness = true } = {}) {
   const b = unhex(hexTx); let p = 0;
   const rd = (n) => { const s = b.slice(p, p + n); p += n; return s; };
   const rdVar = () => { const f = b[p++]; if (f < 0xfd) return f; if (f === 0xfd) { const v = b.readUInt16LE(p); p += 2; return v; } if (f === 0xfe) { const v = b.readUInt32LE(p); p += 4; return v; } const v = Number(b.readBigUInt64LE(p)); p += 8; return v; };
   const version = rd(4).readUInt32LE(0);
-  let segwit = false; if (b[p] === 0x00 && b[p + 1] === 0x01) { segwit = true; p += 2; }
+  let segwit = false; if (allowWitness && b[p] === 0x00 && b[p + 1] === 0x01) { segwit = true; p += 2; }
   const nin = rdVar(); const inputs = [];
   for (let i = 0; i < nin; i++) { const t = hex(rev(rd(32))); const vout = rd(4).readUInt32LE(0); const sl = rdVar(); const scriptSig = rd(sl); const sequence = rd(4).readUInt32LE(0); inputs.push({ txid: t, vout, scriptSig, sequence, witness: [] }); }
   const nout = rdVar(); const outputs = [];

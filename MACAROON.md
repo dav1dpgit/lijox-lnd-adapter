@@ -35,6 +35,7 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
 | lnrpc.Lightning/AbandonChannel | TATARA CHANNEL POOLS (0.103.0+): drop a pool's pending inbound channel whose funding can never confirm (an input spent elsewhere, 6 deep) — called with i_know_what_i_am_doing, on pending channels of Tatara pools only (tatara-channels.js) |
 | lnrpc.Lightning/DecodePayReq, ListPayments, VerifyMessage; routerrpc.Router/SendPaymentV2 | PUSH KEY HOLDER (0.82.0+): read the recipient's provider's invoice, pay it, probe it, verify a void's signature. The same four the delegate module uses — a key without them holds and delivers on its own provider only, and cannot verify a void; the adapter probes them at boot and says so (0.83.1). In bake-permissions-nodelegate.json from 0.83.1. |
 | lnrpc.Lightning/DeleteCanceledInvoice | PUSH KEY (0.116.0+, Kimi round 2 F6): after a claim burns on this provider (the claimant's wallet refused the delivery), the canceled claim invoice is deleted so the real recipient can claim the hash here again (LND never mints a hash twice otherwise). Without it the adapter logs the gap at boot and a burned claim's hash stays unclaimable here. |
+| lnrpc.Lightning/OpenChannel, FundingStateStep; walletrpc.WalletKit/FundPsbt, FinalizePsbt, ReleaseOutput, ListLeases | WALLET TRUSTS LSP (0.124.0+, jit-funding.js): a JIT channel's funding is built and signed from LND's own wallet but PUBLISHED ONLY ONCE THE WALLET HAS CLAIMED the payment — the streaming OpenChannel with a PSBT shim (`no_publish`), FundPsbt (the coins leased under the adapter's own lock id), FinalizePsbt (signs, publishes nothing), FundingStateStep (psbt_verify with skip_finalize; shim_cancel on a failed open), ReleaseOutput/ListLeases (the coins back when the payment is refused; strays at boot). None of these can spend coins to anyone: FundPsbt and FinalizePsbt only build and sign a transaction whose one foreign output is the channel's own 2-of-2; PublishTransaction (already in the key) sends it. The adapter probes the six at boot — a key without them keeps today's publish-first open and says so. In both bake-permissions files. |
 | routerrpc.Router/XImportMissionControl | ROUTING REPORTS (baked 2026-10-25, used from the next release — docs/design/pathfinding in the wallet repo): the adapter writes the routing failures a wallet reports (signed, Privacy → LSP → Routing reports) into its own LND's mission control, so later route asks avoid them. It writes LND's routing memory only — it moves no funds. In both bake-permissions files. |
 
 ## RECOMMENDED — strict per-RPC macaroon (exactly the table above)
@@ -73,7 +74,13 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
       uri:/routerrpc.Router/SendPaymentV2 \
       uri:/lnrpc.Lightning/UpdateChannelPolicy \
       uri:/routerrpc.Router/XImportMissionControl \
-      uri:/lnrpc.Lightning/DeleteCanceledInvoice
+      uri:/lnrpc.Lightning/DeleteCanceledInvoice \
+      uri:/lnrpc.Lightning/OpenChannel \
+      uri:/lnrpc.Lightning/FundingStateStep \
+      uri:/walletrpc.WalletKit/FundPsbt \
+      uri:/walletrpc.WalletKit/FinalizePsbt \
+      uri:/walletrpc.WalletKit/ReleaseOutput \
+      uri:/walletrpc.WalletKit/ListLeases
 
 Then hex it into your .env:
 
