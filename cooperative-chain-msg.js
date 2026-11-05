@@ -45,6 +45,10 @@ const TYPE_REGISTER_WATCH_TX      = 32813;
 const TYPE_REGISTER_WATCH_OUTPUT  = 32815;
 const TYPE_BROADCAST_TX           = 32817;
 const TYPE_BROADCAST_ACK          = 32819;
+// 0.122.0 (S66, Phase 2 — fractional fee rates, design v0.7 §3 A): the exact rates in sat/kw, beside the bundle's whole
+// sat/vB (whose u32 fields and hard-required protocol version cannot change without breaking every older wallet). Sent
+// right after every ChainDataBundle; an older wallet ignores the unknown odd type (BOLT 1); a v362 engine prefers it.
+const TYPE_FEE_RATES_KW           = 32821;
 
 const MAX_RAW_TX_BYTES = 1_000_000;
 
@@ -280,6 +284,25 @@ function decodeChainDataBundle(buf) {
     tip_height, tip_blockhash, recent_blockhashes,
     fee_sat_per_vb_fast, fee_sat_per_vb_medium, fee_sat_per_vb_slow,
   };
+}
+
+// ── Message 11 (0.122.0): FeeRatesKw (LSP → wallet, type 32821) ───────────────
+// fast / medium / slow in sat per kilo-weight (LND's own unit; 250 = 1 sat/vB; 253 = LND's floor) and the relay floor of
+// the node the rates come from, in the same unit. Four u32 after the version byte.
+function encodeFeeRatesKw(msg) {
+  const w = new Writer();
+  writeVersion(w);
+  for (const k of ['fast_sat_per_kw', 'medium_sat_per_kw', 'slow_sat_per_kw', 'relay_floor_sat_per_kw']) {
+    const v = msg[k];
+    if (!Number.isInteger(v) || v < 0 || v > 0xFFFFFFFF) throw new Error(`FeeRatesKw.${k} must be a u32`);
+    w.u32(v);
+  }
+  return w.finish();
+}
+function decodeFeeRatesKw(buf) {
+  const r = new Reader(buf);
+  readVersion(r);
+  return { fast_sat_per_kw: r.u32(), medium_sat_per_kw: r.u32(), slow_sat_per_kw: r.u32(), relay_floor_sat_per_kw: r.u32() };
 }
 
 // ── Message 3: BlockHeightUpdate (LSP → wallet, type 32805) ──────────────────
@@ -525,6 +548,7 @@ module.exports = {
   TYPE_REGISTER_WATCH_OUTPUT,
   TYPE_BROADCAST_TX,
   TYPE_BROADCAST_ACK,
+  TYPE_FEE_RATES_KW,   // 0.122.0
   CHANNEL_STATE,
   CHANNEL_STATE_NAMES,
   BROADCAST_RESULT,
@@ -539,6 +563,7 @@ module.exports = {
   encodeBlockHeightUpdate,    decodeBlockHeightUpdate,
   encodeFundingTxConfirmed,   decodeFundingTxConfirmed,
   encodeFeeScheduleUpdate,    decodeFeeScheduleUpdate,
+  encodeFeeRatesKw,           decodeFeeRatesKw,   // 0.122.0
   encodeChannelStateUpdate,   decodeChannelStateUpdate,
   encodeRegisterWatchTx,      decodeRegisterWatchTx,
   encodeRegisterWatchOutput,  decodeRegisterWatchOutput,

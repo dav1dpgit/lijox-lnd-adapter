@@ -13,7 +13,7 @@ const check = (cond, m) => { if (!cond) { fails++; console.log('FAIL · ' + m); 
 
 (async () => {
   // ── sendWakePush, as written ──
-  const sw = src.match(/async function sendWakePush\(pubkeyHex, holdMsOverride, kind\) \{[\s\S]*?\n\}/);
+  const sw = src.match(/async function sendWakePush\(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride\) \{[\s\S]*?\n\}/);   // 0.121.0: extra, ttlSOverride
   check(!!sw, 'sendWakePush is defined');
   const sent = [];
   const mk = (dialMs) => new Function('PUSH_ENABLED', 'walletLiveNow', 'pushSubs', 'webpush', 'clientHoldCapMs', 'persistPushSubs', 'global',
@@ -34,6 +34,10 @@ const check = (cond, m) => { if (!cond) { fails++; console.log('FAIL · ' + m); 
   const w4 = sent.pop();
   f = mk(180000); await f(PK, 15 * 60 * 1000);   // the Push Key claim: 15 min, dial 3 min
   const w5 = sent.pop();
+  // 0.121.0: the lease warning — extra fields in the payload, a TTL of its own, and a true answer when the push went out
+  f = mk(21600000); const a6 = await f(PK, undefined, 'lease', { days_left: 2, ttl_days: 60 }, 172800);
+  const w6 = sent.pop();
+  f = mk(21600000); const a7 = await f('02' + 'bb'.repeat(32), undefined, 'lease', { days_left: 2, ttl_days: 60 }, 172800);   // no subscription
   console.log = quiet;
   check(w1 && w1.body.hold_s === 14400, 'a 4 h hold states 14,400 s — the window held, not the 6 h dial, rounded DOWN (got ' + (w1 && w1.body.hold_s) + ')');
   check(w1 && w1.body.until_ms >= t0 + 14400000 && w1.body.until_ms <= Date.now() + 14401000, 'until_ms is when the hold ends, from the call');
@@ -42,6 +46,8 @@ const check = (cond, m) => { if (!cond) { fails++; console.log('FAIL · ' + m); 
   check(w3 && w3.body.t === 'nwc' && !('hold_s' in w3.body), 'an NWC request states no hold');
   check(w4 && !('hold_s' in w4.body), 'a zero window states nothing');
   check(w5 && w5.body.hold_s === 900, 'a 15-minute claim states 15 minutes, not the 3-minute dial');
+  check(w6 && w6.body.t === 'lease' && w6.body.days_left === 2 && w6.body.ttl_days === 60 && !('hold_s' in w6.body) && w6.ttl === 172800 && a6 === true, '0.121.0: the lease warning carries days_left and ttl_days, no hold, a two-day TTL, and the sender answers true (got ' + JSON.stringify(w6) + ' ' + a6 + ')');
+  check(a7 !== true && sent.length === 0, '0.121.0: no subscription → nothing sent, and not true');
 
   // ── scheduleHtlcWatchdog returns the window it sets ──
   const wd = src.match(/function scheduleHtlcWatchdog\(paymentHashHex, autoFailHeight, capMs\) \{[\s\S]*?\n\}/);

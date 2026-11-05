@@ -117,12 +117,19 @@ function createOnchainPayRail(deps) {
     } catch (e) { floatState = { ok: false, fence: 'down', balance_sats: 0, unconfirmed_sats: 0, probed_at: now(), note: 'the float wallet could not be asked: ' + e.message }; }
     return floatState;
   }
-  async function liveLockRate() {   // sat/vB, next block, conservative; the floor 1 (Core 29 relays nothing below)
-    const r = await coreRpc.call('estimatesmartfee', [1, 'conservative']);
+  // 0.122.0 (S66, Phase 2 — design v0.7 §3 B): the rates are Bitcoin Core's own, DECIMAL sat/vB (Core already floors its
+  // estimates at its relay fee — 1 sat/vB on Core 29, 0.1 on 30 and later), kept to three decimals; the lock at the
+  // next-block estimate, the release's suggestion at the six-block one (the rule: never a release below the rate expected
+  // to confirm within 6 blocks). The floor of 1 and the rounding up are gone; a hard floor of 0.1 stays as a guard.
+  async function liveRate(blocks) {
+    const r = await coreRpc.call('estimatesmartfee', [blocks, 'conservative']);
     const btcPerKvb = Number(r && r.feerate);
     if (!(btcPerKvb > 0)) throw new Error('no fee estimate yet (' + ((r && r.errors && r.errors.join('; ')) || 'empty') + ')');
-    return Math.max(1, Math.ceil(btcPerKvb * 1e5));
+    return Math.max(0.1, Math.round(btcPerKvb * 1e8) / 1000);   // BTC/kvB → sat/vB with three decimals
   }
+  async function liveLockRate() { return liveRate(1); }
+  async function liveReleaseRate() { return liveRate(6); }
+  const kvb = (rateSatVb) => Math.round(rateSatVb * 1000);   // sat per kilo-vbyte, a whole number — what the engine takes
   async function tipHeight() { return Number(await coreRpc.call('getblockcount')) || 0; }
 
   // ── bounds ──
@@ -405,8 +412,8 @@ function createOnchainPayRail(deps) {
       const live = await probeFloat();
       if (!live.ok) return j({ ok: false, error: 'this provider cannot pay on-chain right now (' + (live.note || 'float wallet not ready') + ')' }, 503);
       if (floatRemaining() < lockSats) return j({ ok: false, error: 'this provider\'s float cannot cover this payment right now' }, 503);
-      let rate; try { rate = await liveLockRate(); } catch (e) { return j({ ok: false, error: 'no fee estimate right now (' + e.message + ')' }, 503); }
-      const lockFee = Math.ceil(S.lock_vbytes * rate);
+      let rate, releaseRate; try { rate = await liveLockRate(); releaseRate = await liveReleaseRate(); } catch (e) { return j({ ok: false, error: 'no fee estimate right now (' + e.message + ')' }, 503); }
+      const lockFee = Math.ceil(S.lock_vbytes * rate);   // 0.122.0: the decimal rate, the fee rounded up once
       const providerFee = S.fee_sats + Math.ceil(amount * S.fee_ppm / 1e6);
       const aPreimage = crypto.randomBytes(32).toString('hex'); const aHash = sha256Hex(Buffer.from(aPreimage, 'hex'));
       let aBolt11, bBolt11;
@@ -414,11 +421,14 @@ function createOnchainPayRail(deps) {
         aBolt11 = await mintHold({ hashHex: aHash, valueMsat: (providerFee + lockFee) * 1000, cltvExpiry: S.a_expiry_blocks, memo: 'Lightning in a Jar · pays on-chain · fee', expiryS: 900 });
         bBolt11 = await mintHold({ hashHex: hash, valueMsat: lockSats * 1000, cltvExpiry: S.b_expiry_blocks, memo: 'Lightning in a Jar · pays on-chain', expiryS: 900 });
       } catch (e) { await cancel(aHash); return j({ ok: false, error: 'could not mint the invoices: ' + e.message }, 502); }
-      const r = { hash, client_pubkey: client, W, L, recipient, amount_sats: amount, release_fee_sats: releaseFee, reserve_sats: reserve, lock_sats: lockSats, provider_fee_sats: providerFee, lock_fee_sats: lockFee, lock_rate_sat_vb: rate,
+      const r = { hash, client_pubkey: client, W, L, recipient, amount_sats: amount, release_fee_sats: releaseFee, reserve_sats: reserve, lock_sats: lockSats, provider_fee_sats: providerFee, lock_fee_sats: lockFee, lock_rate_sat_vb: rate, release_rate_sat_vb: releaseRate,
         a_hash: aHash, a_preimage: aPreimage, a_bolt11: aBolt11, b_bolt11: bBolt11, state: 'quoted', quoted_at: now(), lock_txids: [], takeback_txids: [] };
       recs.set(hash, r); persist(r); leaseTouch(client, 'onchain-pay');
       log(`[ONCHAIN-PAY] ${short(hash)}: quoted for ${client.slice(0, 16)}… — ${amount} sats to the recipient, lock ${lockSats}, A ${providerFee + lockFee} (${rate} sat/vB)`);
-      return j({ ok: true, payment_hash: hash, provider_fee_sats: providerFee, lock_fee_sats: lockFee, lock_rate_sat_vb: rate, lock_sats: lockSats, a: { bolt11: aBolt11, amount_sats: providerFee + lockFee, hash: aHash }, b: { bolt11: bBolt11, amount_sats: lockSats, hash },
+      // 0.122.0: lock_rate_sat_vb is the decimal (no engine reads it as an integer — the v1082 page only prints it); the exact
+      // rates also ride in sat per kilo-vbyte, whole numbers for the engine — the lock's, and Core's six-block estimate as the
+      // suggestion for the release
+      return j({ ok: true, payment_hash: hash, provider_fee_sats: providerFee, lock_fee_sats: lockFee, lock_rate_sat_vb: rate, lock_rate_sat_kvb: kvb(rate), release_rate_sat_kvb: kvb(releaseRate), lock_sats: lockSats, a: { bolt11: aBolt11, amount_sats: providerFee + lockFee, hash: aHash }, b: { bolt11: bBolt11, amount_sats: lockSats, hash },
         L, refund_blocks: S.refund_blocks, t_min_offset: S.refund_blocks - 4, t_max_margin: S.b_margin_blocks, b_expiry_blocks: S.b_expiry_blocks, stop_release_blocks: S.stop_release_blocks, min_conf: 1, valid_for_ms: S.quote_valid_ms, provider: localPubkey() });
     }
     const r = recs.get(hash);

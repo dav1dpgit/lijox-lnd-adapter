@@ -150,6 +150,14 @@ const TESTS = [
       a.raw_tx_bytes.equals(b.raw_tx_bytes),
   },
   {
+    name: 'fee_rates_kw',   // 0.122.0 (Phase 2): the exact rates in sat/kw and the relay floor — four u32 after the version
+    type_id: m.TYPE_FEE_RATES_KW,
+    msg: { fast_sat_per_kw: 1250, medium_sat_per_kw: 300, slow_sat_per_kw: 253, relay_floor_sat_per_kw: 253 },
+    encode: m.encodeFeeRatesKw,
+    decode: m.decodeFeeRatesKw,
+    eq: (a, b) => a.fast_sat_per_kw === b.fast_sat_per_kw && a.medium_sat_per_kw === b.medium_sat_per_kw && a.slow_sat_per_kw === b.slow_sat_per_kw && a.relay_floor_sat_per_kw === b.relay_floor_sat_per_kw,
+  },
+  {
     name: 'fee_schedule_update',
     type_id: m.TYPE_FEE_SCHEDULE_UPDATE,
     msg: { fee_sat_per_vb_fast: 50, fee_sat_per_vb_medium: 25, fee_sat_per_vb_slow: 8 },

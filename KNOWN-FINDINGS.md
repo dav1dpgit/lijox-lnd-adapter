@@ -12,6 +12,76 @@ origin lists → REQUIRED with startup refusal; delegate store path →
 LIJ_DATA_DIR/__dirname). Gate rule stands: full-tree scan with the
 maintainer's private patterns file before any release tag.
 
+## 2026-11-04 — the state kit's receipts on the Backups pane (0.123.0; the box recovery v0.1)
+
+**What had one copy.** The float wallet of Lightning pays on-chain (the float itself and the key of every open lock), this
+adapter's env (the VAPID pair — every Wake push subscription dies with it; the take-back seed; the console secret), its
+state files (the push subscriptions, the wallets' Black start kit copies, the Lightning-address names, the Push Keys,
+the lease state, the on-chain pay records, the Mix), bitcoin.conf's rpcauth lines, the tunnel's credentials, the units —
+each on the box only. The SCB kit covered the channels; nothing covered these (the S41 runbook docketed the adapter's
+state as "v2 — its own encryption ruling").
+
+**The state kit** (the wallet repo's `ops/um890-scb/lij-state-kit.sh`, a daily timer at 00:20 after the SCB cloud leg):
+one `age`-encrypted archive of exactly those pieces plus a manifest, shipped by the SCB kit's two legs — the LAN box
+(seven days kept) and the worker's new `/lsp-state` door (lij-worker 0.19.0; the SCB door's twin, its own keys, the
+newest and one before, 20 MB the line) — signed by the node key as the SCB is. The age key's private half is printed and
+kept with the seed words; neither leg can read a byte. Not in it: the LND seed, channel.db, wallet.db, the chain, the tapes.
+
+**This release** adds nothing to the adapter's doors: `state-kit-status.js` READS the kit's receipts from the SCB state
+folder (`LIJ_SCB_STATE_DIR`, default /var/lib/lij-scb — the manifest and `status-state-{local,cloud}.json`) and the
+Console's Backups pane shows them: what is in the archive (the file count, the size, when it was built, the adapter's
+sha and Core's and LND's versions it names, anything that was missing), then each leg as the SCB's — ok or failed, the
+last run and the last shipment apart, stale past 26 h, the leg's words. A box without the kit sees one dim row naming
+the runbook. The manifest carries file names, sizes and hashes, never a secret; the pane never shows the recipient or the
+node key.
+
+## 2026-11-04 — fractional fee rates, the provider's half (0.122.0; Lightning pays on-chain Phase 2, design v0.7)
+
+**A floor of 4 sat/vB nobody ruled.** The chain bridge turned LND's fee estimate (sat/kw) into the bundle's whole sat/vB
+with `Math.max(4, Math.ceil(kw / 250))` — every wallet on this provider believed "fast" was never under 4 sat/vB, and
+every on-chain action of every wallet (sweeps, opens, closes, releases) paid at least that, however quiet the mempool.
+Gone: the bundle's whole numbers are now `ceil(kw / 250)` with LND's own floor (253 sat/kw ≈ 1.01 sat/vB) and nothing
+else. The bundle's fields stay whole and the protocol version stays 2 — an older wallet refuses a changed version byte.
+
+**The exact rates, a new message.** `FeeRatesKw` (type 32821, odd — an older wallet ignores it): fast / medium / slow
+in sat/kw and the relay floor of the node they come from (253: LND's), sent right after every ChainDataBundle. A v362
+engine reads it and feeds its estimator the exact numbers; the picker shows one decimal.
+
+**The rail goes decimal.** `liveLockRate` reads Core's `estimatesmartfee 1 conservative` as a decimal (Core already
+floors at its relay fee: 1 sat/vB on Core 29, 0.1 on 30 and later; a guard floor of 0.1 here); the lock's fee is
+`ceil(vbytes × rate)`, rounded up once; `sendtoaddress fee_rate` takes the decimal as Core does. The quote carries
+`lock_rate_sat_vb` as the decimal (no engine reads it as an integer — the page only prints it), and two whole numbers for
+the engine in sat per kilo-vbyte: `lock_rate_sat_kvb`, and `release_rate_sat_kvb` — Core's six-block estimate, the
+suggestion for the wallet's release (the rule: never a release below the rate expected to confirm within 6 blocks; the
+wallet takes the higher of its own reading and this). The lock's bump still adds 2 sat/vB. `/release` already took a
+faster copy for the same hash (state `released` allowed; Core's `testmempoolaccept` + `sendrawtransaction` do the
+replacement) — the wallet's speed-up (Phase 3) uses it as is.
+
+## 2026-11-04 — the lease's one warning; the Backups pane says what, where and when (0.121.0)
+
+**The lease's one warning (DP's item 1).** The lease closes a channel whose wallet has not been heard from in LEASE_DAYS
+(any contact resets it). From 0.121.0 the hourly cycle sends ONE push to the wallet LEASE_WARN_DAYS (2) before that —
+"Your channel closes in 2 days — open LiJ once to renew the channel lease for another 60 days. This will be your only
+alert." (the wallet's service worker says it; the days are the lease's own term). Only a wallet with a Wake push
+subscription can be reached (a live wallet needs none — its contact is the renewal); once per channel lifetime — the
+stamp (`warned_ms`) lives on the lease record, which is born with the channel and pruned with it; never in dry run (a
+close that will not happen is no alarm); never for an excluded channel. The push rides the ordinary wake rail
+(`t: 'lease'`, `days_left`, `ttl_days`), kept at the push service for two days. The lease log records `warned`.
+
+**The Backups pane (DP's item 2 — "what is being backed up should be listed").** The kit's two legs ship LND's
+`channel.backup`, the STATIC channel backup: every channel's point and peer, enough to get the funds back by a force
+close from each peer after a disaster — not balances, not keys. Balances are not a file that can be backed up safely
+(an old `channel.db` restored and used broadcasts an old commitment and the peer's penalty takes the channel); LND's
+recovery is seed + SCB → the peers publish their latest commitments → every channel closes at its true balance. The
+local leg runs on every change of the file (and whatever else LND writes in that folder) and once a day; the cloud leg
+once a day, shipping only when the file's hash changed; each run stamps ok — so the old pane's "ok 6 min ago" was a RUN,
+not a shipment. The pane now says WHAT (the file, its size, the channel count, when it last changed, its hash — read from
+LIJ_SCB_FILE, default LND's mainnet channel.backup) and per leg WHERE it goes and the last RUN and the last SHIPMENT told
+apart (the leg's last-sha file is written only when a shipment happened). OPEN, DP's ruling 11-04: the kit does not cover
+the float wallet's descriptors, the adapter's secrets and state (the take-back seed, the VAPID keys, the lease state,
+the push subscriptions, the kit-holder store, the registry identity) or the box's configs — a design note "the box
+recovery" comes before Phase 2/3.
+
 ## 2026-11-02 — Lightning pays on-chain, the provider's half (0.120.0)
 
 **What it is (DP's name; the design docs/design/onchain-pay/lightning-paying-onchain-v0.6.md in the wallet repo).** A LiJ wallet pays an on-chain address from its Lightning balance: it pays this box two hold payments — A (the provider's flat fee ONCHAIN_PAY_FEE_SATS + the lock's miner fee, kept once the lock is sent) and B (the recipient's amount + the release's fee + a speed-up reserve, under the wallet's own payment hash H) — and this box's FLOAT WALLET (`core-rpc.js`: a Bitcoin Core wallet behind a whitelisted RPC user, twelve commands, never a right on LND) sends THE LOCK to a HAND-OVER ADDRESS made for this payment (`btc-tx.js`: OP_SIZE 32 EQUAL IF SHA256 H EQUALVERIFY W ELSE DROP T CLTV DROP L ENDIF CHECKSIG). The wallet releases to the recipient after one confirmation, publishing the secret; this box collects B only when the release is IN A BLOCK (LND's spend notifier; DP 20:43 — at the mempool a provider could hold both B and its coins if the release never confirmed). A wallet that never releases: at T the take-back returns the coins to the float and B is cancelled.

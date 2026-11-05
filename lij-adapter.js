@@ -422,7 +422,8 @@ const { WebSocketServer } = require('ws');
 const { startBridge } = require('./cooperative-chain-bridge');
 const { windowLimiter } = require('./wallet-limits');   // 0.96.0 (S58, proposal 1): the wallet checks' own limits
 const lnurlFetch = require('./lnurl-fetch');
-const { createOnchainPayRail } = require('./onchain-pay');   // 0.120.0 (S66, DP "Go on Phase 1"): LIGHTNING PAYS ON-CHAIN — the provider's half (docs/design/onchain-pay/lightning-paying-onchain-v0.6.md in the wallet repo)
+const { createOnchainPayRail } = require('./onchain-pay');
+const { readStateKit } = require('./state-kit-status');   // 0.123.0 (S66, the box recovery v0.1): the state kit's receipts for the Backups pane   // 0.120.0 (S66, DP "Go on Phase 1"): LIGHTNING PAYS ON-CHAIN — the provider's half (docs/design/onchain-pay/lightning-paying-onchain-v0.6.md in the wallet repo)
 const { createCoreRpc } = require('./core-rpc');             // 0.120.0: the float wallet's door — Bitcoin Core, a whitelisted RPC user, twelve commands   // 0.119.3 (S66, item 2): the provider fetches a payee's pay terms or invoice for a phone the payee's server refused
 const { tunnel: wsTunnel, findPeerOn } = require('./ws-tunnel');   // 0.96.0 (S58, proposals 2 and 3): the wallet's tunnel to LND
 const { createTatara, readLndRoom } = require('./tatara');
@@ -2417,7 +2418,7 @@ setTimeout(() => { onchainPay.boot().catch((e) => console.error(`[ONCHAIN-PAY] b
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
-async function sendWakePush(pubkeyHex, holdMsOverride, kind) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting"
+async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting" · 0.121.0: `extra` rides in the payload (the lease warning's days), `ttlSOverride` keeps it at the push service longer; answers true when a push went out
   const _wakeT0 = Date.now();   // 0.88.1: the hold's end is counted from here (the caller has just armed it)
   if (!PUSH_ENABLED) return;
   const key = (pubkeyHex || '').toLowerCase();
@@ -2461,11 +2462,12 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind) {   // 0.86.0: `kin
     // nothing held; an NWC request). The dial fallback is gone: the dial is not what a payment is held for.
     // hold_s is rounded DOWN (never more than is held); until_ms is when the hold ends, from the call's start.
     const holdMs = (typeof holdMsOverride === 'number' && Number.isFinite(holdMsOverride) && holdMsOverride > 0) ? holdMsOverride : 0;
-    const msg = { t: kind || 'wake' };
+    const msg = Object.assign({ t: kind || 'wake' }, (extra && typeof extra === 'object') ? extra : {});   // 0.121.0
     if (holdMs > 0) { msg.hold_s = Math.max(1, Math.floor(holdMs / 1000)); msg.until_ms = _wakeT0 + holdMs; }
-    const ttlS = Math.max(60, Math.round((holdMs > 0 ? holdMs : clientHoldCapMs(key)) / 1000));   // the push service keeps it as long as before
+    const ttlS = (typeof ttlSOverride === 'number' && ttlSOverride > 0) ? Math.round(ttlSOverride) : Math.max(60, Math.round((holdMs > 0 ? holdMs : clientHoldCapMs(key)) / 1000));   // the push service keeps it as long as before · 0.121.0: or as long as the caller says
     await webpush.sendNotification(sub, JSON.stringify(msg), { TTL: ttlS });   // 0.86.0: t = 'nwc' for an NWC request
-    console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (${msg.hold_s ? 'hold_s=' + msg.hold_s : 'no hold stated'})`);
+    console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (${msg.hold_s ? 'hold_s=' + msg.hold_s : 'no hold stated'}${msg.t !== 'wake' ? ', t=' + msg.t : ''})`);
+    return true;   // 0.121.0
   } catch (e) {
     const status = e && e.statusCode;
     console.error(`[PUSH] wake send failed for ${key.slice(0,16)}…: ${e.message} (status=${status})`);
@@ -6047,12 +6049,31 @@ async function consoleSnapshot() {
   }
   const backups = {};
   const SCB_DIR = process.env.LIJ_SCB_STATE_DIR || '/var/lib/lij-scb';
+  // 0.121.0 (S66 Wed 2026-11-04, DP's item 2 — "what is being backed up should be listed"): the kit's two legs ship LND's
+  // channel.backup, the STATIC channel backup — every channel's point and peer, enough to get the funds back by a force
+  // close from each peer after a disaster; not balances, not keys. The local leg runs on every change of the file (and
+  // whatever else LND writes in that folder) and once a day; the cloud leg once a day, shipping only when the file's
+  // hash changed. Each run stamps ok — so "ok 6 min ago" was a RUN, not a shipment; the leg's last-sha file is written
+  // only when a shipment happened, and its time is the last shipment.
+  const LEG_WORDS = { local: 'the LAN box \u2014 on every change of the file, and once a day', cloud: 'the worker \u2014 once a day, only when the file changed' };
   for (const leg of ['local', 'cloud']) {
     try {
       const st = JSON.parse(fs.readFileSync(`${SCB_DIR}/status-${leg}.json`, 'utf8'));
-      backups[leg] = { ok: st.ok !== false, at_ms: (st.last_ok || st.last_attempt || 0) * 1000, stale: !st.last_ok || (nowMs / 1000 - st.last_ok) > 26 * 3600, note: st.err || '' };
+      let shipped = 0; try { shipped = Math.round(fs.statSync(`${SCB_DIR}/${leg}.last-sha`).mtimeMs); } catch (_) {}
+      backups[leg] = { ok: st.ok !== false, at_ms: (st.last_ok || st.last_attempt || 0) * 1000, stale: !st.last_ok || (nowMs / 1000 - st.last_ok) > 26 * 3600, note: st.err || '', shipped_ms: shipped, where: LEG_WORDS[leg] };
     } catch (_) {}
   }
+  try {
+    const scbFile = process.env.LIJ_SCB_FILE || `${os.homedir()}/.lnd/data/chain/bitcoin/mainnet/channel.backup`;
+    const sst = fs.statSync(scbFile); const buf = fs.readFileSync(scbFile);
+    backups.what = { file: scbFile, bytes: sst.size, changed_ms: Math.round(sst.mtimeMs), sha256: crypto.createHash('sha256').update(buf).digest('hex'), channels: (chans.channels || []).length,
+      words: 'LND\u2019s static channel backup \u2014 every channel\u2019s point and peer, enough to recover the funds by a force close from each peer after a disaster; not balances, not keys' };
+  } catch (e) { backups.what = { error: 'channel.backup not readable here (' + (e && e.code ? e.code : 'error') + ') \u2014 set LIJ_SCB_FILE' }; }
+  // 0.123.0 (S66 Wed 2026-11-04, the box recovery v0.1 — DP's rulings): THE STATE KIT — the box's own state (the float
+  // wallet's keys, this adapter's env and state files, bitcoin.conf, the tunnel, the units) in one age-encrypted archive a
+  // day, shipped by the same two legs (the wallet repo's ops/um890-scb/lij-state-kit.sh, a daily timer); its manifest and
+  // the two status files are read from the SCB state folder. null = the kit has never run on this box.
+  backups.state = readStateKit(SCB_DIR, nowMs);
   const loops = {};
   for (const [name, v] of Object.entries(loopStamps)) loops[name] = { last: v.last || 0, period_ms: v.period_ms, stale: !v.last || (nowMs - v.last) > Math.max(5 * v.period_ms, 120000) };
   let tapes = 0, lastTape = 0;
@@ -6255,6 +6276,10 @@ let leaseUnsavedLogged = false;
 // writes one `touch` line with its source; later touches in the session only
 // move the in-memory stamp (the hourly cycle persists it anyway).
 const LEASE_SESSION_GAP_MS = Math.max(1, parseFloat(process.env.LEASE_SESSION_GAP_MIN || '10')) * 60000;
+// 0.121.0 (S66 Wed 2026-11-04, DP's item 1): THE ONE WARNING — this many days before the lease would close a channel, one push
+// to its wallet; once per channel lifetime (the stamp lives on the lease record, which is born and pruned with the channel).
+const LEASE_WARN_MS = Math.max(0.01, parseFloat(process.env.LEASE_WARN_DAYS || '2')) * 86400000;
+const LEASE_WARN_PUSH_TTL_S = 2 * 86400;   // the push service keeps the warning two days — a phone that is off today may be on tomorrow
 function leaseTouch(pubkey, source) {
   try {
     const k = String(pubkey || '').toLowerCase();
@@ -6580,6 +6605,16 @@ async function leaseCycle() {
     if (connected.has(c.remote_pubkey)) { if (!rec.last_seen_ms || now - rec.last_seen_ms > LEASE_SESSION_GAP_MS) rec.last_source = 'connected'; rec.last_seen_ms = now; } // heard from
     const idleMs = now - rec.last_seen_ms;
     const ttlMs = leaseTtlDays(rec) * 86400000;
+    // 0.121.0 (DP's item 1): THE ONE WARNING, LEASE_WARN_DAYS before the close — only a wallet with a Wake push subscription
+    // can be reached (a live wallet needs none: its contact resets the lease); once per channel lifetime; never in dry run
+    // (a close that will not happen is no alarm); never for an excluded channel; the words carry the lease's own term.
+    if (CONFIG.lease.enabled && !CONFIG.lease.dry_run && !rec.warned_ms && idleMs >= ttlMs - LEASE_WARN_MS && idleMs < ttlMs && !leaseIsExcluded(cp) && pushSubs[String(c.remote_pubkey || '').toLowerCase()]) {
+      const daysLeft = Math.max(1, Math.round((ttlMs - idleMs) / 86400000));
+      try {
+        const sent = await sendWakePush(c.remote_pubkey, undefined, 'lease', { days_left: daysLeft, ttl_days: leaseTtlDays(rec) }, LEASE_WARN_PUSH_TTL_S);
+        if (sent) { rec.warned_ms = now; leaseLog({ event: 'warned', chan_point: cp, peer: c.remote_pubkey.slice(0, 16), days_left: daysLeft, ttl_days: leaseTtlDays(rec) }); }
+      } catch (e) { leaseLog({ event: 'warn_error', chan_point: cp, error: e.message }); }
+    }
     if (idleMs <= ttlMs) continue;
     if (leaseIsExcluded(cp)) continue;               // 0.72.4: the operator's exclusion list (console) + the .env list
     if (Array.isArray(c.pending_htlcs) && c.pending_htlcs.length > 0) {   // 0.113.0 (S63, DP 2026-10-26, Push item 4): a payment still on the channel (a Push lock, a held forward) — skip it this cycle, look again next cycle

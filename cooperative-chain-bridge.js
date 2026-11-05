@@ -511,15 +511,33 @@ function startBridge(opts) {
 
   // ── ChainDataBundle assembly ───────────────────────────────────────────────
 
-  async function estimateFee(targetConf, fallbackSatPerVb) {
+  // 0.122.0 (S66, Phase 2 — design v0.7 §1–2): the estimate is kept in LND's own unit, sat/kw, with LND's own floor of 253
+  // (what LND's estimatefee never goes under); the bundle's whole sat/vB is derived from it with NO floor of 4 — that
+  // number, from an early build, priced every wallet's "fast" at no less than 4 sat/vB however quiet the mempool. The
+  // last sat/kw read of each target is kept for the FeeRatesKw message that follows every bundle.
+  const LND_FLOOR_SAT_PER_KW = 253;
+  const lastKw = { fast: 0, medium: 0, slow: 0 };
+  async function estimateFeeKw(targetConf, fallbackSatPerVb) {
     try {
       const res = await lndRequest(`/v2/wallet/estimatefee/${targetConf}`);
       const satPerKw = parseInt(res.sat_per_kw, 10);
-      if (!Number.isFinite(satPerKw) || satPerKw <= 0) return fallbackSatPerVb;
-      return Math.max(4, Math.ceil(satPerKw / 250));
+      if (!Number.isFinite(satPerKw) || satPerKw <= 0) return fallbackSatPerVb * 250;
+      return Math.max(LND_FLOOR_SAT_PER_KW, satPerKw);
     } catch (e) {
       console.warn(`[ChainBridge] fee estimate (conf=${targetConf}) failed: ${e.message} — using fallback ${fallbackSatPerVb} sat/vB`);
-      return fallbackSatPerVb;
+      return fallbackSatPerVb * 250;
+    }
+  }
+  function feeRatesKwMessage() {   // the exact rates of the last bundle build, for the wallet that reads them
+    return { fast_sat_per_kw: lastKw.fast || LND_FLOOR_SAT_PER_KW, medium_sat_per_kw: lastKw.medium || LND_FLOOR_SAT_PER_KW, slow_sat_per_kw: lastKw.slow || LND_FLOOR_SAT_PER_KW, relay_floor_sat_per_kw: LND_FLOOR_SAT_PER_KW };
+  }
+  async function sendFeeRatesKwTo(peerHex, contextLabel) {   // best effort, after a bundle; an older wallet ignores the type
+    try {
+      const msg = feeRatesKwMessage();
+      await sendToPeer(peerHex, m.TYPE_FEE_RATES_KW, m.encodeFeeRatesKw(msg));
+      console.log(`[ChainBridge] sent FeeRatesKw to ${shortPeer(peerHex)} (${contextLabel}): ${msg.fast_sat_per_kw}/${msg.medium_sat_per_kw}/${msg.slow_sat_per_kw} sat/kw, floor ${msg.relay_floor_sat_per_kw}`);
+    } catch (e) {
+      console.warn(`[ChainBridge] FeeRatesKw to ${shortPeer(peerHex)} (${contextLabel}) not sent: ${e.message}`);
     }
   }
 
@@ -544,9 +562,10 @@ function startBridge(opts) {
       }
     }
 
-    const fast   = await estimateFee(1,   FALLBACK_FEE_FAST_SAT_PER_VB);
-    const medium = await estimateFee(6,   FALLBACK_FEE_MEDIUM_SAT_PER_VB);
-    const slow   = await estimateFee(144, FALLBACK_FEE_SLOW_SAT_PER_VB);
+    lastKw.fast   = await estimateFeeKw(1,   FALLBACK_FEE_FAST_SAT_PER_VB);     // 0.122.0: the exact reads kept for FeeRatesKw
+    lastKw.medium = await estimateFeeKw(6,   FALLBACK_FEE_MEDIUM_SAT_PER_VB);
+    lastKw.slow   = await estimateFeeKw(144, FALLBACK_FEE_SLOW_SAT_PER_VB);
+    const fast = Math.max(1, Math.ceil(lastKw.fast / 250)), medium = Math.max(1, Math.ceil(lastKw.medium / 250)), slow = Math.max(1, Math.ceil(lastKw.slow / 250));   // the bundle's whole sat/vB, no floor of 4
 
     return {
       tip_height: tipHeight,
@@ -573,6 +592,7 @@ function startBridge(opts) {
       await sendToPeer(peerHex, m.TYPE_CHAIN_DATA_BUNDLE, encoded);
       console.log(`[ChainBridge] sent ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}): tip=${bundle.tip_height} fees=${bundle.fee_sat_per_vb_fast}/${bundle.fee_sat_per_vb_medium}/${bundle.fee_sat_per_vb_slow} sat/vB recent_blocks=${bundle.recent_blockhashes.length}`);
       recordSendSuccess(peerHex);
+      await sendFeeRatesKwTo(peerHex, contextLabel);   // 0.122.0: the exact rates follow
     } catch (e) {
       console.error(`[ChainBridge] failed to send ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}): ${e.message}`);
       recordSendFailure(peerHex, 'ChainDataBundle', e);
@@ -828,6 +848,7 @@ function startBridge(opts) {
         const bundle = await buildChainDataBundle();
         await sendToPeer(peerHex, m.TYPE_CHAIN_DATA_BUNDLE, m.encodeChainDataBundle(bundle));
         console.log(`[ChainBridge] sent ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}, unasked): tip=${bundle.tip_height} fees=${bundle.fee_sat_per_vb_fast}/${bundle.fee_sat_per_vb_medium}/${bundle.fee_sat_per_vb_slow} sat/vB`);
+        await sendFeeRatesKwTo(peerHex, contextLabel + ', unasked');   // 0.122.0
         return true;
       } catch (e) {
         console.warn(`[ChainBridge] unasked ChainDataBundle to ${shortPeer(peerHex)} (${contextLabel}) not sent: ${e.message}`);

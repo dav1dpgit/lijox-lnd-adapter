@@ -114,11 +114,19 @@ const SEED = 'ab'.repeat(32);
   for (const h of ['67', '68']) { const x = rail.records().get(h.repeat(32)); x.state = 'expired'; x.ended_at = Date.now(); }   // the two quotes die
   core.st.balance = 0.05;
   r = await route(rail, 'POST', '/v1/onchain-pay/quote', Object.assign({}, base, { node_pubkey: OTHER })); check(r.status === 403, 'a quote signed by another key is refused');
+  // 0.122.0 (Phase 2): a sub-1 rate from Core (0.2 sat/vB) — the lock's fee is 153 vB × 0.2 rounded up once (31 sats), the
+  // rates ride as decimals and in sat per kilo-vbyte; the quote dies so the real one below is fresh
+  core.st.feerate = 0.000002;   // BTC per kvB: 0.2 sat/vB
+  r = await route(rail, 'POST', '/v1/onchain-pay/quote', Object.assign({}, base, { payment_hash: '70'.repeat(32) }));
+  check(r.status === 200 && r.data.lock_rate_sat_vb === 0.2 && r.data.lock_fee_sats === 31 && r.data.lock_rate_sat_kvb === 200 && r.data.release_rate_sat_kvb === 200, '0.122.0: a 0.2 sat/vB estimate → lock fee 31 sats, lock_rate_sat_vb 0.2, 200 sat/kvB both — got ' + JSON.stringify([r.data.lock_rate_sat_vb, r.data.lock_fee_sats, r.data.lock_rate_sat_kvb, r.data.release_rate_sat_kvb]));
+  rail.records().delete('70'.repeat(32));   // gone, so the counts below stay what they were
+  core.st.feerate = 0.00005;
   // ── the quote ──
   r = await route(rail, 'POST', '/v1/onchain-pay/quote', base);
   check(r.status === 200 && r.data.ok, 'the quote answers: ' + JSON.stringify(r.data).slice(0, 120));
   const Q = r.data;
   check(Q.provider_fee_sats === 1000 && Q.lock_rate_sat_vb === 5 && Q.lock_fee_sats === 153 * 5 && Q.lock_sats === 101700, 'the money: provider 1,000; lock 153 vB × 5 = 765; lock 101,700');
+  check(Q.lock_rate_sat_kvb === 5000 && Q.release_rate_sat_kvb === 5000, '0.122.0: the exact rates ride in sat per kilo-vbyte (lock 5000, the six-block suggestion 5000) — got ' + Q.lock_rate_sat_kvb + '/' + Q.release_rate_sat_kvb);
   check(Q.a.amount_sats === 1765 && Q.a.hash !== H && Q.b.amount_sats === 101700 && Q.b.hash === H, 'A = fee + lock fee under the provider\'s hash; B = the lock amount under the wallet\'s hash');
   check(lnd.invoices.get(H).cltv === '200' && lnd.invoices.get(Q.a.hash).cltv === '40', 'B\'s expiry 200 blocks, A\'s 40');
   check(Q.L === rail.L && Q.refund_blocks === 144 && Q.stop_release_blocks === 12 && Q.min_conf === 1, 'L, the window, the stop margin, one confirmation');
