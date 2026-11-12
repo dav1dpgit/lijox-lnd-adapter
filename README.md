@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.124.1, 2026-11-05). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.127.2, 2026-11-11). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.124.1         # the newest tag — the last row of RELEASES.md
+       git checkout v0.127.2         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -213,6 +213,22 @@ returns the record (ciphertext) or 404. Records live in `DATA_DIR/kits/<npub>.js
 KIT_MAX_BYTES (65,536) each; the store evicts the oldest untouched record beyond 20,000, never one
 touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the LiJ repo's
 docs/black-start-standard.md.
+
+**The channel state file (0.126.0).** `POST /v1/peer-storage/put` takes `{ node_pubkey, nonce, signature, version,
+state_fp, file_b64 }` and keeps one encrypted file per wallet node key — 65,531 bytes at most, the size BOLT #1110
+(peer storage) allows; the latest only; a lower `version` is refused (409). `POST /v1/peer-storage/meta` answers the
+held `version` and `state_fp`; `POST /v1/peer-storage/get` hands the file back. Each request carries a single-use
+`nonce` from `GET /lsps/registry/challenge` and the node key's signature over `lij-peer-storage-v1:<action>:<nonce>`
+(a put adds `:<version>:<sha256 of the file>`). The holder cannot read the file. It is held for any wallet that proves
+its key, not only this provider's own. See `peer-storage.js` and KNOWN-FINDINGS 0.126.0.
+
+**A delivery in parts (0.127.0).** When the provider itself delivers a payment to a wallet (a Lightning address
+payment, a Push Key, a chit) and no one channel to the wallet has the room but its channels together do, the payment
+goes in parts — one HTLC per channel, the same hash and payment secret, the whole amount in every part's MPP record —
+and no channel is opened. `LSPS2_DELIVER_MAX_PARTS` (4) and `LSPS2_DELIVER_MIN_PART_SATS` (1000) are the settings.
+See `deliver-parts.js` and KNOWN-FINDINGS 0.127.0. From 0.127.1 a route request for a wallet on this provider that no one
+channel can carry, but its channels together can, is answered `no_route` with `parts_sats` — the sizes a sender can
+split the payment into.
 
 **The Black start page at `/recover` (0.109+).** Every LIJOX adapter also serves the wallet site's own recovery
 page — the one self-contained file `recover/index.html` shipped with each release, its hash in RELEASES.md — at

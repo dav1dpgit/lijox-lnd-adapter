@@ -118,6 +118,8 @@ function createJitFunding(deps) {
     dataDir = null, log = () => {}, now = () => Date.now(),
     lnd,                     // { openChannelHeld, fundPsbt, finalizePsbt, fundingStep, releaseOutput, listLeases, publishTx, abandonChannel, listChannels, pendingChannels, listPeers, peerFeatures, txConfirmations, probe }
     tellWallet = async () => false,   // (client, txidDisplayHex, vout) → true when the peer message went out
+    onOpenUndone = () => {},          // 0.124.2: (rec) a held open ended abandoned/cancelled — the caller takes it off the wallet's fee ladder
+    onOpenRestored = () => {},        // 0.124.2: (rec) such a record was revived to a real channel — the caller counts it again
     settings = {},
     hrp = 'bc',
   } = deps || {};
@@ -130,14 +132,30 @@ function createJitFunding(deps) {
   feeDials.target_conf = Math.min(1008, Math.max(1, Math.floor(Number(feeDials.target_conf) || 144)));
   feeDials.min_sat_per_vb = Math.max(1, Math.floor(Number(feeDials.min_sat_per_vb) || 1));
   feeDials.max_sat_per_vb = Math.max(0, Math.floor(Number(feeDials.max_sat_per_vb) || 0));
+  // 0.124.2 (DP 2026-11-10, the 11-05 finding seen in every journal — LND's floor estimate of 253 sat/kw, 1.0 sat/vB,
+  // went out as 2 sat/vB): THE RATE IS KEPT IN SAT/KW, LND's own unit, with no rounding. 1 sat/vB = 250 sat/kw. The held
+  // open hands `kw` to FundPsbt as sat_per_kw (field 11 of FundPsbtRequest at v0.20.1-beta — exact). The publish-first
+  // open can only take whole sat/vB (OpenChannelRequest sat_per_vbyte, field 1), so it takes `rate`: the same number
+  // rounded to the NEAREST whole sat/vB, never below the floor dial, never above the cap dial.
+  // LND refuses anything under its own relay floor, FeePerKwFloor = 253 sat/kw, so `kw` is never below 253.
+  const LND_FEE_PER_KW_FLOOR = 253;
   async function feeRate() {
-    let est = null;
-    try { est = typeof lnd.estimateFeeSatVb === 'function' ? await lnd.estimateFeeSatVb(feeDials.target_conf) : null; } catch (_) { est = null; }
-    const have = Number.isFinite(Number(est)) && Number(est) > 0;
-    let rate = have ? Math.ceil(Number(est)) : feeDials.min_sat_per_vb;
+    let estKw = null;
+    try {
+      if (typeof lnd.estimateFeeSatKw === 'function') estKw = await lnd.estimateFeeSatKw(feeDials.target_conf);
+      else if (typeof lnd.estimateFeeSatVb === 'function') { const vb = await lnd.estimateFeeSatVb(feeDials.target_conf); estKw = Number(vb) > 0 ? Number(vb) * 250 : null; }
+    } catch (_) { estKw = null; }
+    const have = Number.isFinite(Number(estKw)) && Number(estKw) > 0;
+    const floorKw = Math.max(LND_FEE_PER_KW_FLOOR, feeDials.min_sat_per_vb * 250);
+    const capKw = feeDials.max_sat_per_vb > 0 ? Math.max(floorKw, feeDials.max_sat_per_vb * 250) : 0;
+    let kw = have ? Math.ceil(Number(estKw)) : floorKw;   // a whole sat/kw; an estimate with a fraction of one sat/kw goes up by that fraction only
+    if (kw < floorKw) kw = floorKw;
+    if (capKw > 0 && kw > capKw) kw = capKw;
+    let rate = Math.round(kw * 4 / 1000);   // the nearest whole sat/vB — for the publish-first open and nothing else
     if (rate < feeDials.min_sat_per_vb) rate = feeDials.min_sat_per_vb;
     if (feeDials.max_sat_per_vb > 0 && rate > feeDials.max_sat_per_vb) rate = feeDials.max_sat_per_vb;
-    return { rate, source: have ? `LND's ${feeDials.target_conf}-block estimate ${Number(est).toFixed(1)} sat/vB` : 'no estimate from LND — the floor', estimate: have ? Number(est) : null };
+    const vb = kw * 4 / 1000;
+    return { kw, vb, rate, source: have ? `LND's ${feeDials.target_conf}-block estimate ${Math.round(Number(estKw))} sat/kw = ${(Number(estKw) * 4 / 1000).toFixed(2)} sat/vB` : 'no estimate from LND — the floor', estimate: have ? Number(estKw) * 4 / 1000 : null, estimate_kw: have ? Number(estKw) : null };
   }
   const openTimeoutMs = Math.max(5000, Number(settings.open_timeout_ms) || 25000);
   const abandonGraceMs = settings.abandon_grace_ms == null ? ABANDON_GRACE_MS : Math.max(0, Number(settings.abandon_grace_ms) || 0);
@@ -186,8 +204,17 @@ function createJitFunding(deps) {
 
   const recOf = (cp) => st.records[String(cp || '')] || null;
   function setState(rec, state, extra) {
+    const was = rec.state;
     rec.state = state; rec.updated = now();
     if (extra) Object.assign(rec, extra);
+    // 0.124.2 (DP 2026-11-10 "keep refused opens off the fee ladder"): an open that ended with its funding never
+    // published was not an open the wallet got — the adapter takes its stamp off that wallet's fee ladder, once
+    // (ladder_off, on the record); a record revived to a real channel puts it back, once. Only an open the caller
+    // said it counted (noteLadder → ladder_ts, the exact stamp) is ever taken off — never another open's stamp.
+    try {
+      if ((state === 'abandoned' || state === 'cancelled') && rec.client && rec.ladder_ts && !rec.ladder_off) { rec.ladder_off = true; onOpenUndone(rec); }
+      else if (rec.ladder_off && (was === 'abandoned' || was === 'cancelled') && !(state === 'abandoned' || state === 'cancelled')) { rec.ladder_off = false; onOpenRestored(rec); }
+    } catch (_) {}
     if (state === 'abandoned' && rec.cp && rec.txid) st.tombstones[rec.cp] = { client: rec.client, abandoned_at: rec.abandoned_at || now(), reason: rec.reason || '' };
     persist();
     if (rec.funding_tx_hex) writeCopy(rec);
@@ -271,8 +298,8 @@ function createJitFunding(deps) {
       if (tpl.outputs.length !== 1 || !hasFundingOutput(tpl, fundingScript, amount)) throw new Error('the PSBT LND handed does not carry exactly the funding output');
       // 4. fund it from LND's wallet — the coins leased under OUR id for the hold's whole life; the fee polled now
       const fee = await feeRate();
-      log(`[${T}] funding fee ${fee.rate} sat/vB (${fee.source})`);
-      const funded = await lnd.fundPsbt({ psbt: b64(template), sat_per_vbyte: String(fee.rate), min_confs: 1, custom_lock_id: b64(lockId), lock_expiration_seconds: String(lockSeconds) });
+      log(`[${T}] funding fee ${fee.kw} sat/kw = ${fee.vb.toFixed(2)} sat/vB, given to LND in sat/kw (${fee.source})`);
+      const funded = await lnd.fundPsbt({ psbt: b64(template), sat_per_kw: String(fee.kw), min_confs: 1, custom_lock_id: b64(lockId), lock_expiration_seconds: String(lockSeconds) });
       if (!funded || !funded.funded_psbt) throw new Error('FundPsbt answered no PSBT: ' + JSON.stringify(funded).slice(0, 200));
       fundedOnce = true;
       fundedInputs = (funded.locked_utxos || []).map((u) => ({ txid: String((u.outpoint && (u.outpoint.txid_str || (u.outpoint.txid_bytes && hexOf(fromB64(u.outpoint.txid_bytes).reverse())))) || ''), vout: Number(u.outpoint && u.outpoint.output_index) || 0 }));
@@ -291,7 +318,7 @@ function createJitFunding(deps) {
       const vout = finalTx.outputs.findIndex((o) => Number(o.value) === amount && Buffer.from(o.script).equals(fundingScript));
       // THE RECORD, before LND learns the txid: a crash from here on finds it on disk (and its copy)
       rec = { cp: `${txid}:${vout}`, lock_id: hexOf(lockId), pending_chan_id: hexOf(pendingChanId), client: clientHex, size_sats: amount, rail: String(rail || ''),
-              txid, vout, funding_tx_hex: finalHex, inputs: fundedInputs.map((i) => ({ txid: i.txid, vout: i.vout })), fee_sat_per_vb: fee.rate, fee_source: fee.source,
+              txid, vout, funding_tx_hex: finalHex, inputs: fundedInputs.map((i) => ({ txid: i.txid, vout: i.vout })), fee_sat_per_vb: fee.vb, fee_sat_per_kw: fee.kw, fee_source: fee.source,
               state: 'funded', at: now(), updated: now(), reason: '', verify_sent_at: 0 };
       delete st.records[preKey];
       st.records[rec.cp] = rec; live.add(rec.cp); persist(); writeCopy(rec);
@@ -350,8 +377,16 @@ function createJitFunding(deps) {
     const rec = recOf(cp); if (!rec || !rec.funding_tx_hex) return null;
     if (rec.state === 'paid' || rec.state === 'published' || rec.state === 'confirmed') return null;
     if (ENDED.has(rec.state) || rec.state === 'orphan') log(`[JIT-HOLD] MANUAL ATTENTION: the wallet claimed over channel ${short(rec.txid)}:${rec.vout} whose record was ${rec.state} — publishing the kept funding anyway (its coins may have been released; if the publish fails the provider owes the wallet ${rec.size_sats} sats of channel)`);
-    setState(rec, 'paid', Object.assign({ paid_at: now(), paid_from: rec.state }, extra || {}));
+    const from = rec.state;
+    setState(rec, 'paid', Object.assign({ paid_at: now(), paid_from: from }, extra || {}));
+    // 0.124.2 (DP 2026-11-10): the order is in the journal — 'paid' is on disk BEFORE the payer is settled; the publish follows
+    log(`[JIT-HOLD] PAID written for ${short(rec.txid)}:${rec.vout} (was ${from}) — on disk before the payer is settled; the publish follows`);
     return rec;
+  }
+  /** 0.124.2: the caller counted this open on the wallet's fee ladder with this stamp (ms) — kept on the record. */
+  function noteLadder(cp, ts) {
+    const rec = recOf(cp); if (!rec || !Number.isFinite(Number(ts)) || Number(ts) <= 0) return false;
+    rec.ladder_ts = Number(ts); rec.ladder_off = false; persist(); return true;
   }
   /** Publish the kept funding transaction (idempotent: a transaction LND already knows answers OK). */
   async function publish(cp, why) {
@@ -583,7 +618,7 @@ function createJitFunding(deps) {
   }
   function capabilityReport() { return { enabled, key_ok: capability.key_ok, missing_rpcs: capability.missing_rpcs.slice(), feature_bit: Number(FEATURE_BIT) }; }
 
-  return { boot, canHold, open, markPaid, publish, abandon, sweep, status, snapshot, isBlocked, feeRate, feeDials, capability: capabilityReport, FEATURE_BIT, REQUIRED_URIS, _state: () => st, _live: () => live };
+  return { boot, canHold, open, markPaid, noteLadder, publish, abandon, sweep, status, snapshot, isBlocked, feeRate, feeDials, capability: capabilityReport, FEATURE_BIT, REQUIRED_URIS, _state: () => st, _live: () => live };
 }
 
 module.exports = { createJitFunding, psbtUnsignedTx, hasFundingOutput, pendingPoints, reservationDead, FEATURE_BIT, REQUIRED_URIS, STATE_FILE, COPY_DIR };

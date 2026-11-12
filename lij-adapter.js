@@ -466,6 +466,10 @@ lijDelegate.setHooks({
 // DATA_DIR (default: beside the code). Set LIJ_DATA_DIR to relocate —
 // e.g. /var/lib/lijox-adapter — and the adapter creates it at boot.
 const DATA_DIR = process.env.LIJ_DATA_DIR || __dirname;
+// 0.125.0 (S68, Register amount sharing — the wallet repo's docs/register-mode-plan-v2.1.md): the agreed rate's arithmetic
+// and the rate stamp (register-quote.js; its key is DATA_DIR/register-stamp.key)
+const registerQuote = require('./register-quote');
+const regQuote = registerQuote.createRegisterQuote({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 try { require('fs').mkdirSync(DATA_DIR, { recursive: true }); }
 catch (e) { console.error('DATA_DIR is not writable: ' + DATA_DIR + ' — ' + e.message); process.exit(1); }
 // v0.48 (P4): client IPs are NOT logged unless the operator opts in.
@@ -596,6 +600,10 @@ function oiRateLimited(ip) {
 const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 // 0.79.0: the kit holder's store, DATA_DIR/kits/<npub>.json (ciphertext the box cannot read)
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+// 0.126.0 (S68): the channel state file's holder — BOLT #1110's file (65,531 bytes at most) carried over HTTPS. See peer-storage.js.
+const { createPeerStorage, signedText: peerStorageSignedText, sha256hex: peerStorageSha, FILE_MAX: PEER_STORAGE_FILE_MAX } = require('./peer-storage');
+const deliverParts = require('./deliver-parts');   // 0.127.0: a delivery in parts over the wallet's channels
+const peerStorage = createPeerStorage({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 // 0.109.0: the Black start page (recover/index.html beside this file), read once; absent = the route answers 404 and the console's health says so
 const RECOVER_PAGE = (() => { try { return require('fs').readFileSync(require('path').join(__dirname, 'recover', 'index.html'), 'utf8'); } catch (_) { return null; } })();
 const RECOVER_BUILD = RECOVER_PAGE ? ((RECOVER_PAGE.match(/const RECOVER_BUILD = '(v\d+)'/) || [])[1] || 'unknown') : null;
@@ -1500,6 +1508,7 @@ function lnurlpPruneNotes() {
   for (const rec of Object.values(lnurlpRegistry)) {
     for (const e of ((rec && rec.entries) || [])) {
       if (e && e.note != null && Number(e.note_ts || 0) < cutoff) { delete e.note; delete e.note_ts; }
+      if (e && e.pr && e.status !== 'reserved') delete e.pr;   // 0.125.0: the kept invoice text serves the same-stamp retry only while it is unpaid
     }
   }
 }
@@ -1762,6 +1771,31 @@ function lnurlpMetadata(name, host, display) {
 // 0.119.1: the display text as the page sends it — NFC, no control / zero-width / bidi / BOM characters, trimmed, at
 // most 40 code points (the Register field's own length); a text that is not already in this form is refused, so the
 // record the proof covers is byte for byte what is stored.
+// 0.125.0 (Register amount sharing, DP 2026-11-07): THE REGISTER ANSWER. A first call that carries the flag `?register`
+// (the shop's Register QR; a name@host lookup never adds it) gets the shop's business name as the payee line, the shop's
+// currency with the rate (LNURL PR #251's `currencies` shape plus `quote.expires`) and a callback address with a fresh
+// rate stamp in its PATH (/lnurl/cb/<name>/r/<stamp> — some wallets add "?amount=" without looking for a "?"). A plain
+// first call gets the provider's own payee line again: the business name reaches a payor only through the Register.
+// The currency is the one the shop's wallet filed with its name (POST /lnurl/display, `currency`); no currency filed,
+// or no rate held for it → the Register answer carries the name alone and a callback with the placeholder stamp "-".
+function lnurlpRegisterCurrency(rec) {
+  try {
+    const code = String((rec && rec.currency) || '').toUpperCase();
+    if (!/^[A-Z]{3}$/.test(code) || !ratesCache || !ratesCache.rates) return null;
+    const age = Date.now() - ratesCache.fetched_at_ms;
+    if (age > RATES_STALE_MS) return null;
+    if (age > RATES_TTL_MS) { try { ratesFetchUpstream(); } catch (_) {} }   // refreshed behind the answer, as /rates does
+    const rate = Number(ratesCache.rates[code]);
+    return registerQuote.currencyEntry(code, rate, Math.floor(Date.now() / 1000) + regQuote.lifeS);
+  } catch (_) { return null; }
+}
+/// What the shop's Register reads about one of its payments: the invoice's msats, the agreed rate, the figure in the
+/// shop's currency (smallest units, by the one rounding rule), when it was asked for.
+function lnurlpRegisterView(e) {
+  const g = e && e.register; if (!g) return null;
+  return { hash: e.hash, status: e.status, invoice_msat: String(g.invoice_msat), code: g.code, decimals: g.decimals, multiplier: g.multiplier, units: String(g.units), at: g.at, expires_s: g.exp_s || null,
+    delivered_msat: e.delivered_msat ? String(e.delivered_msat) : null, fee_kept_msat: e.fee_kept_msat ? String(e.fee_kept_msat) : null };
+}
 function lnurlpDisplayClean(t) {
   return String(t || '').normalize('NFC').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/g, '').trim();
 }
@@ -1824,11 +1858,40 @@ function jitInWindow(k) {
   e.opens = e.opens.filter((ts) => ts >= cutoff).slice(-50);
   return e.opens.length;
 }
+// 0.124.2 (DP 2026-11-10 "keep refused opens off the fee ladder"): a held open whose funding was never published
+// (abandoned on the wallet's refusal, or cancelled) was counted at the open; its stamp comes off. The stamp taken is
+// exactly the one this open wrote (kept on the held record as ladder_ts) — never another open's. Not found → nothing
+// changed. jitRestoreOpen puts that stamp back for a record revived to a real channel.
+function jitForgetOpen(pubkey, stampMs, why) {
+  const k = String(pubkey || '').toLowerCase();
+  const e = jitOpenCounters[k];
+  if (!e || !Array.isArray(e.opens) || !Number.isFinite(Number(stampMs))) return false;
+  const i = e.opens.indexOf(Number(stampMs));
+  if (i < 0) return false;
+  e.opens.splice(i, 1);
+  jitCountersPersist();
+  console.log(`[JIT] open taken off the fee ladder for ${k.slice(0, 16)}… (${why}) — ${e.opens.length} in the window now`);
+  return true;
+}
+function jitRestoreOpen(pubkey, atMs, why) {
+  const k = String(pubkey || '').toLowerCase();
+  if (!/^[0-9a-f]{66}$/.test(k)) return false;
+  if (!jitOpenCounters[k]) jitOpenCounters[k] = { opens: [] };
+  jitOpenCounters[k].opens.push(Number.isFinite(Number(atMs)) && Number(atMs) > 0 ? Number(atMs) : Date.now());
+  jitOpenCounters[k].opens.sort((a, b) => a - b);
+  jitInWindow(k);
+  jitCountersPersist();
+  console.log(`[JIT] open put back on the fee ladder for ${k.slice(0, 16)}… (${why}) — ${jitOpenCounters[k].opens.length} in the window now`);
+  return true;
+}
 function jitRecordOpen(pubkey) {
   const k = String(pubkey || '').toLowerCase();
   if (!jitOpenCounters[k]) jitOpenCounters[k] = { opens: [] };
   jitInWindow(k);
-  jitOpenCounters[k].opens.push(Date.now());
+  let stamp = Date.now();
+  while (jitOpenCounters[k].opens.includes(stamp)) stamp++;   // 0.124.2: a stamp names one open (a refused held open takes exactly its own off)
+  jitOpenCounters[k].opens.push(stamp);
+  jitRecordOpen.lastStamp = stamp;
   jitCountersPersist();
   console.log(`[JIT] open recorded for ${k.slice(0, 16)}… (${jitOpenCounters[k].opens.length} in ${Math.round(JIT_WINDOW_MS / 86400000)}d window)`);
   return jitOpenCounters[k].opens.length;
@@ -1981,6 +2044,23 @@ function channelRoomMsat(c) {
   return room > 0n ? room * 1000n : 0n;
 }
 
+// 0.127.0: the pick below is the FIRST of this list — every channel toward the wallet, the most room first (ties: the
+// larger balance, then LND's order). deliverToWallet reads the whole list when no one channel has the room.
+async function lnurlpClientChannels(clientPubkey) {
+  try {
+    const r = await lndGet('/v1/channels');
+    const out = [];
+    for (const c of (r.channels || [])) {
+      if ((c.remote_pubkey || '').toLowerCase() !== clientPubkey.toLowerCase()) continue;
+      if (jitFunding.isBlocked(String(c.channel_point || ''))) continue;
+      const scid = (Array.isArray(c.alias_scids) && c.alias_scids.length) ? String(c.alias_scids[0]) : String(c.chan_id);
+      out.push({ chan_id: String(c.chan_id), scid: scid, local_msat: BigInt(c.local_balance || '0') * 1000n, room_msat: channelRoomMsat(c), active: !!c.active, channel_point: String(c.channel_point || '') });
+    }
+    const cmp = (x, y) => (x > y ? -1 : (x < y ? 1 : 0));
+    out.sort((a, b) => cmp(a.room_msat, b.room_msat) || cmp(a.local_msat, b.local_msat));
+    return out;
+  } catch (e) { return []; }
+}
 async function lnurlpClientChannel(clientPubkey) {
   // v0.27.0 (S30): best channel toward the client with LSP-side liquidity.
   // The ACTIVE gate is gone — a sleeping wallet's channel reads inactive,
@@ -2077,11 +2157,18 @@ function deliverReservedFundingSats() { let s = 0; for (const o of deliverOpenin
 async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat: fixedFeeMsat, finalCltvDelta, tag, jitTag }) {
   let guardCp = '';   // 0.104.0: set when THIS call opened the channel; its payment's outcome is reported to the guard below
   let heldCp = '';    // 0.124.0: set when THIS call opened the channel with its funding HELD — paid → publish, failed → abandon
+  let openedCp = '';  // 0.127.1: the funding point of the channel THIS call opened
   const amt = BigInt(amountMsat);
   const T = tag || 'deliver';
   let chan = await lnurlpClientChannel(client);
   let feeMsat = 0n;
   if (chan && deliverOpening.has(client)) deliverOpening.delete(client);   // 0.117.0 (F21): the channel is listed — whatever open we remembered is done
+  // 0.127.0: no ONE channel has the room, but the wallet's channels together do → the payment goes in parts, one per
+  // channel, under the one hash; nothing is opened and no fee is taken. A new channel only when the total is short.
+  if (chan && chan.room_msat < amt) {
+    const plan = deliverParts.plan(await lnurlpClientChannels(client), amt, DELIVER_PARTS);
+    if (plan && plan.length > 1) return deliverInParts({ client, hashHex, secretHex, amt, finalCltvDelta, T, plan });
+  }
   if (!chan || chan.room_msat < amt) {   // 0.84.0: the room LND will send (reserve, commit fee, fee buffer, margin already off)
     // JIT path: same fee law as every channel-opening receive (or the fee the wallet was promised).
     feeMsat = (fixedFeeMsat !== undefined && fixedFeeMsat !== null) ? BigInt(fixedFeeMsat) : lnurlpFeeMsat(amt, client);
@@ -2127,15 +2214,23 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       // 0.124.0 (wallet trusts LSP): the ONE open — held when the wallet carries the bit, else today's OpenChannelSync
       const opened = await openJitChannel({ client, sizeSats, tag: T });
       heldCp = opened.held ? opened.cp : '';
+      openedCp = String(opened.cp || '');
     } catch (e) {
       console.error(`[${T}]: open failed (${e.message}) — will retry`);
       if (/DEADLINE|deadline|timed? ?out/i.test(String(e.message || e))) { const o = deliverOpening.get(client); if (o) o.deadline = true; }   // 0.117.0 (F21): LND may still be opening — the record stays 90 s; the next tick asks LND's pending list first
       else deliverOpening.delete(client);
       return { kind: 'retry', reason: 'open failed: ' + e.message };
     }
+    // 0.127.1 (DP's journal, 2026-11-11 05:56 on the UM890): a wallet that ALREADY had a channel without the room kept
+    // that channel here — the wait below ran only while `chan` was empty — so the payment went into the old channel
+    // (LND: TEMPORARY_CHANNEL_FAILURE on our own link), the new channel was abandoned, the guard filed the failure under
+    // the old channel's point, and two tries blocked the wallet from JIT opens. The channel to deliver over is the one
+    // THIS call opened, found by its funding point.
+    chan = null;
     for (let i = 0; i < 24 && !chan; i++) {
       await new Promise((r2) => setTimeout(r2, 500));
-      chan = await lnurlpClientChannel(client);
+      const _all = await lnurlpClientChannels(client);
+      chan = (openedCp ? _all.find((c) => c.channel_point === openedCp) : _all.find((c) => c.room_msat >= amt - feeMsat)) || null;
     }
     deliverOpening.delete(client);   // 0.117.0 (F21): the open call returned — listed or not, the next caller reads LND
     if (!chan) {
@@ -2144,6 +2239,7 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
       return { kind: 'retry', reason: 'opened channel never listed' };
     }
     jitRecordOpen(client);   // v0.32.0: per-wallet open counter
+    if (heldCp) jitFunding.noteLadder(heldCp, jitRecordOpen.lastStamp);   // 0.124.2: a held open that ends refused takes this stamp off again
     guardCp = chan.channel_point || ''; jitGuard.recordOpen(guardCp, client, sizeSats, T.toLowerCase().split(' ')[0], !!heldCp);   // 0.104.0 · 0.124.0: held
     if (heldCp && heldCp !== guardCp) console.warn(`[${T}]: the held funding ${heldCp} is not the channel LND lists for this wallet (${guardCp}) — the sweep sorts it out`);
   }
@@ -2194,6 +2290,41 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
   return { kind: 'attempt', attempt, innerMsat, feeMsat, chan };
 }
 
+// 0.127.0: the delivery in parts (see deliver-parts.js). Each part is ONE HTLC over its own channel with the SAME hash
+// and payment secret; every part's mpp_record names the WHOLE amount, so the wallet holds the parts until all have
+// arrived and then claims them together — one preimage. LND takes several SendToRoute calls for one hash as one
+// payment and refuses a part that would take it over the total. The first part goes out alone, a moment ahead, so LND
+// has the payment on its books before the others arrive. A channel that is not active yet (the wallet has only just
+// connected) → 'retry', never a part LND would fail on our own link while the others wait in the wallet.
+const DELIVER_PARTS = { maxParts: parseInt(process.env.LSPS2_DELIVER_MAX_PARTS || '4', 10), minPartMsat: BigInt(parseInt(process.env.LSPS2_DELIVER_MIN_PART_SATS || '1000', 10)) * 1000n };
+async function deliverInParts({ client, hashHex, secretHex, amt, finalCltvDelta, T, plan }) {
+  const idle = plan.filter((p) => !p.chan.active);
+  if (idle.length) {
+    console.log(`[${T}]: ${amt} msat fits the wallet's channels together (${plan.length} parts) but ${idle.length} of them ${idle.length === 1 ? 'is' : 'are'} not active yet — retry`);
+    return { kind: 'retry', reason: 'a channel for a part is not active yet' };
+  }
+  const info = await lndGet('/v1/getinfo').catch(() => null);
+  const tip = (info && info.block_height) || 0;
+  if (!tip) { console.warn(`[${T}] no live tip — retry`); return { kind: 'retry', reason: 'no live tip' }; }
+  const expiry = tip + Math.max(80, Number(finalCltvDelta) || 0);
+  const addr = Buffer.from(secretHex, 'hex').toString('base64');
+  const routeFor = (p) => ({
+    total_time_lock: expiry,
+    total_amt_msat: p.msat.toString(),
+    hops: [{ chan_id: p.chan.scid, expiry: expiry, amt_to_forward_msat: p.msat.toString(), fee_msat: '0', pub_key: client, tlv_payload: true,
+      mpp_record: { payment_addr: addr, total_amt_msat: amt.toString() } }],
+  });
+  console.log(`[${T}]: delivering ${amt} msat (fee 0) in ${plan.length} parts — ${plan.map((p) => `${p.msat} msat via scid=${p.chan.scid} (room=${p.chan.room_msat})`).join(', ')} hash=${hashHex.slice(0,16)}…`);
+  const send = (p) => sendToRouteV2Hard(routerClient, Buffer.from(hashHex, 'hex'), routeFor(p), CONFIG.lsps2.sendtoroute_timeout_ms, T);
+  const calls = [send(plan[0])];
+  await new Promise((r2) => setTimeout(r2, 200));
+  for (const p of plan.slice(1)) calls.push(send(p));
+  const out = deliverParts.combine(await Promise.allSettled(calls));
+  if (out.kind === 'rejected') return out;
+  if (out.attempt.status !== 'SUCCEEDED') console.warn(`[${T}]: the delivery in ${plan.length} parts did not succeed (status=${out.attempt.status} code=${(out.attempt.failure && out.attempt.failure.code) || 'unknown'})`);
+  return { kind: 'attempt', attempt: out.attempt, innerMsat: amt.toString(), feeMsat: 0n, chan: plan[0].chan, parts: plan.length };
+}
+
 // 0.83.0 (S49, DP GO — PUSH KEY, the first field finding): the ONE answer to "can this wallet take N msat
 // from this provider right now, and at what fee?" — deliverToWallet's law, read without acting: room in
 // the wallet's channel (the same 50-sat margin) → in full, fee 0; no room → a JIT open at THE ONE
@@ -2202,8 +2333,10 @@ async function deliverToWallet({ client, hashHex, secretHex, amountMsat, feeMsat
 // payer can send to this wallet today (quote and charge agree — v0.32.0×v0.33.0).
 async function walletReceivable(client, amountMsat) {
   const amt = BigInt(amountMsat);
-  const chan = await lnurlpClientChannel(client);
-  const room = chan ? chan.room_msat : 0n;   // 0.84.0: the room LND will send
+  const chans = await lnurlpClientChannels(client);
+  const chan = chans[0] || null;
+  const parts = (chan && chan.room_msat < amt) ? deliverParts.plan(chans, amt, DELIVER_PARTS) : null;   // 0.127.0: the channels together
+  const room = (parts && parts.length > 1) ? deliverParts.totalRoomMsat(chans) : (chan ? chan.room_msat : 0n);   // 0.84.0: the room LND will send
   const minMsat = String(lnurlpMinMsat(chan, client));
   if (chan && room >= amt) return { ok: true, mode: 'channel', fee_msat: '0', receivable_msat: String(room), min_msat: minMsat };
   const fee = channelOpenFeeMsat(amt, client);
@@ -2635,6 +2768,9 @@ const walletCheckIpLimit   = windowLimiter(CONFIG.security.wallet_check_ip_reque
 const myChannelsKeyLimit   = windowLimiter(CONFIG.security.my_channels_key_requests,   CONFIG.security.wallet_check_key_window_ms);
 const recoverCloseKeyLimit = windowLimiter(CONFIG.security.recover_close_key_requests, CONFIG.security.wallet_check_key_window_ms);
 // 0.119.3 (S66, item 2): the fetch-for-the-phone route's own ceiling per address (LNURL_FETCH_IP_PER_MIN, default 30 a minute)
+// 0.126.0 (S68): the channel state file's own limits — a busy wallet sends one file per change, at most one every 30 s
+const peerStorageIpLimit  = windowLimiter(parseInt(process.env.PEER_STORAGE_IP_PER_HOUR  || '600', 10) || 600, 3600000);
+const peerStorageKeyLimit = windowLimiter(parseInt(process.env.PEER_STORAGE_KEY_PER_HOUR || '300', 10) || 300, 3600000);
 const lnurlFetchIpLimit = windowLimiter(parseInt(process.env.LNURL_FETCH_IP_PER_MIN || '30', 10) || 30, 60000);
 let lnurlFetchCounts = { asked: 0, served: 0, refused: 0 };   // the only record kept — never the URL
 
@@ -2681,6 +2817,8 @@ const jitFunding = createJitFunding({
   settings: { enabled: JIT_FUNDING_HOLD_ENABLED, lock_seconds: Number(process.env.LSPS2_FUNDING_HOLD_LOCK_SECONDS) || 172800, fee: JIT_FUNDING_FEE, open_timeout_ms: CONFIG.lsps2.openchannel_timeout_ms },
   hrp: 'bc',
   tellWallet: async (client, txid, vout) => (chainBridge && chainBridge.sendJitFundingAbandoned) ? chainBridge.sendJitFundingAbandoned(client, txid, vout) : false,
+  onOpenUndone: (rec) => jitForgetOpen(rec.client, rec.ladder_ts, `${String(rec.txid || '').slice(0, 12)}:${rec.vout} ${rec.state}`),   // 0.124.2: a refused open is not on the wallet's fee ladder
+  onOpenRestored: (rec) => jitRestoreOpen(rec.client, rec.ladder_ts, `${String(rec.txid || '').slice(0, 12)}:${rec.vout} revived`),
   lnd: {
     openChannelHeld: (params, opts) => openChannelHeld(lightningOpenChannelClient, params, opts),
     fundPsbt: async (body) => lndOrThrow(await lndPost('/v2/wallet/psbt/fund', body), 'FundPsbt'),
@@ -2698,6 +2836,8 @@ const jitFunding = createJitFunding({
     listPeers: async () => (await lndGetOk('/v1/peers')).peers || [],   // 0.124.1: LND's proof that a reservation is dead (the peer gone, or flapped since the verify)
     // 0.124.1: the fee poll — LND's estimate for the target, sat/vB (sat_per_kw × 4 / 1000); null when LND has none
     estimateFeeSatVb: async (targetConf) => { const r = await lndGet(`/v2/wallet/estimatefee/${Math.max(1, Math.floor(Number(targetConf) || 144))}`).catch(() => null); const kw = Number(r && r.sat_per_kw); return kw > 0 ? kw * 4 / 1000 : null; },
+    // 0.124.2: the same poll in LND's own unit, sat/kw, untouched — the held open hands it straight back to FundPsbt
+    estimateFeeSatKw: async (targetConf) => { const r = await lndGet(`/v2/wallet/estimatefee/${Math.max(1, Math.floor(Number(targetConf) || 144))}`).catch(() => null); const kw = Number(r && r.sat_per_kw); return kw > 0 ? kw : null; },
     peerFeatures: async (client) => {
       const pl = await lndGet('/v1/peers');
       const p = (pl.peers || []).find((x) => String(x.pub_key || '').toLowerCase() === String(client).toLowerCase());
@@ -2742,7 +2882,7 @@ async function openJitChannel({ client, sizeSats, tag }) {
     return { channelPoint: r.channel_point, cp: r.cp, held: true };
   }
   const fee = await jitFunding.feeRate();   // 0.124.1: the same polled rate as the held open (was a hard-coded 1 sat/vB)
-  console.log(`[${tag || 'JIT'}] funding fee ${fee.rate} sat/vB (${fee.source}) — publish-first open`);
+  console.log(`[${tag || 'JIT'}] funding fee ${fee.rate} sat/vB — the nearest whole sat/vB to ${fee.kw} sat/kw; this open takes whole sat/vB only (${fee.source}) — publish-first open`);
   const channelPoint = await openChannelSync(lightningOpenChannelClient, Object.assign({ node_pubkey_string: client, sat_per_vbyte: String(fee.rate), min_confs: 0 }, common), CONFIG.lsps2.openchannel_timeout_ms);
   return { channelPoint, cp: channelPointStr(channelPoint), held: false };
 }
@@ -4246,6 +4386,7 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     const opened = await openJitChannel({ client: promise.client_pubkey, sizeSats: channelSizeSats, tag: 'LSPS2' });
     channelPoint = opened.channelPoint; _held = opened.held;
     jitRecordOpen(promise.client_pubkey);   // v0.32.0: per-wallet open counter (success only)
+    if (_held) jitFunding.noteLadder(opened.cp, jitRecordOpen.lastStamp);   // 0.124.2: a held open that ends refused takes this stamp off again
     _guardCp = opened.cp; jitGuard.recordOpen(_guardCp, promise.client_pubkey, channelSizeSats, 'lsps2', _held);   // 0.104.0: the funding is public from here · 0.124.0: or held
   } catch (e) {
     // B-13: mid-open peer-disconnect -> HOLD + retry-open-on-reconnect.
@@ -5124,6 +5265,7 @@ async function routeBuildWithSynthesis(destination, amountSat, lndBody, routeHin
 
   let chanIdDecimal = null, chanCapacity = null, flavor = null;
   let a1Refused = false;   // v0.56.4 (6e)
+  let partsHint = null;    // 0.127.1: no one channel can carry it, the wallet's active channels together can — the part sizes
   try {
     const data = pinnedToPromise ? null : await lndGet('/v1/channels');
     // B-8: a peer may have SEVERAL channels (JIT churn). Pick the one with
@@ -5141,6 +5283,10 @@ async function routeBuildWithSynthesis(destination, amountSat, lndBody, routeHin
         chanIdDecimal = String(best.chan_id); chanCapacity = String(best.capacity || amountSat); flavor = 'channel';
       } else {
         console.log(`[SYNTH] no channel to ${destination.slice(0,16)}... can carry ${amtN} (best spendable ${bestSpend === -Infinity ? 'n/a' : bestSpend} across ${mine.length}) -- trying JIT promise`);
+        try {   // 0.127.1: the sizes a sender can split this payment into so that each part fits one of the wallet's channels
+          const _pl = deliverParts.plan(mine.filter((c) => c.active && !jitFunding.isBlocked(String(c.channel_point || ''))).map((c) => ({ scid: String(c.chan_id), room_msat: channelRoomMsat(c) })), BigInt(amtN) * 1000n, DELIVER_PARTS);
+          if (_pl && _pl.length > 1) partsHint = _pl.map((p) => Number(p.msat / 1000n));
+        } catch (_) {}
       }
     }
   } catch (e) {}
@@ -5188,6 +5334,12 @@ async function routeBuildWithSynthesis(destination, amountSat, lndBody, routeHin
         _resp.lijox_refusal = { code: 'stale_jit_promise' };
         return _resp;
       }
+    }
+    if (partsHint) {   // 0.127.1: no route for the whole amount — say the part sizes that fit (an engine that does not know the field reads "no routes" as before)
+      const _rp = (lndResp && typeof lndResp === 'object') ? lndResp : { routes: [] };
+      _rp.lijox_parts_sats = partsHint;
+      console.log(`[SYNTH] ${destination.slice(0,16)}...: ${amountSat} sats fit the wallet's channels in ${partsHint.length} parts (${partsHint.join(' + ')}) — said in the answer`);
+      return _rp;
     }
     if (lndErr) throw lndErr;
     return lndResp || { routes: [] };
@@ -6616,6 +6768,81 @@ async function handleRecoverClose(req, res, ip) {
 //   0.92.1: commitment_type as LND names it (STATIC_REMOTE_KEY pays a closed channel's wallet share to its m/84 address)
 // A wallet that gets no answer starts as it always has (DP: the check must never lock up the device).
 const MY_CHANNELS_DOMAIN = 'lij-my-channels-v1:';
+// ── 0.126.0 (S68 Wed 2026-11-11): THE CHANNEL STATE FILE'S HOLDER ─────────────────────────────────────────────────────
+//   POST /v1/peer-storage/put   { node_pubkey, nonce, signature, version, state_fp, file_b64 }  → { ok, version }
+//   POST /v1/peer-storage/meta  { node_pubkey, nonce, signature }                               → { ok, found, version, state_fp, at }
+//   POST /v1/peer-storage/get   { node_pubkey, nonce, signature }                               → { ok, found, version, state_fp, at, file_b64 }
+//   nonce     = a single-use challenge from GET /lsps/registry/challenge
+//   signature = LND-style signmessage (zbase32) by the NODE key over
+//               "lij-peer-storage-v1:<action>:<nonce>" and, for a put, ":<version>:<sha256 hex of the file>"
+// Held for ANY wallet that proves its node key — a channel with this provider is not asked for (LIJOX: MUST hold for
+// others). The file is BOLT #1110's: bytes the holder cannot read, 65,531 at most, the latest only. A lower number is
+// refused (409). A reconnecting wallet asks meta alone and fetches the file only when state_fp differs from its own.
+async function handlePeerStorage(req, res, ip, action) {
+  if (action !== 'put' && action !== 'meta' && action !== 'get') return errResponse(res, 'Not found', 404);
+  const ipLim = peerStorageIpLimit.hit(ip);
+  if (!ipLim.ok) { console.warn(`[Security] Peer-storage limit hit for ${ip} — resets in ${ipLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
+  let body;
+  try { body = await readBody(req, 200000); } catch (e) { return errResponse(res, 'Invalid JSON or body too large'); }
+  const pk = String((body && body.node_pubkey) || '').toLowerCase().trim();
+  const nonce = String((body && body.nonce) || '').toLowerCase().trim();
+  const sig = String((body && body.signature) || '').trim();
+  if (!/^0[23][0-9a-f]{64}$/.test(pk)) return errResponse(res, 'node_pubkey must be 66 lowercase hex chars');
+  if (!/^[0-9a-f]{64}$/.test(nonce)) return errResponse(res, 'nonce must be 64 hex chars');
+  if (!sig) return errResponse(res, 'Missing signature');
+  let version = 0, stateFp = '', file = null, fileSha = '';
+  if (action === 'put') {
+    version = Number(body && body.version);
+    stateFp = String((body && body.state_fp) || '').toLowerCase();
+    const b64 = String((body && body.file_b64) || '');
+    if (!Number.isSafeInteger(version) || version <= 0) return errResponse(res, 'version must be a positive whole number');
+    if (!/^[0-9a-f]{64}$/.test(stateFp)) return errResponse(res, 'state_fp must be 64 hex chars');
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) return errResponse(res, 'file_b64 must be base64');
+    file = Buffer.from(b64, 'base64');
+    if (file.length === 0) return errResponse(res, 'file_b64 is empty');
+    if (file.length > PEER_STORAGE_FILE_MAX) return jsonResponse(res, { ok: false, reason: 'too_large', max_bytes: PEER_STORAGE_FILE_MAX }, 413);   // before LND is asked anything
+    fileSha = peerStorageSha(file);
+  }
+  // 1. signature → recovered pubkey must equal the claimed node key (the my-channels pattern)
+  let recovered = '';
+  try {
+    const r = await lndRequest('POST', '/v1/verifymessage', {
+      msg: Buffer.from(peerStorageSignedText(action, nonce, version, fileSha), 'utf8').toString('base64'),
+      signature: sig,
+    });
+    const emsg = String((r && (r.message || r.error)) || '');
+    if (!r || (!r.pubkey && /permission|macaroon|unauthenticated|unavailable|deadline|connection|EOF|unimplemented/i.test(emsg))) {
+      return jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503);
+    }
+    recovered = String((r && r.pubkey) || '').toLowerCase();
+  } catch (e) {
+    return jsonResponse(res, { ok: false, reason: 'verify_unavailable' }, 503);
+  }
+  if (!recovered || recovered !== pk) {
+    console.warn(`[PeerStorage] BAD_SIG from ${ip} for ${pk.slice(0, 16)} (${action})`);
+    return jsonResponse(res, { ok: false, reason: 'bad_signature' }, 401);
+  }
+  const keyLim = peerStorageKeyLimit.hit(pk);
+  if (!keyLim.ok) { console.warn(`[PeerStorage] ${pk.slice(0, 16)}: limit hit — resets in ${keyLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
+  // 2. the nonce, used up only after the signature has proven the key
+  const nr = registryNonceStore.consume(nonce);
+  if (!nr.ok) return jsonResponse(res, { ok: false, reason: nr.code }, 400);
+  if (action === 'put') {
+    const r = peerStorage.put(pk, version, stateFp, file);
+    if (r.ok) return jsonResponse(res, { ok: true, version: r.version });
+    const status = r.code === 'lower_version' ? 409 : r.code === 'too_large' ? 413 : r.code === 'full' ? 507 : 400;
+    if (r.code === 'lower_version') console.warn(`[PeerStorage] ${pk.slice(0, 16)}: no. ${version} refused — no. ${r.held_version} is held`);
+    return jsonResponse(res, { ok: false, reason: r.code, held_version: r.held_version }, status);
+  }
+  if (action === 'meta') {
+    const m = peerStorage.meta(pk);
+    return jsonResponse(res, m ? { ok: true, found: true, version: m.version, state_fp: m.state_fp, at: m.at } : { ok: true, found: false });
+  }
+  const g = peerStorage.get(pk);
+  if (g) console.log(`[PeerStorage] handed back no. ${g.version} (${g.file.length} bytes) to ${pk.slice(0, 16)}`);
+  return jsonResponse(res, g ? { ok: true, found: true, version: g.version, state_fp: g.state_fp, at: g.at, file_b64: g.file.toString('base64') } : { ok: true, found: false });
+}
+
 async function handleMyChannels(req, res, ip) {
   // 0.96.0 (S58): the wallet checks' own address ceiling, before LND is asked to check anything (was the channel-open's 3 an hour)
   const ipLim = walletCheckIpLimit.hit(ip);
@@ -6803,6 +7030,7 @@ function ratesFetchUpstream() {
       const u = new URL(RATES_UPSTREAM);
       const rq = require('https').request({
         hostname: u.hostname,
+        port: u.port || 443,   // 0.125.0: the port from RATES_UPSTREAM when it names one (the release check's stand-in does)
         path: u.pathname + u.search,
         method: 'GET',
         headers: { 'accept': 'application/json', 'user-agent': 'lij-lsp-rates/0.22' },
@@ -6930,7 +7158,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
 
   // v0.9: CORS headers on every response, plus OPTIONS preflight short-circuit
   setCorsHeaders(req, res);
-  if (path === '/v1/kit') kitHolder.openCors(res);   // 0.79.1: the kit holder answers every wallet origin (signature-gated, no credentials)
+  if (path === '/v1/kit' || path.startsWith('/v1/peer-storage/')) kitHolder.openCors(res);   // 0.79.1 (0.126.0: and the channel state file's holder — signature-gated the same way): the kit holder answers every wallet origin (signature-gated, no credentials)
   if (method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -7017,6 +7245,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
                                        : { enabled: !!htlcInterceptor,
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
+        peer_storage:    peerStorage.capability,   // 0.126.0: this box holds a wallet's channel state file (BOLT #1110's file over HTTPS; max_bytes 65531)
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
         lnurl_fetch:     { enabled: true },   // 0.119.3 (S66, item 2): POST /v1/lnurl/fetch — the provider fetches a payee's pay terms or invoice for a phone the payee refused
@@ -7048,6 +7277,10 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // registry.js). MUST dispatch BEFORE the authOk gate below -- adapter
   // secret is the wrong auth model for these endpoints. Any exception
   // here logs + 500s rather than falling through to the auth gate.
+  if (path.startsWith('/v1/peer-storage/') && method === 'POST') {   // 0.126.0 (S68): public, signed-challenge auth — the channel state file
+    try { return await handlePeerStorage(req, res, ip, path.slice('/v1/peer-storage/'.length)); }
+    catch (e) { console.error('[PeerStorage] handler threw:', e); return errResponse(res, 'Internal error', 500); }
+  }
   if (path === '/lsps/registry/my-channels' && method === 'POST') {   // 0.92.0 (S57): public, signed-challenge auth, read-only
     try { return await handleMyChannels(req, res, ip); }
     catch (e) { console.error('[MyChannels] handler threw:', e); return errResponse(res, 'Internal error', 500); }
@@ -7186,21 +7419,43 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!rec) return jsonResponse(res, { status: 'ERROR', reason: 'unknown name' }, 404);
     const host = req.headers.host || 'lsp';
     const chan = await lnurlpClientChannel(rec.client_pubkey);
-    return jsonResponse(res, {
+    // 0.125.0: the Register answer (the flag on the shop's own QR) or the plain one
+    const isRegister = parsed.searchParams.has('register');
+    const answer = {
       tag: 'payRequest',
       callback: 'https://' + host + '/lnurl/cb/' + name,
       minSendable: lnurlpMinMsat(chan, rec.client_pubkey),   // v0.31.0 honest / v0.32.0 escalated
       maxSendable: CONFIG.lsps2.variable_ceiling_msat,
-      metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec), rec.display),   // 0.68.0: the address host, not necessarily this host; 0.119.1: the display name
+      metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec), isRegister ? rec.display : null),   // 0.68.0: the address host; 0.119.1: the display name; 0.125.0: on the Register answer only
       commentAllowed: LNURLP_COMMENT_MAX,   // 0.81.0 (S49, DP): the payer may write to the payee (LUD-12)
-    });
+    };
+    if (isRegister) {
+      const cur = lnurlpRegisterCurrency(rec);
+      let stamp = '-';
+      if (cur) { const s = regQuote.make({ name, code: cur.code, milli: cur.milli, decimals: cur.decimals }); stamp = s.stamp; cur.entry.quote.expires = s.exp_s; answer.currencies = [cur.entry]; }
+      answer.callback = 'https://' + host + '/lnurl/cb/' + name + '/r/' + stamp;
+    }
+    return jsonResponse(res, answer);
   }
   if (method === 'GET' && path.startsWith('/lnurl/cb/')) {
-    const name = path.slice('/lnurl/cb/'.length).toLowerCase();
+    // 0.125.0: /lnurl/cb/<name> is the plain callback; /lnurl/cb/<name>/r/<stamp> the Register's (the stamp is
+    // case-sensitive; the name is not)
+    const cbRest = path.slice('/lnurl/cb/'.length);
+    const cbM = /^([^/]+)\/r\/([^/]{1,500})$/.exec(cbRest);
+    const isRegisterCb = !!cbM;
+    const name = (cbM ? cbM[1] : cbRest).toLowerCase();
     const rec = lnurlpRegistry[name];
     if (!rec) return jsonResponse(res, { status: 'ERROR', reason: 'unknown name' }, 404);
-    const amount = parsed.searchParams.get('amount');
-    const amt = amount && /^\d+$/.test(amount) ? BigInt(amount) : 0n;
+    // the stamp, the amount and the one-use rule: register-quote.js decides (pure, tested) — the stamp must be the
+    // provider's own, unchanged, within its ten minutes and unused, or the request is a plain one. NEVER a refusal over
+    // the stamp (DP: "no invoice is rejected unless the wallet or merchant modifies the rate").
+    const cbD = regQuote.decide({ stampText: isRegisterCb ? cbM[2] : null, name, amountRaw: parsed.searchParams.get('amount'), entries: rec.entries || [], nowS: lnurlpNowS(),
+      liveMilli: (code, dec) => ((ratesCache && ratesCache.rates && (Date.now() - ratesCache.fetched_at_ms) <= RATES_STALE_MS) ? registerQuote.multiplierMilli(Number(ratesCache.rates[code]), dec) : null) });
+    if (cbD.same) {
+      console.log(`[LNURLP] ${name}: the same Register stamp and amount again — the same invoice returned hash=${cbD.same.hash.slice(0, 16)}…`);
+      return jsonResponse(res, { pr: cbD.same.pr, routes: [] });
+    }
+    const amt = cbD.amt; const quote = cbD.quote; const stampWhy = cbD.why;
     const chan = await lnurlpClientChannel(rec.client_pubkey);
     const minMsat = BigInt(lnurlpMinMsat(chan, rec.client_pubkey));   // v0.31.0/v0.32.0: same helper as the quote
     if (amt < minMsat || amt > BigInt(CONFIG.lsps2.variable_ceiling_msat)) {
@@ -7224,6 +7479,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     entry.status = 'reserved';
     entry.amount_msat = amt.toString();
     entry.reserved_at = Date.now();
+    delete entry.register; delete entry.pr;   // 0.125.0: written below, after the invoice exists
     // 0.81.0: the payer's note rides the callback (LUD-12 `comment`); cleaned, kept on the entry, never logged
     const _note = lnurlpCleanNote(parsed.searchParams.get('comment'));
     if (_note) { entry.note = _note; entry.note_ts = Date.now(); } else { delete entry.note; delete entry.note_ts; }
@@ -7237,12 +7493,12 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       // SHA-256 of the EXACT metadata string served (no `d`, no memo,
       // no second string to drift). cltv 400→144: a day of hold
       // headroom without demanding 2.8 days of sender HTLC lockup.
-      const metaStr = lnurlpMetadata(name, lnurlpAddrHost(req, rec), rec.display);   // 0.68.0: sealed under the address host; 0.119.1: the display name
+      const metaStr = lnurlpMetadata(name, lnurlpAddrHost(req, rec), isRegisterCb ? rec.display : null);   // 0.68.0: sealed under the address host; 0.119.1: the display name; 0.125.0: each callback seals the answer that named it
       const mintBody = {
         hash: Buffer.from(entry.hash, 'hex').toString('base64'),
         value_msat: amt.toString(),
         description_hash: require('crypto').createHash('sha256').update(metaStr, 'utf8').digest('base64'),
-        expiry: '1200',   // 0.67.0: an unpaid reservation lives 20 min (was 60) — a payer pays in seconds; a griefer burns fewer hashes
+        expiry: quote ? String(registerQuote.STAMPED_INVOICE_LIFE_S) : '1200',   // 0.67.0: an unpaid reservation lives 20 min (was 60) — a payer pays in seconds; a griefer burns fewer hashes · 0.125.0: an invoice at an agreed rate lives 10 min, so a rate never lives longer than 20 in all
         cltv_expiry: '144',
         private: true,
       };
@@ -7269,8 +7525,14 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       lnurlpPersist();
       return jsonResponse(res, { status: 'ERROR', reason: 'could not mint invoice' }, 500);
     }
+    // 0.125.0: "this invoice, these msats, at this rate" — on the entry, with the invoice kept for the same-stamp retry
+    if (quote) {
+      entry.register = { stamp_id: quote.id, code: quote.code, decimals: quote.decimals, multiplier: quote.multiplier, invoice_msat: amt.toString(), units: registerQuote.unitsFor(amt, quote.milli).toString(), at: Date.now(), exp_s: lnurlpNowS() + registerQuote.STAMPED_INVOICE_LIFE_S };
+      entry.pr = hodl.payment_request;
+      lnurlpPersist();
+    }
     lnurlpWatch(name, entry);
-    console.log(`[LNURLP] ${name}: minted hold invoice ${amt} msat hash=${entry.hash.slice(0,16)}…${entry.note ? ' note=' + Array.from(entry.note).length + ' chars' : ''}`);
+    console.log(`[LNURLP] ${name}: minted hold invoice ${amt} msat hash=${entry.hash.slice(0,16)}…${entry.note ? ' note=' + Array.from(entry.note).length + ' chars' : ''}${quote ? ` \u00b7 Register: ${entry.register.units} ${quote.code} smallest unit(s) at ${quote.multiplier} msat each, 10 min` : (isRegisterCb ? ' \u00b7 Register callback, no agreed rate (' + (stampWhy || 'no currency filed or no rate held') + ') \u2014 a plain request' : '')}`);
     return jsonResponse(res, { pr: hodl.payment_request, routes: [] });
   }
   // 0.81.0 (S49, DP): the payee reads the payer's note — token-gated, and only the hash's owner.
@@ -7289,7 +7551,26 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!hit) return jsonResponse(res, { ok: false, error: 'unknown hash' }, 404);
     if (owner !== who) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
     touchWalletActive(who);
-    return jsonResponse(res, { ok: true, note: hit.note || null, ts: hit.note_ts || null, status: hit.status || null });
+    return jsonResponse(res, { ok: true, note: hit.note || null, ts: hit.note_ts || null, status: hit.status || null, register: lnurlpRegisterView(hit),   // 0.125.0: the agreed rate's record, for the shop's PAID screen
+      invoice_msat: hit.amount_msat ? String(hit.amount_msat) : null, delivered_msat: hit.delivered_msat ? String(hit.delivered_msat) : null, fee_kept_msat: hit.fee_kept_msat ? String(hit.fee_kept_msat) : null });   // 0.125.1: what the payor paid, what reached the payee and the provider's fee — the Register's fee line on the plain path too (DP's answer 7)
+  }
+  // 0.125.0 (Register amount sharing): the shop's Register reads its OPEN requests — invoices asked for at an agreed rate
+  // and not yet settled — in the order they were asked for ("show every waiting payment, in the order requested", DP).
+  // Token-gated and owner-only: the node key's proof (action lnurl-note) over `register-open:<name>:<client>`.
+  if (method === 'GET' && path === '/lnurl/register/open') {
+    if (!authOk(req)) return jsonResponse(res, { ok: false, error: 'auth' }, 401);
+    const oName = String(parsed.searchParams.get('name') || '').toLowerCase();
+    const oWho = String(parsed.searchParams.get('client_pubkey') || '').toLowerCase();
+    if (!lnurlpNameSafe(oName) || !/^[0-9a-f]{66}$/.test(oWho)) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
+    { const opr = lnurlpAuthCheck(proofFromQuery(parsed.searchParams), 'lnurl-note', oWho, 'register-open:' + oName + ':' + oWho); if (!opr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + opr.code }, opr.status); }
+    const oRec = lnurlpRegistry[oName];
+    if (!oRec) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
+    if (String(oRec.client_pubkey || '').toLowerCase() !== oWho) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
+    touchWalletActive(oWho);
+    const nowS1 = lnurlpNowS();
+    const open = (oRec.entries || []).filter((e) => e && e.register && ((e.status === 'reserved' && Number(e.register.exp_s || 0) > nowS1) || e.status === 'accepted' || e.status === 'settle_pending'))
+      .sort((a, b) => Number(a.register.at || 0) - Number(b.register.at || 0)).slice(0, 20).map(lnurlpRegisterView);
+    return jsonResponse(res, { ok: true, name: oName, currency: oRec.currency || null, open, now_s: nowS1 });
   }
   if (method === 'GET' && path === '/quorum/defaults') {
     // v0.46 (S33, DP design): the LSP declares the default quorum endpoint
@@ -7457,7 +7738,11 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     const dspText = (dsp && typeof dsp.display === 'string') ? dsp.display : null;
     if (!lnurlpNameSafe(dspName) || !/^[0-9a-f]{66}$/.test(dspPk) || dspText === null) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
     if (lnurlpDisplayClean40(dspText) !== dspText) return jsonResponse(res, { ok: false, error: 'display not clean (NFC, no control characters, trimmed, at most 40)' }, 400);
-    const dspAuth = lnurlpAuthCheck(dsp, 'lnurl-display', dspPk, lnurlpDisplayRecordId(dspName, dspText));
+    // 0.125.0: the shop's currency rides the same signed filing — when the field is present the record the proof covers
+    // is "<the display record>:<CODE>" (an older page sends no currency and signs the display record alone, as before).
+    const dspCurRaw = (dsp && typeof dsp.currency === 'string') ? dsp.currency : null;
+    if (dspCurRaw !== null && dspCurRaw !== '' && (!/^[A-Z]{3}$/.test(dspCurRaw) || registerQuote.currencyDecimals(dspCurRaw) === null)) return jsonResponse(res, { ok: false, error: 'currency must be three capital letters this provider knows' }, 400);
+    const dspAuth = lnurlpAuthCheck(dsp, 'lnurl-display', dspPk, lnurlpDisplayRecordId(dspName, dspText) + (dspCurRaw !== null ? ':' + dspCurRaw : ''));
     if (!dspAuth.ok) {
       console.warn(`[LNURLP] display for ${dspName} by ${dspPk.slice(0, 16)}… refused: ${dspAuth.code}`);
       return jsonResponse(res, { ok: false, error: 'auth: ' + dspAuth.code }, dspAuth.status);
@@ -7466,9 +7751,10 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!dspRec) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
     if (dspRec.client_pubkey.toLowerCase() !== dspPk) return jsonResponse(res, { ok: false, error: 'pubkey mismatch' }, 403);
     if (dspText) dspRec.display = dspText; else delete dspRec.display;
+    if (dspCurRaw !== null) { if (dspCurRaw) dspRec.currency = dspCurRaw; else delete dspRec.currency; }   // 0.125.0
     lnurlpPersist();
-    console.log(`[LNURLP] display: ${dspName} ${dspText ? 'now reads \u201c' + dspText + '\u201d' : 'cleared'} (owner ${dspPk.slice(0, 16)}…)`);
-    return jsonResponse(res, { ok: true, name: dspName, display: dspText || null });
+    console.log(`[LNURLP] display: ${dspName} ${dspText ? 'now reads \u201c' + dspText + '\u201d' : 'cleared'}${dspCurRaw !== null ? ' \u00b7 Register currency ' + (dspCurRaw || 'cleared') : ''} (owner ${dspPk.slice(0, 16)}…)`);
+    return jsonResponse(res, { ok: true, name: dspName, display: dspText || null, currency: dspRec.currency || null, register: true });
   }
 
   if (method === 'POST' && path === '/lnurl/release') {
@@ -8238,7 +8524,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       if (lndResp && !Array.isArray(lndResp.routes) && /unable to find a path|no path|no route/i.test(String(lndResp.message || (lndResp.error && lndResp.error.message) || ''))) {
         const lmsg = String(lndResp.message || (lndResp.error && lndResp.error.message) || '').slice(0, 200);
         console.log(`[Phase10b] route answer: none (${lmsg})`);
-        return jsonResponse(res, { ok: false, error: 'no_route', routes: [], lnd_error: lmsg }, 200);
+        return jsonResponse(res, { ok: false, error: 'no_route', routes: [], lnd_error: lmsg, parts_sats: Array.isArray(lndResp.lijox_parts_sats) ? lndResp.lijox_parts_sats : undefined }, 200);   // 0.127.1: parts_sats
       }
       // v0.12: attach our own outgoing-channel policy for the first hop so the
       // wallet can correctly compute the LSP self-hop fee. Without this the

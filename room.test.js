@@ -19,7 +19,7 @@ check(room({ local_balance: '500' }) === 0n, 'never below zero');
 check(room({ local_balance: '100000', commit_fee: '0', fee_per_kw: '0' }) === (100000n - 1000n) * 1000n, 'no reserve/fee fields → balance less the margin');
 // the readers
 check(/if \(!chan \|\| chan\.room_msat < amt\)/.test(src), 'deliverToWallet decides JIT on room_msat');
-check(/const room = chan \? chan\.room_msat : 0n;/.test(src), 'walletReceivable answers with room_msat');
+check(/: \(chan \? chan\.room_msat : 0n\);/.test(src) && /deliverParts\.totalRoomMsat\(chans\)/.test(src), 'walletReceivable answers with room_msat (0.127.0: the channels together when the parts fit)');
 check(/chan && chan\.room_msat > 1000n/.test(src), 'lnurlpMinMsat reads room_msat');
 check(!/chan\.local_msat < amt \+ 50000n/.test(src) && !/chan\.local_msat >= amt \+ 50000n/.test(src), 'no reader adds 50 sats to local_balance any more');
 const dsrc = fs.readFileSync(require('path').join(__dirname, 'delegate.js'), 'utf8');

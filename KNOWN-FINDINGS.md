@@ -52,6 +52,116 @@ before, and `/health` and `get_info` say `jit_funding_hold.key_ok: false`.
 **Not changed.** The forward itself, the fee law, the promise clock, the offline hold, the Terminus channel type (the same
 parser arm serves both open calls — fork rpcserver.go 2327–2341), the funding fee (1 sat/vB, as the old open).
 
+## 2026-11-10 — Register amount sharing: the agreed rate on a shop's static QR (0.125.0)
+
+**What it is for.** A shop runs the wallet's Register mode beside its own register. The customer types the register's
+total in the shop's currency; the figure on the shop's screen must be the figure the customer typed. Until now two
+wallets converted at two rates at two times, and the Register valued the payment at a third.
+
+**What this adapter now does** (`register-quote.js`; the design is the wallet repo's docs/register-mode-plan-v2.md and
+-v2.1.md):
+- **The Register answer.** A first call with the flag `?register` (the shop's Register QR; a `name@host` lookup never adds
+  it) answers with the shop's business name as the payee line, the shop's currency and rate in LNURL PR #251's shape
+  (`currencies`: code, name, symbol, decimals, `multiplier` = msats per smallest unit, three decimals) with
+  `quote.expires`, and a callback address that carries a **rate stamp** in its path: `/lnurl/cb/<name>/r/<stamp>`.
+- **The plain answer hides the business name again.** A lookup without the flag gets "Pay <name> — Lightning in a Jar",
+  as before 0.119.1. The business name reaches a payor only through the Register QR.
+- **The stamp** is this provider's own text — name, currency, multiplier, decimals, expiry, a random id — under an
+  HMAC-SHA256 with a key kept in `DATA_DIR/register-stamp.key` (made at first use, mode 0600). Ten minutes unused; one
+  use. It says nothing about the payor.
+- **The stamped callback** makes the invoice for exactly the msats sent, with a 10-minute life (a plain one keeps 20),
+  and writes on the entry "this invoice, these msats, at this rate" plus the figure in the shop's currency by the one
+  rounding rule (round half up, both ways). It also accepts PR #251's `amount=<smallest units>.<CODE>`.
+- **Never a refusal over the stamp.** Unreadable, changed, made for another name, past its ten minutes, already used with
+  another amount or on an invoice already paid → the request is a plain one (no rate recorded), and the journal says why.
+  The same stamp with the same msats while its invoice is still unpaid returns the same invoice (a wallet asking again
+  after a lost answer).
+- **The shop's currency** is filed by the shop's wallet with its name (`POST /lnurl/display`, the new `currency` field;
+  the proof then covers `<the display record>:<CODE>`). No currency filed, or no rate held for it → the Register answer
+  carries the name alone and the placeholder stamp `-`.
+- **The Register's reads**, token-gated and owner-only under the node key's proof: `GET /lnurl/register/open` (the
+  invoices asked for at an agreed rate and not yet settled, in the order asked) and the `register` record on
+  `GET /lnurl/note/<hash>`.
+
+**What a payor's wallet needs.** Nothing: the stamp rides the callback address every wallet calls back unchanged. A
+wallet that reads `currencies` can show the shop's currency and convert with the multiplier.
+
+**0.125.1.** `GET /lnurl/note/<hash>` (owner-only, as before) also answers `invoice_msat`, `delivered_msat` and
+`fee_kept_msat` for any payment to the name — the Register shows a provider fee on its own line for a plain payment too.
+
+**0.126.0.** The channel state file's holder (`peer-storage.js`; `POST /v1/peer-storage/put | meta | get`). A wallet
+keeps one encrypted file here, 65,531 bytes at most — the size and the rule of BOLT #1110 peer storage (bytes the holder
+cannot read, the latest only, given back to its owner), carried over HTTPS because LND has no peer storage messages in
+any release. Known limits: (1) the holder is the wallet's channel partner — the one party that gains from handing back
+an old file; the wallet does not trust it for freshness and checks a restored state against its Black start kit, held
+by parties that do not gain. (2) Any node key that proves itself is held for, up to 20,000 wallets; a key costs nothing
+to make, so the cap can be filled by someone who wants to — a full holder refuses new wallets and keeps serving the
+ones it holds. (3) A lower number is refused, but the number is the wallet's own clock: a wallet whose clock was far
+ahead once cannot store again until real time passes that number or the operator removes its two files in
+`DATA_DIR/peer-storage/`. (4) Each request costs one LND `verifymessage`; the limits are 600 an hour per address and
+300 an hour per key (`PEER_STORAGE_IP_PER_HOUR`, `PEER_STORAGE_KEY_PER_HOUR`).
+
+**0.127.0.** A delivery in parts (`deliver-parts.js`; `deliverInParts` in `lij-adapter.js`). Found in the field
+2026-11-11: a wallet with two channels and over 500,000 sats of room in total could not be paid 420,000 sats to its
+Lightning address by another wallet on the same provider. `deliverToWallet` sent one HTLC over the one channel with the
+most room, and an amount above that room went to a new channel open whatever the other channels held. Now the channels
+are read together: when they have the room, each takes a part (the most room first), all parts under the one hash, and
+nothing is opened; `walletReceivable` answers the same way, so no opening fee is quoted for an amount the parts carry.
+Known limits: (1) proven only against stand-ins in `deliver-parts.test.js` — LND's handling of several `SendToRoute`
+calls for one hash is read from its source, and the first field run is the proof; (2) every channel taking a part must
+be active, otherwise the delivery waits for the next sweep; (3) if one part fails, the others wait in the wallet until
+its own timeout for an incomplete payment, and the delivery is tried again after that; (4) a wallet paying an INVOICE
+of another wallet on this provider still asks for one route for the whole amount — that send is not split to fit the
+receiving wallet's channels (the wallet's engine decides the split from its own channels only).
+
+**0.127.1.** Two things from the UM890's journal of 2026-11-11 05:56 (a 410,000-sat address payment to a wallet whose
+two channels had 269,029 sats of room at most). (1) THE CHANNEL AN OPEN DELIVERS OVER. `deliverToWallet` opened a new
+channel and then waited for "a channel" only while it had none in hand — a wallet that already had a channel kept the
+old one, so the payment went into the channel without the room (LND: `TEMPORARY_CHANNEL_FAILURE` on our own link),
+the new channel was abandoned unused, the guard filed the failure under the OLD channel's funding point, and after two
+tries the wallet was blocked from JIT opens for 24 hours; the next payment was then refused at once. The delivery now
+goes over the channel that call opened, found by its funding point. Every delivery-rail open for a wallet that already
+had a channel was exposed to this; a wallet with no channel was not. A wallet blocked this way is released from the
+Console. (2) `parts_sats` in the route answer: a request for a wallet on this provider that no one channel can carry
+but its active channels together can is still answered `no_route`, now with the part sizes that fit; a wallet engine
+that knows the field can send the payment in those parts (no engine reads it yet).
+
+**0.127.2.** No change to what the adapter does: one comment line in `deliver-parts.js` reworded before the public
+release. A box on 0.127.1 runs the same code.
+
+**Order of the rides.** This adapter can ride before the wallet page that uses it: older pages never send the flag and
+never file a currency. One visible change at the ride: a plain address lookup stops showing the business name.
+
+**Not changed.** The hash pool, the hold, the hand-on to the payee, the fees, the range check (it still applies to
+every request), the 20-minute life of a plain invoice.
+
+## 2026-11-10 — the funding fee in LND's own unit, and three smaller things (0.124.2)
+
+**How it was found.** Every journal of a held open since 0.124.1 read `funding fee 2 sat/vB (LND's 144-block estimate 1.0
+sat/vB)`. LND's estimate on a quiet day is its own floor, 253 sat/kw — 1.012 sat/vB. 0.124.1 turned the estimate into
+sat/vB and rounded UP to a whole number, so 1.012 became 2: every JIT funding paid about twice the rate it was meant to.
+
+**Now.** The rate is kept in sat/kw from LND's answer to LND's call, with no rounding (1 sat/vB = 250 sat/kw):
+- **the held open** hands it to `FundPsbt` as `sat_per_kw` (field 11 of FundPsbtRequest at v0.20.1-beta) — exact;
+- **the publish-first open** (`OpenChannelSync`) takes whole sat/vB only (`sat_per_vbyte`, field 1 of
+  OpenChannelRequest), so it takes the NEAREST whole sat/vB to the same number (1.012 → 1; 1.6 → 2);
+- the floor and cap dials stay in sat/vB (`LSPS2_FUNDING_FEE_MIN_SAT_PER_VB`, `_MAX_SAT_PER_VB`); the rate is never
+  below LND's own relay floor of 253 sat/kw, which LND would refuse.
+The journal line names the unit: `funding fee 253 sat/kw = 1.01 sat/vB, given to LND in sat/kw (…)`.
+
+**A journal line when "paid" is written.** `[JIT-HOLD] PAID written for <funding> (was held) — on disk before the payer is
+settled; the publish follows`. The code always wrote `paid` before the settle and published after; nothing in the journal
+showed that order.
+
+**Refused opens are off the fee ladder.** A JIT open was counted on the wallet's open fee ladder at the open. A held open
+that ended with its funding never published (abandoned on the wallet's refusal, or cancelled) is not an open the wallet
+got; its stamp now comes off that wallet's ladder — exactly the stamp that open wrote (`ladder_ts` on the held record),
+once (`ladder_off`). A record revived to a real channel goes back on. The publish-first open is unchanged: its funding
+is public the moment it opens.
+
+**Not changed.** The dials' names and defaults; the 144-block target; the sweep; the key (no new URI — `FundPsbt` was
+already in it).
+
 ## 2026-11-05 — the review's fixes (0.124.1): the timeout trap, the fail-closed abandon, the polled fee
 
 **How it was found.** Before 0.124.0 rode, an independent review (fresh eyes; it read the adapter, the engine and LND

@@ -36,7 +36,7 @@ const TXID = btc.txid(unsignedTx());
 const CP = TXID + ':0';
 
 function standIn(overrides) {
-  const calls = { fund: [], finalize: [], step: [], release: [], publish: [], abandon: [], told: [], estimate: [] };
+  const calls = { fund: [], finalize: [], step: [], release: [], publish: [], abandon: [], told: [], estimate: [], log: [], undone: [], restored: [] };
   let chans = [];
   let pendingOpen = [];
   let peers = [{ pub_key: CLIENT, last_flap_ns: '0' }];
@@ -62,7 +62,7 @@ function standIn(overrides) {
     listChannels: async () => chans,
     pendingChannels: async () => ({ pending_open_channels: pendingOpen.map((cp) => ({ channel: { channel_point: cp } })) }),
     listPeers: async () => peers,
-    estimateFeeSatVb: async (target) => { calls.estimate.push(target); return estimate; },
+    estimateFeeSatKw: async (target) => { calls.estimate.push(target); return estimate == null ? null : estimate * 250; },   // 0.124.2: LND's own unit; the stand-in's `estimate` stays in sat/vB for reading
     peerFeatures: async () => new Set(['257', FEATURE_BIT]),
     txConfirmations: async () => confs,
     probe: async () => [],
@@ -70,7 +70,7 @@ function standIn(overrides) {
   Object.assign(lnd, overrides || {}); delete lnd.__settings;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jitf-'));
   let now = 1_800_000_000_000;
-  const jf = createJitFunding({ dataDir: dir, log: () => {}, now: () => now, lnd, tellWallet: async (c, txid, vout) => { calls.told.push([c, txid, vout]); return true; }, settings: Object.assign({ enabled: true, lock_seconds: 172800, open_timeout_ms: 5000, abandon_grace_ms: 0, fee: { target_conf: 144, min_sat_per_vb: 1, max_sat_per_vb: 0 } }, (overrides && overrides.__settings) || {}) });
+  const jf = createJitFunding({ dataDir: dir, log: (m) => { calls.log.push(String(m)); }, now: () => now, lnd, onOpenUndone: (r) => { calls.undone.push([r.client, r.ladder_ts, r.state]); }, onOpenRestored: (r) => { calls.restored.push([r.client, r.ladder_ts, r.state]); }, tellWallet: async (c, txid, vout) => { calls.told.push([c, txid, vout]); return true; }, settings: Object.assign({ enabled: true, lock_seconds: 172800, open_timeout_ms: 5000, abandon_grace_ms: 0, fee: { target_conf: 144, min_sat_per_vb: 1, max_sat_per_vb: 0 } }, (overrides && overrides.__settings) || {}) });
   return { jf, lnd, calls, dir, setChans: (c) => { chans = c; }, setPending: (c) => { pendingOpen = c; }, setPeers: (p) => { peers = p; }, setEstimate: (e) => { estimate = e; }, setConfs: (c) => { confs = c; }, setLeases: (l) => { leases = l; }, tick: (ms) => { now += ms; }, file: () => JSON.parse(fs.readFileSync(path.join(dir, 'jit-held-funding.json'), 'utf8')) };
 }
 const commonParams = () => ({ node_pubkey: Buffer.from(CLIENT, 'hex'), local_funding_amount: SIZE, private: true, zero_conf: true, scid_alias: true, commitment_type: 'STATIC_REMOTE_KEY' });
@@ -154,14 +154,14 @@ t('h1 the happy path: funded → held → paid → published → confirmed; the 
   const r = await S.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams(), rail: 'lsps2', tag: 'T' });
   assert.strictEqual(r.cp, CP);
   assert.strictEqual(S.calls.fund.length, 1);
-  assert.strictEqual(S.calls.fund[0].sat_per_vbyte, '3', 'LND\'s 2.6 sat/vB estimate, rounded up'); assert.deepStrictEqual(S.calls.estimate, [144]); assert.strictEqual(S.calls.fund[0].min_confs, 1); assert.strictEqual(S.calls.fund[0].lock_expiration_seconds, '172800');
+  assert.strictEqual(S.calls.fund[0].sat_per_kw, '650', 'LND\'s 650 sat/kw (2.6 sat/vB) estimate, handed back in sat/kw, not rounded'); assert.strictEqual(S.calls.fund[0].sat_per_vbyte, undefined, 'no whole sat/vB on the held open (0.124.2)'); assert.deepStrictEqual(S.calls.estimate, [144]); assert.strictEqual(S.calls.fund[0].min_confs, 1); assert.strictEqual(S.calls.fund[0].lock_expiration_seconds, '172800');
   assert.strictEqual(Buffer.from(S.calls.fund[0].custom_lock_id, 'base64').length, 32);
   assert.strictEqual(S.calls.finalize.length, 1);
   assert.strictEqual(S.calls.step.length, 1); assert.strictEqual(S.calls.step[0].psbt_verify.skip_finalize, true); assert.ok(S.calls.step[0].psbt_verify.funded_psbt);
   const f = S.file().records[CP];
   assert.strictEqual(f.state, 'held'); assert.strictEqual(f.client, CLIENT); assert.strictEqual(f.txid, TXID); assert.strictEqual(f.vout, 0);
   assert.strictEqual(f.funding_tx_hex, btc.serialize(finalTx(), true).toString('hex'), 'the signed bytes are on disk');
-  assert.strictEqual(f.fee_sat_per_vb, 3); assert.ok(f.verify_sent_at > 0, 'the verify stamp');
+  assert.strictEqual(f.fee_sat_per_vb, 2.6); assert.strictEqual(f.fee_sat_per_kw, 650); assert.ok(f.verify_sent_at > 0, 'the verify stamp');
   assert.ok(fs.existsSync(path.join(S.dir, 'jit-held-funding.d', TXID + '-0.json')), 'a copy per record');
   assert.strictEqual(Object.keys(S.file().records).filter((k) => k.startsWith('pre:')).length, 0, 'the pre-fund record is gone once the funded one exists');
   assert.deepStrictEqual(f.inputs, [{ txid: inputTxid, vout: 3 }]);
@@ -439,11 +439,55 @@ t('fee the polled rate (DP 00:01): LND\'s estimate for the target, rounded up, f
   const S2 = standIn({ __settings: { fee: { target_conf: 6, min_sat_per_vb: 2, max_sat_per_vb: 10 } } });
   S2.setEstimate(1.2); assert.strictEqual((await S2.jf.feeRate()).rate, 2, 'floor 2');
   S2.setEstimate(48); assert.strictEqual((await S2.jf.feeRate()).rate, 10, 'cap 10');
-  S2.setEstimate(7.01); assert.strictEqual((await S2.jf.feeRate()).rate, 8);
+  S2.setEstimate(7.01); { const q = await S2.jf.feeRate(); assert.strictEqual(q.kw, 1753, '7.01 sat/vB = 1752.5 sat/kw, up to the whole sat/kw'); assert.strictEqual(q.rate, 7, 'the NEAREST whole sat/vB (0.124.2; 0.124.1 rounded up to 8)'); }
   await S2.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams() });
-  assert.deepStrictEqual(S2.calls.estimate, [6, 6, 6, 6], 'the target asked of LND each time'); assert.strictEqual(S2.calls.fund[0].sat_per_vbyte, '8');
+  assert.deepStrictEqual(S2.calls.estimate, [6, 6, 6, 6], 'the target asked of LND each time'); assert.strictEqual(S2.calls.fund[0].sat_per_kw, '1753');
   assert.deepStrictEqual(S2.jf.snapshot().fee, { target_conf: 6, min_sat_per_vb: 2, max_sat_per_vb: 10 });
-  const S3 = standIn({ estimateFeeSatVb: async () => { throw new Error('no estimator'); } }); assert.strictEqual((await S3.jf.feeRate()).rate, 1);
+  const S3 = standIn({ estimateFeeSatKw: async () => { throw new Error('no estimator'); } }); { const q = await S3.jf.feeRate(); assert.strictEqual(q.rate, 1); assert.strictEqual(q.kw, 253, 'no estimate → LND\'s own floor, 253 sat/kw'); }
+});
+
+t('fee2 (0.124.2, DP 2026-11-10 — the 11-05 finding): LND\'s floor estimate of 253 sat/kw goes to FundPsbt as 253 sat/kw, never as 2 sat/vB; the publish-first rate is the nearest whole sat/vB; an adapter that only has the sat/vB poll still works', async () => {
+  const S = standIn(); S.setEstimate(253 / 250);
+  const q = await S.jf.feeRate();
+  assert.strictEqual(q.kw, 253); assert.strictEqual(q.rate, 1, '1.012 sat/vB → 1 (0.124.1 gave 2)'); assert.ok(Math.abs(q.vb - 1.012) < 1e-9);
+  await S.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams() });
+  assert.strictEqual(S.calls.fund[0].sat_per_kw, '253'); assert.strictEqual(S.calls.fund[0].sat_per_vbyte, undefined); assert.strictEqual(S.calls.fund[0].target_conf, undefined, 'one fee field only — LND\'s oneof');
+  assert.ok(S.calls.log.some((m) => /funding fee 253 sat\/kw = 1\.01 sat\/vB, given to LND in sat\/kw/.test(m)), 'the journal names the unit');
+  const N = standIn();
+  N.setEstimate(374 / 250); assert.strictEqual((await N.jf.feeRate()).rate, 1, '1.496 → 1');
+  N.setEstimate(376 / 250); assert.strictEqual((await N.jf.feeRate()).rate, 2, '1.504 → 2');
+  N.setEstimate(100 / 250); { const z = await N.jf.feeRate(); assert.strictEqual(z.kw, 253, 'an estimate under LND\'s floor is lifted to 253 sat/kw'); assert.strictEqual(z.rate, 1); }
+  const O = standIn({ estimateFeeSatKw: undefined, estimateFeeSatVb: async () => 2.6 }); { const z = await O.jf.feeRate(); assert.strictEqual(z.kw, 650); assert.strictEqual(z.rate, 3, '2.6 → 3, the nearest'); }
+});
+
+t('p1 (0.124.2): a journal line when "paid" is written — before any publish', async () => {
+  const S = standIn();
+  await S.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams() });
+  const before = S.calls.publish.length;
+  assert.ok(S.jf.markPaid(CP));
+  const i = S.calls.log.findIndex((m) => /\[JIT-HOLD\] PAID written for .* \(was held\) — on disk before the payer is settled; the publish follows/.test(m));
+  assert.ok(i >= 0, 'the line is in the journal'); assert.strictEqual(S.calls.publish.length, before, 'nothing was published by markPaid itself'); assert.strictEqual(S.file().records[CP].state, 'paid', 'and the record on disk says paid');
+  assert.strictEqual(S.jf.markPaid(CP), null); assert.strictEqual(S.calls.log.filter((m) => /PAID written/.test(m)).length, 1, 'written once');
+});
+
+t('l1 (0.124.2, "keep refused opens off the fee ladder"): a held open the caller counted comes off the ladder once when it ends abandoned; an open it never counted is left alone; a revived record goes back on', async () => {
+  const S = standIn();
+  await S.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams() });
+  assert.strictEqual(S.jf.noteLadder(CP, 1_799_999_999_123), true);
+  S.setChans([{ channel_point: CP, remote_balance: '0', pending_htlcs: [] }]);
+  const a = await S.jf.abandon(CP, 'the wallet refused'); assert.strictEqual(a.ok, true);
+  assert.deepStrictEqual(S.calls.undone, [[CLIENT, 1_799_999_999_123, 'abandoned']], 'taken off, with the exact stamp');
+  assert.strictEqual(S.file().records[CP].ladder_off, true);
+  await S.jf.sweep(true); await S.jf.sweep(true);
+  assert.strictEqual(S.calls.undone.length, 1, 'once only');
+  S.setChans([{ channel_point: CP, remote_balance: '0', pending_htlcs: [] }]);   // LND lists it after all: the revive backstop
+  await S.jf.sweep(true);
+  if (S.file().records[CP].state === 'held') assert.deepStrictEqual(S.calls.restored, [[CLIENT, 1_799_999_999_123, 'held']], 'revived → back on the ladder');
+  const U = standIn();
+  await U.jf.open({ client: CLIENT, sizeSats: SIZE, params: commonParams() });
+  U.setChans([{ channel_point: CP, remote_balance: '0', pending_htlcs: [] }]);
+  await U.jf.abandon(CP, 'the wallet refused');
+  assert.deepStrictEqual(U.calls.undone, [], 'an open nobody counted is not taken off');
 });
 
 t('a1 the adapter\'s call sites (findings 13, 17, 2; the fee): \'paid\' before the late SETTLE; the delivery rail publishes only the channel the payment went over; the pickers and the interceptor refuse a channel being abandoned; both opens on the polled fee', () => {
