@@ -602,6 +602,7 @@ const TAPES_DIR = require('path').join(DATA_DIR, 'tapes');
 const kitHolder = createKitHolder({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 // 0.126.0 (S68): the channel state file's holder — BOLT #1110's file (65,531 bytes at most) carried over HTTPS. See peer-storage.js.
 const { createPeerStorage, signedText: peerStorageSignedText, sha256hex: peerStorageSha, FILE_MAX: PEER_STORAGE_FILE_MAX } = require('./peer-storage');
+const receiveWords = require('./receive-words');   // 0.127.4: the address rail's refusal before an invoice is made
 const deliverParts = require('./deliver-parts');   // 0.127.0: a delivery in parts over the wallet's channels
 const peerStorage = createPeerStorage({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 // 0.109.0: the Black start page (recover/index.html beside this file), read once; absent = the route answers 404 and the console's health says so
@@ -7460,6 +7461,16 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     const minMsat = BigInt(lnurlpMinMsat(chan, rec.client_pubkey));   // v0.31.0/v0.32.0: same helper as the quote
     if (amt < minMsat || amt > BigInt(CONFIG.lsps2.variable_ceiling_msat)) {
       return jsonResponse(res, { status: 'ERROR', reason: 'amount out of range' }, 400);
+    }
+    // 0.127.4: receivability first (see receive-words.js) — a payment this wallet cannot be delivered is refused HERE,
+    // with its reason, before a hash is used and before the payer sends anything. No answer about the room → as before.
+    {
+      let _rcv = null; try { _rcv = await walletReceivable(rec.client_pubkey, amt); } catch (_) { _rcv = null; }
+      const _rw = receiveWords.refusal(_rcv, { halted: jitGuard.halted(), blocked: jitGuard.walletBlocked(rec.client_pubkey) });
+      if (_rw) {
+        console.log(`[LNURLP] ${name}: ${amt} msat refused before minting — ${_rw}`);
+        return jsonResponse(res, { status: 'ERROR', reason: _rw }, 400);
+      }
     }
     // 0.67.0: never mint an expired hash (the wallet's engine would refuse
     // it); retire what we pass over so the pool count tells the truth.

@@ -3,14 +3,16 @@
 Makes your Umbrel's LND a LIJOX Lightning service provider: wallets that speak the LIJOX standard (LiJ and others)
 open channels with it, receive while offline, and keep their Black start kits with it.
 
-**Status: first release. Steps 1–9 were run on a Raspberry Pi Umbrel on 2026-11-11, and a LiJ wallet then received
-into a new channel there (private, static remote key, zero-conf); not yet run on a PC.** Do it with the publisher on a call.
+**Status: second release. Steps 1–9 were run on a Raspberry Pi Umbrel on 2026-11-11 with LND (Terminus) 0.21.6; on
+2026-11-12 the same Pi took the 0.21.8 image below (over the 0.21.6 one), a LiJ wallet received into a new channel there
+(private, static remote key, zero-conf) and paid out over it. Not yet run on a PC.** Do it with the publisher on a call.
 
 ## Before you start
 
-1. **LND (Terminus)**, not the Lightning app's stock LND. It is LND 0.21.6 with one patch that opens the channels
-   LIJOX wallets ask for (zero-conf, no anchors): [the patch, 62 lines](https://github.com/dav1dpgit/lnd/compare/v0.21.6-beta...a88c1872c).
-   It keeps your data and your channels. Your Lightning app must be on LND 0.21.6 first.
+1. **LND (Terminus)**, not the Lightning app's stock LND. It is LND 0.21.8 with one patch that opens the channels
+   LIJOX wallets ask for (zero-conf, no anchors): [the patch, 62 lines](https://github.com/dav1dpgit/lnd/commit/cf8f0d2cbdf380e038f180aa9adb5c4377f95f83).
+   It keeps your data and your channels. Your Lightning app must be on LND 0.21.6 first. 0.21.8 does not change LND's
+   database, so going back to the app's stock 0.21.6 stays possible.
 2. **Bitcoin on-chain in LND's wallet**, plus public channels with room to send out.
 3. **A way in.** LiJ is a web wallet, so the adapter needs a public `https://` and `wss://` address. With Cloudflare:
    a tunnel with two public names — one to `http://localhost:7000`, one to `http://localhost:7001`.
@@ -23,7 +25,7 @@ grep -n "lnd:" ~/umbrel/app-data/lightning/docker-compose.yml
 ```
 2. Pull the image.
 ```
-sudo docker pull ghcr.io/dav1dpgit/lnd-terminus:v0.21.6-beta@sha256:3345bd541bc71e08de8369ae7eb9055321de45e26ff682bb9da4b83a83725f2e
+sudo docker pull ghcr.io/dav1dpgit/lnd-terminus:v0.21.8-beta@sha256:467e29656f9133dc196c87bcbcdd4c555bb00485063a58037c3de0f0ce904df3
 ```
 3. Stop the Lightning app.
 ```
@@ -35,7 +37,7 @@ sudo cp -p ~/umbrel/app-data/lightning/docker-compose.yml ~/umbrel/app-data/ligh
 ```
 5. Change the LND line.
 ```
-sudo sed -i 's|lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8|ghcr.io/dav1dpgit/lnd-terminus:v0.21.6-beta@sha256:3345bd541bc71e08de8369ae7eb9055321de45e26ff682bb9da4b83a83725f2e|' ~/umbrel/app-data/lightning/docker-compose.yml
+sudo sed -i 's|lightninglabs/lnd:v0.21.6-beta@sha256:54b3c87ad0bc3fea3fab8af23ace6421147ea97e6b56bf3911592d7853c185b8|ghcr.io/dav1dpgit/lnd-terminus:v0.21.8-beta@sha256:467e29656f9133dc196c87bcbcdd4c555bb00485063a58037c3de0f0ce904df3|' ~/umbrel/app-data/lightning/docker-compose.yml
 ```
 6. Check: exactly one line differs.
 ```
@@ -52,7 +54,7 @@ umbreld client apps.restart.mutate --appId lightning
 ```
 umbreld client apps.restart.mutate --appId lightning
 ```
-9. After two minutes, check. `commit_hash` is `64c181d72d51d3d1ca8022a2fc51396bf52f5b62`, and both features are listed.
+9. After two minutes, check. lnd's `version` is `0.21.8-beta` and its `commit_hash` is `f3ed44e71a2d62867570a59ea838187a7bb68676`, and both features are listed.
 ```
 sudo docker exec lightning_lnd_1 lncli version
 ```

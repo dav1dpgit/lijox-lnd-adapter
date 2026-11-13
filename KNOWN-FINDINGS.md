@@ -129,6 +129,14 @@ that knows the field can send the payment in those parts (no engine reads it yet
 **0.127.2.** No change to what the adapter does: one comment line in `deliver-parts.js` reworded before the public
 release. A box on 0.127.1 runs the same code.
 
+**0.127.3.** The Console's JIT guard line (`console.js` `jitGuardLine`). Found in the field 2026-11-12: with one wallet
+blocked from JIT opens after two held-funding opens failed, the Guardrails pane read "none in the last 24 h" and, under
+it, "1 wallet blocked from JIT opens". The first line counts only opens whose funding was PUBLISHED and then failed
+(the figure that arms and halts the guard); held-funding failures and a wallet's own block are counted apart. The line
+now says what it counts — "no JIT open with published funding failed in the last 24 h" — names the held-funding
+failures and the blocked wallets beside it, and is not shown as all clear while either exists. With nothing failed and
+nobody blocked it reads "no failed JIT open in the last 24 h". No change to the guard itself.
+
 **Order of the rides.** This adapter can ride before the wallet page that uses it: older pages never send the flag and
 never file a currency. One visible change at the ride: a plain address lookup stops showing the business name.
 
@@ -717,3 +725,12 @@ code — the in-memory store runs, a known limitation).
   switch Off really means off). `route/build` now takes `ignored_nodes` (the node-first rule), answers `no_route` as a
   plain 200 when LND finds no path (the engine then asks once more avoiding only the refusing channels), and journals
   every answer hop by hop. The console has a Routing reports card. `route-report.test.js` (22 checks).
+
+**0.127.4.** Receivability first on the address rail (`receive-words.js`, the callback in `lij-adapter.js`). Found in
+the field 2026-11-12: 8,000 sats sent to an address whose wallet could receive 7,510; the amount was over the channel's
+room, so delivery needed a new channel, and the amount was under that provider's opening fee. The callback had made the
+invoice anyway; the payer's sats were held, delivery refused, the hold was cancelled, and the payer's wallet said only
+that the recipient declined. The callback now reads `walletReceivable` before it uses a hash, and refuses with an LNURL
+error of at most 140 characters that says what the wallet can receive now and what a new channel costs. It also
+refuses, before minting, a payment that needs an open the JIT guard would refuse. Not covered: a payment that fits when
+the invoice is made and no longer fits when it is paid — that one is still refused at delivery, as before.
