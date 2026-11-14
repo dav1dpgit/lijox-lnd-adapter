@@ -43,13 +43,26 @@ say "ours: $BR $OURS — $NC commits, $NF files"
 # 3 + 4 — ls-remote answers 0 (the branch exists), 2 (the project answers but has no such branch: the first copy) or
 # fails outright (no project at that path, or the token refused); the last two are told apart, since the run's log is not
 # readable from everywhere but its annotations are
-THEIRS=""
+THEIRS=""; REPLACE=0
 set +e; g ls-remote --exit-code --heads "$URL" "$BR" >"$T/remote.txt" 2>"$T/err.txt"; RC=$?; set -e
 if [ "$RC" = 0 ]; then
   THEIRS=$(cut -f1 "$T/remote.txt" | head -1)
   g fetch -q "$URL" "refs/heads/$BR:refs/remotes/gitlab/$BR" 2>"$T/err.txt" || stop "could not fetch GitLab's $BR — $(why "$T/err.txt")"
   if [ "$THEIRS" = "$OURS" ]; then say "GitLab already at $OURS — branch unchanged"; else
-    git merge-base --is-ancestor "$THEIRS" "$OURS" || stop "GitLab's $BR ($THEIRS) is not an ancestor of ours — GitHub's history was rewritten or replaced; GitLab keeps its copy"
+    if ! git merge-base --is-ancestor "$THEIRS" "$OURS"; then
+      # 2026-11-14 (DP "Go on 1&2"): THE ONE-TIME REPLACE, by hand only (the workflow's replace_from input). Allowed only
+      # when GitLab's head is EXACTLY the commit id typed in, and that commit's files are the files of one of our last 20
+      # commits — a commit remade with the same files (its author or message corrected), never different content.
+      # GitLab's own protection must also allow a force push for the run. Anything else: stopped as before.
+      SAME=""
+      if printf '%s' "${REPLACE_FROM:-}" | grep -Eq '^[0-9a-f]{40}$' && [ "$REPLACE_FROM" = "$THEIRS" ]; then
+        TT=$(git rev-parse "$THEIRS^{tree}")
+        for c in $(git rev-list -n 20 "$OURS"); do [ "$(git rev-parse "$c^{tree}")" = "$TT" ] && { SAME="$c"; break; }; done
+      fi
+      [ -n "$SAME" ] || stop "GitLab's $BR ($THEIRS) is not an ancestor of ours — GitHub's history was rewritten or replaced; GitLab keeps its copy"
+      REPLACE=1
+      say "REPLACE, allowed by hand: GitLab's $BR is exactly $THEIRS and its files are those of our $SAME"
+    fi
     TF=$(git ls-tree -r --name-only "$THEIRS" | wc -l)
     [ $((NF * 100)) -ge $((TF * MIN_KEEP_PCT)) ] || stop "ours has $NF files, GitLab's $TF — more than $((100 - MIN_KEEP_PCT)) % would disappear"
     say "GitLab: $THEIRS ($TF files) → a fast-forward of $(git rev-list --count "$THEIRS..$OURS") commit(s)"
@@ -62,12 +75,25 @@ else
   stop "GitLab did not answer for $URL — no public project at that path (set the repository variable GITLAB_PROJECT to the real path) or a bad token: $(why "$T/err.txt") / without the token: $(why "$T/anon.txt")"
 fi
 # the push — plain, no force
-if [ "$THEIRS" != "$OURS" ]; then g push "$URL" "$OURS:refs/heads/$BR" 2>"$T/push.txt" || stop "the push of $BR to $URL failed: $(why "$T/push.txt")"; cat "$T/push.txt"; fi
+if [ "$THEIRS" != "$OURS" ] && [ "$REPLACE" = 1 ]; then
+  g push --force-with-lease="refs/heads/$BR:$THEIRS" "$URL" "$OURS:refs/heads/$BR" 2>"$T/push.txt" || stop "the replace of $BR on $URL failed (GitLab's protected branch must allow a force push for this one run): $(why "$T/push.txt")"; cat "$T/push.txt"
+elif [ "$THEIRS" != "$OURS" ]; then g push "$URL" "$OURS:refs/heads/$BR" 2>"$T/push.txt" || stop "the push of $BR to $URL failed: $(why "$T/push.txt")"; cat "$T/push.txt"; fi
 # tags GitLab lacks, one by one, never moved
-g ls-remote --tags "$URL" 2>"$T/err.txt" | awk '{print $2}' | sed 's#refs/tags/##; s#\^{}##' | sort -u > "$T/tags.txt" || stop "could not list GitLab's tags: $(why "$T/err.txt")"
+g ls-remote --tags "$URL" >"$T/tagraw.txt" 2>"$T/err.txt" || stop "could not list GitLab's tags: $(why "$T/err.txt")"
+awk '{print $2}' "$T/tagraw.txt" | sed 's#refs/tags/##; s#\^{}##' | sort -u > "$T/tags.txt"
 NEW=0
 for t in $(git tag --list); do
-  grep -qx "$t" "$T/tags.txt" && continue
+  if grep -qx "$t" "$T/tags.txt"; then
+    # in a REPLACE run only: a tag GitLab holds on the replaced commit moves to where ours points
+    if [ "$REPLACE" = 1 ]; then
+      GT=$(awk -v a="refs/tags/$t^{}" -v b="refs/tags/$t" '$2==a{p=$1} $2==b{l=$1} END{print (p!=""?p:l)}' "$T/tagraw.txt")
+      if [ "$GT" = "$THEIRS" ] && [ "$(git rev-parse "$t^{commit}")" != "$GT" ]; then
+        g push --force "$URL" "refs/tags/$t:refs/tags/$t" 2>"$T/push.txt" || stop "the move of tag $t failed (delete the tag on GitLab by hand, then run again): $(why "$T/push.txt")"
+        say "tag $t moved off the replaced commit"
+      fi
+    fi
+    continue
+  fi
   g push "$URL" "refs/tags/$t:refs/tags/$t" 2>"$T/push.txt" || stop "the push of tag $t failed: $(why "$T/push.txt")"
   NEW=$((NEW + 1))
 done

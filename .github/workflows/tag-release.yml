@@ -12,6 +12,7 @@ on:
       - docs/releases.md
       - lij-pwa/frontend/wallet/index.html
       - .github/workflows/tag-release.yml
+  workflow_dispatch: {}   # a run by hand (2026-11-14): makes the tag on main's head when the tag is missing; a tag that exists is left as it is
 permissions:
   contents: write
 concurrency:
