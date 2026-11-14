@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.127.4, 2026-11-12). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.129.1, 2026-11-14). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.127.4         # the newest tag — the last row of RELEASES.md
+       git checkout v0.129.1         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -221,6 +221,34 @@ held `version` and `state_fp`; `POST /v1/peer-storage/get` hands the file back. 
 `nonce` from `GET /lsps/registry/challenge` and the node key's signature over `lij-peer-storage-v1:<action>:<nonce>`
 (a put adds `:<version>:<sha256 of the file>`). The holder cannot read the file. It is held for any wallet that proves
 its key, not only this provider's own. See `peer-storage.js` and KNOWN-FINDINGS 0.126.0.
+
+**The tower (0.128.0, off unless `TOWER_ENABLED=true`).** The provider keeps a wallet's encrypted penalty transactions
+and reads every block for the old channel states they answer. `POST /v1/tower/put` takes `{ key, group, ts, signature,
+items: [{ hint, blob }] }`: `hint` is the first 16 bytes of the old state's transaction id (as the chain stores it),
+`blob` is the penalty transaction encrypted under SHA-256 of that whole id (ChaCha20-Poly1305, a zero nonce — the same
+bytes The Eye of Satoshi keeps). `POST /v1/tower/drop` removes one channel's items; `POST /v1/tower/status` answers the
+count, the bytes used, and whether the box is watching. Each request is signed (BIP-340) by a key the wallet makes for
+this tower alone, over SHA-256 of `lijox-tower-v1|<action>|<key>|<group>|<ts>` (a put adds `|<sha256 of the items>`);
+`ts` must be within ten minutes. The box cannot read an item until the old state it answers is in a block; then it
+opens it, checks that it spends that transaction and nothing else, and publishes it through LND — the one paying the
+higher fee first, again on every new block for 144 blocks. The blocks come from LND's ChainKit (`GetBestBlock`,
+`GetBlockHash`, `GetBlock`), so the key must carry those three reads (MACAROON.md); a box whose key cannot read a block
+keeps nothing and says so on `/health` (`tower.offered: false`). 5 MB a wallet key (`TOWER_QUOTA_BYTES`); a key silent
+for 400 days is dropped (`TOWER_KEEP_DAYS`). What it does not do: it answers the main output of an old state, not its
+HTLC outputs. See `tower.js`, `tower-watch.js` and KNOWN-FINDINGS 0.128.0.
+
+**The tower on the registry record, and the joining drill (0.129.0).** A box with the tower turned on says so on its
+registry record: `tower: { offered, quota_bytes, keep_days_silent, form }`, signed with the rest of the record as
+`lijox-register:v5` (lij-worker 0.21.0; a registry that does not know the block gets the record without it).
+`offered` is what the box is doing when it registers — watching or not — and the record is sent again when that
+changes. **The drill** is the one check that proves a tower publishes. It is started by a command on the box —
+`node lij-adapter.js --tower-drill "<the provider's name or node key>"` (0.129.1; the Console shows the drills and
+starts nothing, because a drill spends the box's coins). This
+box funds and signs a small transaction of its own (20,000 sats, `TOWER_DRILL_SATS`) to a one-time script, hands the
+other provider's tower the transaction that spends it back — encrypted under the first one's id, exactly as a wallet
+uploads — and then publishes the first. A tower that works publishes the answer by itself; the drill passes when the
+answer is in a block at most six above the first transaction's. If it is not, this box publishes the answer itself to
+take the coins back and the drill has failed. The cost is the two transactions' fees. See `tower-drill.js`.
 
 **A delivery in parts (0.127.0).** When the provider itself delivers a payment to a wallet (a Lightning address
 payment, a Push Key, a chit) and no one channel to the wallet has the room but its channels together do, the payment

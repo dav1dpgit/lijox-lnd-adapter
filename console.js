@@ -227,6 +227,21 @@ function render(d){
     ]))}
   // 0.124.0 (S67, wallet trusts LSP): THE HELD FUNDINGS — JIT channels whose funding transaction waits on disk until
   // the wallet has claimed; the records with their state, the day's counts, the key probe. Report only.
+  // 0.128.0 (S69): THE TOWER — whether this box keeps wallets' penalty transactions, whether it is watching, what it holds.
+  var tw=d.tower;
+  if(!tw){setPane('tower','<span class="dim">no report</span>')}else if(!tw.enabled){setPane('tower','<span class="dim">off (TOWER_ENABLED is not true) \u2014 this box keeps no penalty transactions for wallets</span>')}else{
+    var th=tw.held||{},ww=tw.watch||{};
+    setPane('tower',kv([
+      ['watching',tw.watching?'<span class="ok">yes</span> \u2014 every '+fmt(tw.poll_s)+' s, last block read '+fmt(ww.last_height):'<span class="bad">NO</span> \u2014 '+esc(tw.why||'')+' <span class="dim">nothing is accepted from wallets until the blocks can be read</span>',1],
+      ['held',fmt(th.items)+' item(s) for '+fmt(th.wallets)+' wallet key(s) \u00b7 '+fmt(th.bytes)+' bytes <span class="dim">'+fmt(tw.quota_bytes)+' bytes a wallet key at most; dropped after '+fmt(tw.keep_days_silent)+' silent days</span>',1],
+      ['old states seen',(ww.matches?'<span class="warn">'+fmt(ww.matches)+'</span>':'0')+' since the start \u00b7 '+fmt(ww.published)+' penalty published \u00b7 '+fmt(ww.penalties_live)+' still being sent again'+(ww.last_error?' \u00b7 <span class="bad">last error: '+esc(ww.last_error)+'</span>':''),1]
+    ])+(function(){
+      // 0.129.0: THE JOINING DRILL \\u2014 this box proves another provider's tower publishes (two on-chain fees; the coins come back)
+      var DS={waiting_t1:'waiting for its first transaction to be in a block',watching:'<span class="warn">watching</span> \\u2014 the tower has six blocks',recovering:'<span class="bad">FAILING</span> \\u2014 no answer from the tower; this box is taking the coins back',passed:'<span class="ok">PASSED</span>',failed:'<span class="bad">FAILED</span>',stuck:'<span class="bad">stuck</span>'};
+      var dr=(tw.drills||[]).slice().reverse(),cs=tw.drill_candidates||[];
+      var rows=dr.length?'<div class="tbl"><table><tr><th>tower</th><th>state</th><th>started</th><th>note</th><th>T1</th><th>answer</th></tr>'+dr.map(function(r){return '<tr><td>'+esc(r.name||'')+' '+idc(r.tower,12)+'</td><td>'+(DS[r.state]||esc(r.state))+'</td><td>'+esc(new Date(r.started_ms).toISOString().slice(0,16).replace('T',' '))+'</td><td>'+esc(r.note||'')+'</td><td>'+idc(r.t1_txid,12)+(r.t1_height?' <span class="dim">'+fmt(r.t1_height)+'</span>':'')+'</td><td>'+idc(r.t2_txid,12)+(r.t2_height?' <span class="dim">'+fmt(r.t2_height)+'</span>':'')+'</td></tr>'}).join('')+'</table></div>':'<span class="dim">no drill has been run from this box</span>';
+      var btns=cs.length?'<span class="dim">could be drilled from this box: </span>'+cs.map(function(c){return esc(c.name||'a provider')+(c.offered?'':' <span class="dim">(its record offers no tower)</span>')}).join(' \\u00b7 '):'<span class="dim">no other provider is listed</span>';
+      return '<div style="margin-top:10px"><b>Joining drill</b> <span class="dim">\\u2014 proves that another provider\\u2019s tower publishes: a small transaction of this box stands in for an old state, the tower is handed the answer and must publish it by itself within six blocks. Costs two on-chain fees; the coins return to this box\\u2019s wallet. Started on the box, never from here: <span class="mono">node lij-adapter.js --tower-drill "name"</span></span></div><div style="margin:6px 0">'+btns+'</div>'+rows})())}
   var jf=d.jit_funding;
   if(!jf){setPane('jitfund','<span class="dim">no report (module not loaded)</span>')}else{
     var STW={funded:'signed, LND not yet told',held:'<span class="warn">HELD</span> \u2014 channel open, funding on disk, waiting for the claim',paid:'<span class="ok">claimed</span> \u2014 publishing',published:'<span class="ok">published</span> \u2014 waiting for a block',confirmed:'<span class="ok">confirmed</span>',abandoned:'<span class="dim">abandoned</span> \u2014 the payment was refused; nothing published, coins released',cancelled:'<span class="dim">cancelled</span> \u2014 the open never finished; coins released',orphan:'<span class="bad">ORPHAN</span> \u2014 the channel left LND without this adapter abandoning it (its lease is kept)',abandoning:'<span class="warn">abandoning</span> \u2014 the refusal is being carried out; nothing routes over it',funding:'the lease is being taken'};
@@ -434,6 +449,7 @@ function pageConsole() {
 <section class="card"><h2>Delegate rail</h2><div id="delegate" class="dim">\u2026</div></section>
 <section class="card"><h2>NWC</h2><div id="nwc" class="dim">\u2026</div></section>
 <section class="card"><h2>Float \u00b7 Lightning pays on-chain</h2><div id="float" class="dim">\u2026</div></section>
+<section class="card"><h2>Tower \u00b7 penalty transactions kept for wallets</h2><div id="tower" class="dim">\u2026</div></section>
 <section class="card"><h2>JIT funding \u00b7 wallet trusts LSP</h2><div id="jitfund" class="dim">\u2026</div></section>
 <section class="card" id="pl"><h2>PL</h2><div class="ctl"><input type="date" id="pldate"><span class="per"><button data-p="day" class="on">Day</button> <button data-p="mtd">MTD</button> <button data-p="ytd">YTD</button> <button data-p="ltd">LTD</button></span></div><div id="plbody" class="dim">\u2026</div></section>
 <section class="card"><h2>Node</h2><div id="node" class="dim">\u2026</div></section>

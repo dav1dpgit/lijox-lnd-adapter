@@ -734,3 +734,54 @@ that the recipient declined. The callback now reads `walletReceivable` before it
 error of at most 140 characters that says what the wallet can receive now and what a new channel costs. It also
 refuses, before minting, a payment that needs an open the JIT guard would refuse. Not covered: a payment that fits when
 the invoice is made and no longer fits when it is paid — that one is still refused at delivery, as before.
+
+**0.128.0.** Two things.
+
+*The tower* (`tower.js`, `tower-watch.js`, three routes and the start-up check in `lij-adapter.js`, a Console card).
+LIJOX watch duty W1: the provider keeps wallets' encrypted penalty transactions and watches the chain for the old
+states they answer. Off unless `TOWER_ENABLED=true`. What is checked: the encryption gives The Eye of Satoshi's own
+test bytes; a block is believed only when its header hashes to the hash asked for; a held item is published only when
+it opens with the old state's id AND spends that transaction and nothing else; after a stop the blocks missed are read
+(2,016 at most — a longer gap is said in the journal and the older blocks are NOT read); the last twelve heights are
+read again when their hash changes. Known limits, stated: (1) main output only — an old state's HTLC outputs are not
+answered; (2) the watch looks every 30 seconds and a wallet's delay is 144 blocks, so a box down for a day can miss the
+window; (3) the fee of a penalty is fixed when the wallet signs it — the box cannot raise it; the wallet sends two, at
+two rates; (4) a put replayed inside its ten minutes keeps nothing twice, a drop replayed inside its ten minutes drops
+again what the wallet may have put back; (5) nothing here has run against a real old state on the chain — the checks
+are unit checks and a stand-in boot. The registry record does not carry the tower yet (that needs the worker's twin);
+`/health` and `get_info` do.
+
+*The chit refund* (`delegate.js`). Found 2026-11-13 while re-baking the key: the refund paid through
+`POST /v1/channels/transactions` (SendPaymentSync), which LND 0.21 no longer has — the bake refused the permission, and
+a refund asked of an LND 0.21 box could not have paid. No refund had failed on either box (the journal count was 0).
+The refund now pays through `/v2/router/send` with the spend rail's fee limit and timeout. A payment whose outcome is
+not known when the answer is due is no longer written down as failed: the chit stays `PAYING`, the answer is 503
+`REFUND_PENDING`, and the next ask reads LND's own payment record — paid (200, `resolved_earlier: true`), failed (owed
+again), or still unknown (409 `REFUND_IN_FLIGHT`). Before this an unknown outcome was booked as failed, and a wallet
+that asked again with a new invoice could have been paid twice. `delegate-refund.test.js` (17 checks).
+
+**0.129.0.** *The tower on the registry record* (`canonicalRegisterMsg` — the twin of lij-worker 0.21.0 — and
+`registerWithRegistry` in `lij-adapter.js`). A record with a tower block signs as `lijox-register:v5`; one without
+signs exactly as before, so a box with the tower off is untouched. `offered` on the record is the state at
+registration; the first registration after a start is signed before the block reads have been tried and says "not
+offered", and the record is sent again the moment the reads pass. A wallet must still ask the provider's `/health`
+before it counts on a tower: the record can be up to six hours old.
+
+*The joining drill* (`tower-drill.js`, the Console's Tower card, `POST /console/tower-drill`). Known limits, stated:
+(1) it proves the tower published ONE answer on ONE day — not that it will tomorrow; (2) a pass needs the drilled
+tower's node to relay a transaction and a miner to take it within six blocks: the answer pays twice the rate LND
+estimates for two blocks, and a fee spike in those six blocks can fail a tower that did publish; (3) the drilling box
+must itself be able to read blocks (its own tower turned on and watching); (4) the drill's one-time key and the answer
+sit in `DATA_DIR/tower/drills.json` (owner-only) until the drill ends — losing that file while a drill runs loses the
+drill amount if the tower also fails; (5) the transaction that stands in for an old state pays an ordinary script, not
+a channel's: the drill exercises the tower's hint match, decryption, input check and publish, not LDK's penalty
+signing (that is the wallet's side, tested in the engine). Not run against a real tower before this release — the
+checks are unit checks with the real holder and watch behind a stand-in chain (`tower-drill.test.js`, 20).
+
+**0.129.1.** The joining drill is started on the box, not from the Console. 0.129.0 put a "Drill" button and
+`POST /console/tower-drill` in the Console; a drill spends the operator's coins (two on-chain fees), and the Console's
+rule is that it shows information and moves no money. Both are removed. `node lij-adapter.js --tower-drill "<name or
+node key>"` writes a request file (`DATA_DIR/tower/drill-request`) and exits; the running adapter reads it within
+twenty seconds, removes it, and starts the drill or says in the journal why not. The Console's Tower card lists the
+drills and their results. No drill was run with the button.
+

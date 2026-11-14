@@ -605,6 +605,110 @@ const { createPeerStorage, signedText: peerStorageSignedText, sha256hex: peerSto
 const receiveWords = require('./receive-words');   // 0.127.4: the address rail's refusal before an invoice is made
 const deliverParts = require('./deliver-parts');   // 0.127.0: a delivery in parts over the wallet's channels
 const peerStorage = createPeerStorage({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+// 0.128.0 (S69, LIJOX watch duty W1 — the wallet repo's docs/lijox-watch-standard-r1.md): THE TOWER. This box keeps
+// wallets' encrypted penalty transactions (tower.js) and reads every block for the old states they answer
+// (tower-watch.js; the blocks come from LND's own ChainKit). OFF unless TOWER_ENABLED=true. When it is on and the key
+// cannot read blocks, nothing is accepted — a tower that cannot watch must not take a wallet's penalties.
+const towerLib = require('./tower');
+const { createTowerWatch } = require('./tower-watch');
+const TOWER_ENABLED = String(process.env.TOWER_ENABLED || 'false').toLowerCase() === 'true';
+const TOWER_QUOTA_BYTES = parseInt(process.env.TOWER_QUOTA_BYTES || '', 10) > 0 ? parseInt(process.env.TOWER_QUOTA_BYTES, 10) : 5 * 1024 * 1024;
+const TOWER_KEEP_DAYS = parseInt(process.env.TOWER_KEEP_DAYS || '', 10) > 0 ? parseInt(process.env.TOWER_KEEP_DAYS, 10) : 400;
+const TOWER_POLL_MS = Math.max(5000, (parseInt(process.env.TOWER_POLL_SECONDS || '', 10) || 30) * 1000);
+const tower = TOWER_ENABLED ? towerLib.createTower({ dataDir: DATA_DIR, quotaBytes: TOWER_QUOTA_BYTES, keepDaysSilent: TOWER_KEEP_DAYS, log: (m) => console.log(m) }) : null;
+const towerState = { watching: false, why: TOWER_ENABLED ? 'the block reads have not been tried yet' : 'TOWER_ENABLED is not true', probed_ms: null, height: null };
+const towerLnd = {
+  bestBlock: async () => { const j = await lndGetOk('/v2/chainkit/bestblock'); return { height: Number(j.block_height), hash: String(j.block_hash || '') }; },
+  blockHash: async (h) => String((await lndGetOk('/v2/chainkit/blockhash?block_height=' + h)).block_hash || ''),
+  block: async (hashB64) => Buffer.from(String((await lndGetOk('/v2/chainkit/block?block_hash=' + encodeURIComponent(hashB64))).raw_block || ''), 'base64'),
+  publish: async (hex) => lndOrThrow(await lndPost('/v2/wallet/tx', { tx_hex: Buffer.from(hex, 'hex').toString('base64'), label: 'lijox tower penalty' }), 'PublishTransaction'),
+};
+const towerWatch = tower ? createTowerWatch({ tower, lnd: towerLnd, dataDir: DATA_DIR, log: (m) => console.log(m) }) : null;
+// 0.129.0 (S69, DP "I like this, do it"): THE JOINING DRILL — tower-drill.js. This box, with its own coins, proves
+// that ANOTHER provider's tower publishes: a small transaction of its own stands in for an old state, the tower is
+// handed the answer, and must publish it by itself within six blocks. Started by a command on the box only
+// (`--tower-drill`, 0.129.1 — it spends the operator's coins: two transactions' fees; the Console shows the drills and
+// starts nothing); the coins come back to this box's wallet either way.
+const { createTowerDrill } = require('./tower-drill');
+const towerDrillPost = (endpoint, body) => new Promise((resolve) => {
+  let done = false; const finish = (v) => { if (!done) { done = true; resolve(v); } };
+  try {
+    const u = new url.URL(endpoint); const payload = JSON.stringify(body);
+    const rq = https.request({ hostname: u.hostname, port: u.port || 443, path: u.pathname, method: 'POST', timeout: 15000, headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } }, (rs) => {
+      let data = ''; rs.on('data', (c) => { data += c; if (data.length > 65536) rq.destroy(); });
+      rs.on('end', () => { let j = null; try { j = JSON.parse(data); } catch (e) {} finish({ status: rs.statusCode, json: j }); });
+    });
+    rq.on('timeout', () => rq.destroy()); rq.on('error', () => finish(null)); rq.write(payload); rq.end();
+  } catch (e) { finish(null); }
+});
+const towerDrill = TOWER_ENABLED ? createTowerDrill({
+  dataDir: DATA_DIR, log: (m) => console.log(m), post: towerDrillPost, chain: towerLnd,
+  lnd: {
+    fundPsbt: async (b) => lndOrThrow(await lndPost('/v2/wallet/psbt/fund', b), 'FundPsbt'),
+    finalizePsbt: async (b) => lndOrThrow(await lndPost('/v2/wallet/psbt/finalize', b), 'FinalizePsbt'),
+    estimateFeeSatVb: async (targetConf) => { const r = await lndGet(`/v2/wallet/estimatefee/${Math.max(1, Math.floor(Number(targetConf) || 2))}`).catch(() => null); const kw = Number(r && r.sat_per_kw); return kw > 0 ? kw * 4 / 1000 : null; },
+    publish: (hex) => towerLnd.publish(hex),
+  },
+}) : null;
+// the other listed providers whose record or health says they keep a tower — whom this box could drill
+async function towerDrillCandidates() {
+  const out = [];
+  for (const reg of CONFIG.registries) {
+    const r = await httpsGetJson(reg + '/lsps'); const l = r && r.json && Array.isArray(r.json.lsps) ? r.json.lsps : null;
+    if (!l) continue;
+    for (const p of l) { if (!p || p.pubkey === CONFIG.node.pubkey || !/^https:\/\//.test(String(p.endpoint || ''))) continue; out.push({ pubkey: String(p.pubkey), name: String(p.name || ''), endpoint: String(p.endpoint), tower: p.tower || null }); }
+    break;
+  }
+  return out;
+}
+let towerDrillCands = { at: 0, list: [] };
+async function towerDrillStart(pubkey, by) {
+  if (!towerDrill) return { ok: false, error: 'the tower is not turned on at this box (the drill needs its block reads)' };
+  if (!towerState.watching) return { ok: false, error: 'this box cannot read blocks now: ' + towerState.why };
+  const who = String(pubkey || '').trim().toLowerCase();
+  const c = (await towerDrillCandidates()).find((x) => x.pubkey === who || String(x.name || '').toLowerCase() === who);   // 0.129.1: by node key or by name
+  if (!c) return { ok: false, error: 'that provider is not on the registry\'s list (give its name as listed, or its node key)' };
+  try { const rec = await towerDrill.start(c, Number(process.env.TOWER_DRILL_SATS) || 20000); console.log(`[TOWER-DRILL] started by ${by}`); return { ok: true, drill: rec }; }
+  catch (e) { console.error(`[TOWER-DRILL] not started (${by}): ${e.message}`); return { ok: false, error: String(e.message || e).slice(0, 240) }; }
+}
+const towerCapability = () => tower ? Object.assign({}, tower.capability, { offered: towerState.watching, watching: towerState.watching }) : { offered: false };
+const towerReport = () => ({ drills: towerDrill ? towerDrill.list().slice(-8) : [], drill_candidates: towerDrillCands.list, enabled: TOWER_ENABLED, watching: towerState.watching, why: towerState.why, quota_bytes: TOWER_QUOTA_BYTES, keep_days_silent: TOWER_KEEP_DAYS, poll_s: TOWER_POLL_MS / 1000,
+  held: tower ? tower.summary() : null, watch: towerWatch ? towerWatch.summary() : null });
+// The three block reads, tried end to end with the key the adapter holds. Said once in the journal; tried again every
+// ten minutes while it fails (LND may still be starting), and the watch begins the moment it passes.
+let towerTimer = null;
+async function towerBoot() {
+  if (!tower) { console.log('[TOWER] off (TOWER_ENABLED is not true) — no penalty transactions are kept on this box'); return; }
+  const p = await towerWatch.probe(); towerState.probed_ms = Date.now();
+  if (!p.ok) {
+    const first = towerState.why !== p.why; towerState.watching = false; towerState.why = p.why;
+    if (first) console.error(`[TOWER] NOT WATCHING — the key could not read a block: ${p.why}. Nothing is accepted from wallets until it can (the key needs /chainrpc.ChainKit/GetBestBlock, GetBlockHash and GetBlock — MACAROON.md). Tried again every 10 minutes.`);
+    setTimeout(() => { towerBoot().catch(() => {}); }, 600000).unref();
+    return;
+  }
+  towerState.watching = true; towerState.why = ''; towerState.height = p.height;
+  if (towerState.registered_offered === false) registerWithRegistry().catch(() => {});   // 0.129.0: the record said "not offered" (it was signed before the block reads were tried) — say it again now
+  const h = tower.summary();
+  console.log(`[TOWER] key probe: the three block reads answer (best block ${p.height}, ${p.txs} transactions) — WATCHING every ${TOWER_POLL_MS / 1000} s · ${h.items} item(s) held for ${h.wallets} wallet key(s), ${h.bytes} bytes · ${TOWER_QUOTA_BYTES} bytes a wallet key, dropped after ${TOWER_KEEP_DAYS} silent days`);
+  const look = () => towerWatch.poll().then((r) => { if (!r.ok && towerState.why !== r.why) console.error(`[TOWER] a look at the chain failed: ${r.why}`); towerState.why = r.ok ? '' : r.why; if (r.ok && r.height) towerState.height = r.height; }).catch(() => {});
+  look(); towerTimer = setInterval(look, TOWER_POLL_MS); towerTimer.unref();
+  setInterval(() => { try { tower.sweep(); } catch (e) { console.error(`[TOWER] sweep failed: ${e.message}`); } }, 86400000).unref();
+  // 0.129.0: the drills move with the chain (a look a minute); the list of providers that could be drilled, read every ten minutes
+  setInterval(() => { towerDrill.tick().catch(() => {}); }, 60000).unref();
+  // 0.129.1: a drill is asked for on the box (`--tower-drill`), never from the Console — the request file is read here
+  const drillRequest = async () => {
+    const file = require('path').join(DATA_DIR, 'tower', 'drill-request');
+    let who = ''; try { who = require('fs').readFileSync(file, 'utf8').trim(); } catch (e) { return; }
+    try { require('fs').unlinkSync(file); } catch (e) { return; }   // taken once: a request that cannot be removed is not acted on
+    if (!who) return;
+    console.log(`[TOWER-DRILL] request read from the box: "${who.slice(0, 80)}"`);
+    const r = await towerDrillStart(who, 'a command on the box');
+    if (!r.ok) console.error(`[TOWER-DRILL] the request was not carried out: ${r.error}`);
+  };
+  setInterval(() => { drillRequest().catch((e) => console.error(`[TOWER-DRILL] request failed: ${e.message}`)); }, 20000).unref();
+  const cands = () => towerDrillCandidates().then((l) => { towerDrillCands = { at: Date.now(), list: l.map((x) => ({ pubkey: x.pubkey, name: x.name, offered: !!(x.tower && x.tower.offered) })) }; }).catch(() => {});
+  cands(); setInterval(cands, 600000).unref();
+}
 // 0.109.0: the Black start page (recover/index.html beside this file), read once; absent = the route answers 404 and the console's health says so
 const RECOVER_PAGE = (() => { try { return require('fs').readFileSync(require('path').join(__dirname, 'recover', 'index.html'), 'utf8'); } catch (_) { return null; } })();
 const RECOVER_BUILD = RECOVER_PAGE ? ((RECOVER_PAGE.match(/const RECOVER_BUILD = '(v\d+)'/) || [])[1] || 'unknown') : null;
@@ -1283,6 +1387,19 @@ if (process.argv.includes('--totp-enroll')) {
   const { totpEnroll } = require('./console');
   const e = totpEnroll('LIJOX console @ ' + require('os').hostname());
   console.log('\nCONSOLE_TOTP_SECRET=' + e.secret + '\n\nAdd that line to config.env, then in your authenticator app choose "enter a setup key"\nand type the secret (or add this URI):\n\n' + e.uri + '\n');
+  process.exit(0);
+}
+// 0.129.1 (S69, DP 2026-11-14: "the Console only receives information" — a direct money action is a deliberate command
+// on the box): `node lij-adapter.js --tower-drill "<provider's name or node key>"` asks the RUNNING adapter to start a
+// joining drill of that provider's tower. It only writes the request (DATA_DIR/tower/drill-request) and exits; the
+// running adapter reads it within a minute, starts the drill or says why not, and the journal carries every step.
+if (process.argv.includes('--tower-drill')) {
+  const who = String(process.argv[process.argv.indexOf('--tower-drill') + 1] || '').trim();
+  if (!who || who.startsWith('--')) { console.error('\nName the provider to drill:  node lij-adapter.js --tower-drill "<its name or node key>"\n'); process.exit(1); }
+  const dir = require('path').join(DATA_DIR, 'tower'); const file = require('path').join(dir, 'drill-request');
+  require('fs').mkdirSync(dir, { recursive: true });
+  require('fs').writeFileSync(file, who + '\n', { mode: 0o600 });
+  console.log('\nDrill request written: ' + file + '\nThe running adapter reads it within a minute. It sends ' + (Number(process.env.TOWER_DRILL_SATS) || 20000) + ' sats of this box through two on-chain transactions and gets them back less the two fees.\nFollow it in the journal (lines marked [TOWER-DRILL]) or on the Console\'s Tower card.\n');
   process.exit(0);
 }
 const ADAPTER_LOGIC_VERSION = 'v' + require('./package.json').version; /* O3: JIT_REMOTE_RESERVE_SATS honored at gRPC open (field 25) — the deferred REST-path reserve override, un-deferred; startup line tells the truth */ /* P7: /health default answers wallet needs only (detail behind HEALTH_DETAIL=on incl. lnd_version + counters); /health/jit admin-gated unless detail on */ /* step 1: first-run doctor — startup-only checks (cert readable, macaroon present, data-dir write probe, REST+macaroon+identity-match with 5s timeout, gRPC TCP probe), plain-sentence failures, LIJOX_DOCTOR=off escape; banner reads this const */ void ADAPTER_LOGIC_VERSION;
@@ -2559,6 +2676,7 @@ function lnurlpBootResume() {
 setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
 setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PUSH-KEY] boot resume failed: ${e.message}`); } }, 9000);   // 0.82.0
 setTimeout(() => { onchainPay.boot().catch((e) => console.error(`[ONCHAIN-PAY] boot failed: ${e.message}`)); }, 9500);   // 0.120.0: the float probe, the records, the watches re-armed
+setTimeout(() => { towerBoot().catch((e) => console.error(`[TOWER] boot failed: ${e.message}`)); }, 12000);   // 0.128.0: the block reads tried, then the watch
 setTimeout(() => { jitFunding.boot().then(() => jitFunding.sweep(true)).catch((e) => console.error(`[JIT-HOLD] boot failed: ${e.message}`)); }, 11000);   // 0.124.0: the key probe, then the records read against LND
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
@@ -2771,6 +2889,8 @@ const recoverCloseKeyLimit = windowLimiter(CONFIG.security.recover_close_key_req
 // 0.119.3 (S66, item 2): the fetch-for-the-phone route's own ceiling per address (LNURL_FETCH_IP_PER_MIN, default 30 a minute)
 // 0.126.0 (S68): the channel state file's own limits — a busy wallet sends one file per change, at most one every 30 s
 const peerStorageIpLimit  = windowLimiter(parseInt(process.env.PEER_STORAGE_IP_PER_HOUR  || '600', 10) || 600, 3600000);
+const towerIpLimit  = windowLimiter(parseInt(process.env.TOWER_IP_PER_HOUR  || '1200', 10) || 1200, 3600000);   // 0.128.0
+const towerKeyLimit = windowLimiter(parseInt(process.env.TOWER_KEY_PER_HOUR || '600', 10) || 600, 3600000);
 const peerStorageKeyLimit = windowLimiter(parseInt(process.env.PEER_STORAGE_KEY_PER_HOUR || '300', 10) || 300, 3600000);
 const lnurlFetchIpLimit = windowLimiter(parseInt(process.env.LNURL_FETCH_IP_PER_MIN || '30', 10) || 30, 60000);
 let lnurlFetchCounts = { asked: 0, served: 0, refused: 0 };   // the only record kept — never the URL
@@ -5712,6 +5832,8 @@ function httpsPost(endpoint, body) {
 // 0.108.0 (lij-worker 0.13.0, S61 — Step A): a record that carries a `routes` list is signed as 'lijox-register:v4:' +
 // the v1 fields + filter_url ('' when none) + filter_sp + every tatara field ('' / '0' when no block) + ONE field holding
 // every route as reach|endpoint|wss_url|filter_url, routes joined by ';' (percent-encoded with the field).
+// 0.129.0 (lij-worker 0.21.0, S69): a record that carries a `tower` block is signed as 'lijox-register:v5:' + every v4
+// field in place + offered ('1'/'0') + quota_bytes + keep_days_silent + form. A record without the block signs as before.
 function canonicalRegisterMsg(f) {
   const s = (v) => (v === null || v === undefined) ? '' : String(v);
   const n = (v) => String(Number(v) || 0);
@@ -5721,6 +5843,17 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.tower) {
+    // 0.21.0: v5 — a record that says it keeps a tower (LIJOX watch duty W1). Every v4 field in place ('' / '0' where the
+    // record has none, the routes field '' without a list), then the tower's four: offered, quota_bytes,
+    // keep_days_silent, form.
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = (f.routes || []).map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    const w = f.tower;
+    return 'lijox-register:v5:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf], [(w.offered ? '1' : '0'), n(w.quota_bytes), n(w.keep_days_silent), s(w.form)]).map(encodeURIComponent).join(':');
+  }
   if (f.routes && f.routes.length) {
     const t = f.tatara || {};
     const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
@@ -5964,6 +6097,9 @@ async function registerWithRegistry() {
     const routes = await buildRoutes();
     for (const ln of routesStatus.notes) console.log('[Registry] ' + ln);
     body.routes = routes;
+    // 0.129.0 (S69, DP "Add the tower info to the registry record"): the tower block when the tower is turned on
+    // (lijox-register:v5) — offered is what the box is doing NOW (watching or not); off = the record as before
+    if (tower) { body.tower = { offered: !!towerState.watching, quota_bytes: TOWER_QUOTA_BYTES, keep_days_silent: TOWER_KEEP_DAYS, form: 'teos-v1' }; towerState.registered_offered = body.tower.offered; console.log('[Registry] tower block: ' + (body.tower.offered ? 'offered' : 'NOT offered (not watching)') + ' · ' + TOWER_QUOTA_BYTES + ' bytes a wallet key · ' + TOWER_KEEP_DAYS + ' days'); }
     const signWith = async (canonical) => {
       const signed = await lndPost('/v1/signmessage', {
         msg: Buffer.from(canonical, 'utf8').toString('base64'),
@@ -5980,13 +6116,18 @@ async function registerWithRegistry() {
     // mirror between the doors has nothing to level. A registry older than lij-worker 0.13.0 does not know routes
     // (its canonical is v3): that one gets the first door alone, signed once more for it.
     body.signature = await signWith(canonicalRegisterMsg(body));
-    let v3 = null;
+    let v3 = null, v4 = null;
     const errors = [];
     for (const reg of CONFIG.registries) {
       let result = await httpsPost(`${reg}/lsps/register`, body).catch((e) => ({ ok: false, error: e.message }));
+      if (result && !result.ok && body.tower && /signature does not verify/i.test(String(result.error || ''))) {   // 0.129.0: a registry older than lij-worker 0.21.0 does not know the tower block
+        console.log('[Registry] ' + reg + ' does not know the tower block (its answer: ' + result.error + ') — registering without it (v4)');
+        if (!v4) { v4 = Object.assign({}, body); delete v4.tower; delete v4.signature; v4.signature = await signWith(canonicalRegisterMsg(v4)); }
+        result = await httpsPost(`${reg}/lsps/register`, v4).catch((e) => ({ ok: false, error: e.message }));
+      }
       if (result && !result.ok && body.routes && /signature does not verify/i.test(String(result.error || ''))) {
         console.log('[Registry] ' + reg + ' does not know routes (its answer: ' + result.error + ') — registering the first door alone (v3)');
-        if (!v3) { v3 = Object.assign({}, body); delete v3.routes; delete v3.signature; v3.signature = await signWith(canonicalRegisterMsg(v3)); }
+        if (!v3) { v3 = Object.assign({}, body); delete v3.routes; delete v3.tower; delete v3.signature; v3.signature = await signWith(canonicalRegisterMsg(v3)); }
         result = await httpsPost(`${reg}/lsps/register`, v3).catch((e) => ({ ok: false, error: e.message }));
       }
       console.log('[Registry] Registered at ' + reg + ':', result);
@@ -6382,6 +6523,7 @@ async function consoleSnapshot() {
     delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
     onchain_pay: (() => { try { return onchainPay.summary(); } catch (_) { return null; } })(),   // 0.120.0: the Float pane — the float, the open payments, the take-backs due, fees and chain costs
+    tower: (() => { try { return towerReport(); } catch (_) { return null; } })(),   // 0.128.0
     jit_funding: (() => { try { return jitFunding.snapshot(); } catch (_) { return null; } })(),   // 0.124.0: the held fundings — the records, the counts, the key
     settings: settingsReport(), lnd_policy: lndPolicy,
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
@@ -6779,6 +6921,31 @@ const MY_CHANNELS_DOMAIN = 'lij-my-channels-v1:';
 // Held for ANY wallet that proves its node key — a channel with this provider is not asked for (LIJOX: MUST hold for
 // others). The file is BOLT #1110's: bytes the holder cannot read, 65,531 at most, the latest only. A lower number is
 // refused (409). A reconnecting wallet asks meta alone and fetches the file only when state_fp differs from its own.
+// 0.128.0 (S69): THE TOWER'S DOOR — public; every request is signed (BIP-340) by a key the wallet makes for this
+// tower alone, over SHA-256 of "lijox-tower-v1|<action>|<key>|<group>|<ts>[|<sha256 of the items>]" (tower.js).
+//   POST /v1/tower/put     { key, group, ts, signature, items: [{ hint, blob (base64) }] }  → { ok, kept, items, bytes, quota_bytes }
+//   POST /v1/tower/drop    { key, group, ts, signature }                                    → { ok, dropped }
+//   POST /v1/tower/status  { key, ts, signature }                                           → { ok, items, bytes, quota_bytes, last_ms, keep_days_silent, watching }
+// The box cannot read what it keeps: an item opens only with the id of the old state it answers, seen in a block.
+async function handleTower(req, res, ip, action) {
+  if (action !== 'put' && action !== 'drop' && action !== 'status') return errResponse(res, 'Not found', 404);
+  if (!tower) return jsonResponse(res, { ok: false, code: 'not_offered' }, 404);
+  const ipLim = towerIpLimit.hit(ip);
+  if (!ipLim.ok) { console.warn(`[Security] Tower limit hit for ${ip} — resets in ${ipLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
+  let body;
+  try { body = await readBody(req, 400000); } catch (e) { return errResponse(res, 'Invalid JSON or body too large'); }
+  if (action === 'put' && !towerState.watching) return jsonResponse(res, { ok: false, code: 'not_watching' }, 503);   // before anything is kept
+  const v = towerLib.verifyRequest(action, body, Math.floor(Date.now() / 1000));
+  if (!v.ok) return jsonResponse(res, { ok: false, code: v.code }, v.code === 'signature' ? 401 : 400);
+  const keyLim = towerKeyLimit.hit(body.key);
+  if (!keyLim.ok) return errResponse(res, 'Rate limit exceeded', 429);
+  if (action === 'put') {
+    const r = tower.put(body.key, body.group, v.items);
+    return jsonResponse(res, r, r.ok ? 200 : (r.code === 'quota' ? 413 : 507));
+  }
+  if (action === 'drop') return jsonResponse(res, tower.drop(body.key, body.group));
+  return jsonResponse(res, Object.assign(tower.status(body.key), { watching: towerState.watching }));
+}
 async function handlePeerStorage(req, res, ip, action) {
   if (action !== 'put' && action !== 'meta' && action !== 'get') return errResponse(res, 'Not found', 404);
   const ipLim = peerStorageIpLimit.hit(ip);
@@ -7160,6 +7327,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // v0.9: CORS headers on every response, plus OPTIONS preflight short-circuit
   setCorsHeaders(req, res);
   if (path === '/v1/kit' || path.startsWith('/v1/peer-storage/')) kitHolder.openCors(res);   // 0.79.1 (0.126.0: and the channel state file's holder — signature-gated the same way): the kit holder answers every wallet origin (signature-gated, no credentials)
+  if (path.startsWith('/v1/tower/')) kitHolder.openCors(res);   // 0.128.0: the tower's routes — signature-gated the same way
   if (method === 'OPTIONS') {
     res.writeHead(204);
     res.end();
@@ -7246,6 +7414,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
                                        : { enabled: !!htlcInterceptor,
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
+        tower:           towerCapability(),   // 0.128.0: LIJOX watch duty W1 — this box keeps wallets' encrypted penalty transactions and watches the chain for them (offered only while it is watching)
         peer_storage:    peerStorage.capability,   // 0.126.0: this box holds a wallet's channel state file (BOLT #1110's file over HTTPS; max_bytes 65531)
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
@@ -7278,6 +7447,10 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // registry.js). MUST dispatch BEFORE the authOk gate below -- adapter
   // secret is the wrong auth model for these endpoints. Any exception
   // here logs + 500s rather than falling through to the auth gate.
+  if (path.startsWith('/v1/tower/') && method === 'POST') {   // 0.128.0 (S69): public, signed by the wallet's key for this tower — the penalty transactions
+    try { return await handleTower(req, res, ip, path.slice('/v1/tower/'.length)); }
+    catch (e) { console.error('[TOWER] handler threw:', e); return errResponse(res, 'Internal error', 500); }
+  }
   if (path.startsWith('/v1/peer-storage/') && method === 'POST') {   // 0.126.0 (S68): public, signed-challenge auth — the channel state file
     try { return await handlePeerStorage(req, res, ip, path.slice('/v1/peer-storage/'.length)); }
     catch (e) { console.error('[PeerStorage] handler threw:', e); return errResponse(res, 'Internal error', 500); }
@@ -8042,6 +8215,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       push_key:              pushRail.capability,
       onchain_pay:           onchainPay.capability(),   // 0.120.0
       jit_funding_hold:      jitFunding.capability(),   // 0.124.0: wallet trusts LSP — the held open is offered to wallets with feature bit 261
+      tower:                 towerCapability(),   // 0.128.0
       // 0.86.0 (S50): NWC — offered here or not (the wallet's Dials → NWC greys when not), the relay's wss address, the ceiling
       nwc:                   nwc.capability,
       // v0.56.0 (O5 full balance availability): the payer-funds-the-floor

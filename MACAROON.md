@@ -37,6 +37,7 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
 | lnrpc.Lightning/DeleteCanceledInvoice | PUSH KEY (0.116.0+, Kimi round 2 F6): after a claim burns on this provider (the claimant's wallet refused the delivery), the canceled claim invoice is deleted so the real recipient can claim the hash here again (LND never mints a hash twice otherwise). Without it the adapter logs the gap at boot and a burned claim's hash stays unclaimable here. |
 | lnrpc.Lightning/OpenChannel, FundingStateStep; walletrpc.WalletKit/FundPsbt, FinalizePsbt, ReleaseOutput, ListLeases | WALLET TRUSTS LSP (0.124.0+, jit-funding.js): a JIT channel's funding is built and signed from LND's own wallet but PUBLISHED ONLY ONCE THE WALLET HAS CLAIMED the payment — the streaming OpenChannel with a PSBT shim (`no_publish`), FundPsbt (the coins leased under the adapter's own lock id), FinalizePsbt (signs, publishes nothing), FundingStateStep (psbt_verify with skip_finalize; shim_cancel on a failed open), ReleaseOutput/ListLeases (the coins back when the payment is refused; strays at boot). None of these can spend coins to anyone: FundPsbt and FinalizePsbt only build and sign a transaction whose one foreign output is the channel's own 2-of-2; PublishTransaction (already in the key) sends it. The adapter probes the six at boot — a key without them keeps today's publish-first open and says so. In both bake-permissions files. |
 | routerrpc.Router/XImportMissionControl | ROUTING REPORTS (baked 2026-10-25, used from the next release — docs/design/pathfinding in the wallet repo): the adapter writes the routing failures a wallet reports (signed, Privacy → LSP → Routing reports) into its own LND's mission control, so later route asks avoid them. It writes LND's routing memory only — it moves no funds. In both bake-permissions files. |
+| chainrpc.ChainKit/GetBestBlock, GetBlockHash, GetBlock | THE TOWER'S BLOCK WATCH (baked 2026-11-13, used from 0.128.0 — the wallet repo's docs/lijox-watch-standard-r1.md): the tower reads each new block's transaction ids to notice an old channel state it holds a penalty for. Three reads; nothing is written or spent. A box whose key lacks them keeps the tower off and says so. `ops/rebake.py` bakes the key again from the permission file and replaces the one .env line. |
 
 ## RECOMMENDED — strict per-RPC macaroon (exactly the table above)
 
@@ -70,7 +71,6 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
       uri:/lnrpc.Lightning/AddInvoice \
       uri:/lnrpc.Lightning/DecodePayReq \
       uri:/lnrpc.Lightning/ListPayments \
-      uri:/lnrpc.Lightning/SendPaymentSync \
       uri:/routerrpc.Router/SendPaymentV2 \
       uri:/lnrpc.Lightning/UpdateChannelPolicy \
       uri:/routerrpc.Router/XImportMissionControl \
@@ -80,7 +80,10 @@ result goes into `LIJ_ADAPTER_MACAROON_HEX` in your .env.
       uri:/walletrpc.WalletKit/FundPsbt \
       uri:/walletrpc.WalletKit/FinalizePsbt \
       uri:/walletrpc.WalletKit/ReleaseOutput \
-      uri:/walletrpc.WalletKit/ListLeases
+      uri:/walletrpc.WalletKit/ListLeases \
+      uri:/chainrpc.ChainKit/GetBestBlock \
+      uri:/chainrpc.ChainKit/GetBlockHash \
+      uri:/chainrpc.ChainKit/GetBlock
 
 Then hex it into your .env:
 
@@ -154,3 +157,13 @@ delegate RPC names was rejected by a newer LND build (`invalid permission action
 The delegate REFUND path still calls it (`POST /v1/channels/transactions`) — DOCKET 0.65.0: move the refund pay to
 `/v2/router/send` (SendPaymentV2) so the full list bakes on every LND build. Until then, omit SendPaymentSync on such
 nodes and expect delegate refunds to fail there.
+
+## 2026-11-13 — `/lnrpc.Lightning/SendPaymentSync` is out of the list
+
+LND 0.21 no longer has it (in 0.20.1's rpcserver.go, absent from 0.21.8's): a bake that names it is refused whole
+("invalid permission action"). It is removed from `bake-permissions.json` (47 permissions with the three block reads).
+STILL OPEN IN THE CODE: the delegate REFUND path calls it (`POST /v1/channels/transactions`, delegate.js) — on a node
+running LND 0.21 a chit's refund fails and stays owed until that call is moved to `/v2/router/send`.
+
+**Closed in 0.128.0 (2026-11-13).** The refund now pays through `/v2/router/send` (`routerrpc.Router/SendPaymentV2`,
+already in both lists) and reads its outcome from `ListPayments`. No call to SendPaymentSync is left in the code.

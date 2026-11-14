@@ -812,6 +812,20 @@ async function epRefund(req, res, lndRequest) {
       return j(res, 401, { ok: false, code: 'BAD_SIG' });
     }
 
+    // 0.128.0: a refund whose outcome was never learned (a stop mid-payment, a lost answer) is settled from LND's own
+    // payment list before anything else — before this, such a chit answered REFUND_IN_FLIGHT for ever.
+    if (rec.refund_state === 'PAYING' && rec.refund_inflight) {
+      const fate = await refundFate(lndRequest, rec.refund_inflight);
+      if (fate.paid) {
+        const was = rec.refund_inflight.amount_msat;
+        bookRefund(nonce, rec, was, fate.fee_msat);
+        console.log('[delegate] REFUND paid (learned from the payment list) nonce=' + nonce.slice(0, 12) + '… ' + was + 'msat (fee ' + fate.fee_msat + ' msat counted) → ' + rec.refund_state);
+        return j(res, 200, { ok: true, refunded_msat: was, fee_msat: fate.fee_msat, remaining_owed_msat: refundOwedMsat(rec), resolved_earlier: true });
+      }
+      if (!fate.failed) return j(res, 409, { ok: false, code: 'REFUND_IN_FLIGHT' });
+      rec.refund_state = 'OWED'; delete rec.refund_inflight; recPut(nonce, rec);
+      console.log('[delegate] REFUND FAILED (learned from the payment list) nonce=' + nonce.slice(0, 12) + '…: ' + fate.failed);
+    }
     const owed = refundOwedMsat(rec);
     if (owed <= 0) return j(res, 409, { ok: false, code: 'NOTHING_OWED', state: rec.state });
     if (rec.refund_state === 'PAYING') return j(res, 409, { ok: false, code: 'REFUND_IN_FLIGHT' });
@@ -834,26 +848,45 @@ async function epRefund(req, res, lndRequest) {
       amount_msat: payMsat, ts: Date.now() };
     recPut(nonce, rec); // persist BEFORE pay, same discipline as spend
 
+    // 0.128.0 (S69, DP "Put it in as 0.128.0 with the tower"): THE REFUND IS PAID THROUGH THE ROUTER CALL the chit's
+    // spend already uses. It went through SendPaymentSync (POST /v1/channels/transactions), which LND 0.21 no longer
+    // has — on a 0.21 node every refund failed and stayed owed. timeout_seconds makes LND itself give a final answer;
+    // no_inflight_updates makes that answer the one message.
     let pay;
     try {
-      const body = { payment_request: bolt11, fee_limit: { fixed_msat: String(CFG.FEE_LIMIT_MSAT()) } };
+      const body = { payment_request: bolt11, timeout_seconds: CFG.SPEND_TIMEOUT_S(), fee_limit_msat: String(CFG.FEE_LIMIT_MSAT()), no_inflight_updates: true };
       if (invMsat <= 0) body.amt_msat = String(payMsat);
-      pay = await lndRequest('POST', '/v1/channels/transactions', body);
-    } catch (e) { pay = { payment_error: String(e.message || e).slice(0, 160) }; }
+      pay = await Promise.race([
+        lndRequest('POST', '/v2/router/send', body),
+        new Promise((_, rj) => setTimeout(() => rj(new Error('client_backstop_30s')), 30000)),
+      ]);
+      if (pay && pay.result) pay = pay.result;
+    } catch (e) { pay = { transport_error: String(e.message || e).slice(0, 160) }; }
 
-    if (pay && !pay.payment_error && pay.payment_preimage) {
+    let fate;
+    if (pay && pay.status === 'SUCCEEDED' && preimageHex(pay.payment_preimage)) {
       // 0.114.0 (F19): the routing fee this refund cost counts against the chit — the issuer's remainder paid it
-      const feePaid = Number((pay.payment_route && pay.payment_route.total_fees_msat) || pay.fee_msat || 0) || 0;
-      rec.refunded_msat = (rec.refunded_msat || 0) + payMsat + feePaid;
-      rec.refund_fee_msat = (rec.refund_fee_msat || 0) + feePaid;
-      rec.refund_state = (refundOwedMsat(rec) > 0) ? 'OWED' : 'PAID';
-      delete rec.refund_inflight;
-      recPut(nonce, rec);
+      fate = { paid: true, fee_msat: Number(pay.fee_msat || (pay.payment_route && pay.payment_route.total_fees_msat) || 0) || 0 };
+    } else if (pay && pay.status === 'FAILED') {
+      fate = { failed: String(pay.failure_reason || 'FAILURE_REASON_NONE') };
+    } else {
+      // no final answer (an error before or during the payment, a lost connection): ask LND's own list, once, now
+      fate = await refundFate(lndRequest, rec.refund_inflight, true);
+      if (!fate.paid && !fate.failed) {
+        const why = (pay && (pay.transport_error || (pay.error && (pay.error.message || pay.error)) || pay.payment_error)) || 'no final answer';
+        console.log('[delegate] REFUND PENDING nonce=' + nonce.slice(0, 12) + '… (' + String(why).slice(0, 120) + ') — the next request settles it from the payment list');
+        return j(res, 503, { ok: false, code: 'REFUND_PENDING', error: 'outcome not yet known — do not make a new invoice; ask again in a minute' });
+      }
+      if (fate.failed && pay && pay.error) fate.failed = String(pay.error.message || pay.error).slice(0, 160);
+    }
+    if (fate.paid) {
+      const feePaid = fate.fee_msat;
+      bookRefund(nonce, rec, payMsat, feePaid);
       console.log('[delegate] REFUND paid nonce=' + nonce.slice(0, 12) + '… ' + payMsat + 'msat (fee ' + feePaid + ' msat counted) → ' + rec.refund_state);
       return j(res, 200, { ok: true, refunded_msat: payMsat, fee_msat: feePaid, remaining_owed_msat: refundOwedMsat(rec) });
     }
     rec.refund_state = 'OWED'; delete rec.refund_inflight; recPut(nonce, rec);
-    const err = (pay && pay.payment_error) || 'no_preimage';
+    const err = fate.failed || 'no_preimage';
     console.log('[delegate] REFUND FAILED nonce=' + nonce.slice(0, 12) + '…: ' + err);
     return j(res, 502, { ok: false, code: 'REFUND_FAILED', error: String(err).slice(0, 160) });
   });
@@ -865,6 +898,37 @@ function claimId() {
 }
 function claimsDigest(pk, ts) {
   return 'LIJOX-delegate-claims-v1\nissuer_pubkey=' + pk + '\nts=' + ts;
+}
+
+// 0.128.0: a preimage as hex, or '' when it is missing or all zeros (LND's REST gives hex or base64 by call).
+function preimageHex(v) {
+  const s = String(v || ''); if (!s) return '';
+  const h = /^[0-9a-f]+$/i.test(s) ? s.toLowerCase() : Buffer.from(s, 'base64').toString('hex');
+  return (h.length === 64 && !/^0+$/.test(h)) ? h : '';
+}
+// 0.128.0: count a refund that LND paid — the amount and the routing fee it cost come off what is owed.
+function bookRefund(nonce, rec, amountMsat, feeMsat) {
+  rec.refunded_msat = (rec.refunded_msat || 0) + amountMsat + feeMsat;
+  rec.refund_fee_msat = (rec.refund_fee_msat || 0) + feeMsat;
+  rec.refund_state = (refundOwedMsat(rec) > 0) ? 'OWED' : 'PAID';
+  delete rec.refund_inflight;
+  recPut(nonce, rec);
+}
+// 0.128.0: what became of a refund payment, from LND's own list: { paid, fee_msat } | { failed: why } | {} (not known —
+// still on its way, or the list could not be read). `absentIsFailed` is for the moment right after the pay call: LND
+// has no payment with this hash, so none was made. For an older one the same holds once the list was walked whole.
+async function refundFate(lndRequest, inflight, absentIsFailed) {
+  const hash = String((inflight && inflight.payment_hash) || '');
+  const sinceS = Math.floor(Number((inflight && inflight.ts) || 0) / 1000) - LOOKUP_MARGIN_S;
+  const look = await lookupPaymentByHash(lndRequest, hash, sinceS > 0 ? sinceS : 0);
+  if (look.found) {
+    const st = String(look.found.status || '');
+    if (st === 'SUCCEEDED') return { paid: true, fee_msat: Number(look.found.fee_msat || 0) || 0 };
+    if (st === 'FAILED') return { failed: String(look.found.failure_reason || 'FAILED') };
+    return {};
+  }
+  if (look.absent && (absentIsFailed || Date.now() - Number((inflight && inflight.ts) || 0) > WEDGE_MIN_AGE_MS)) return { failed: 'LND made no payment for this refund' };
+  return {};
 }
 
 // 0.88.0 (S54, DP GO): ONE payment's fate, by its hash. Walks LND's payment list backwards (ListPayments, reversed,
