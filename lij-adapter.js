@@ -431,6 +431,8 @@ const { createJitGuard } = require('./jit-guard');
 const { createJitFunding } = require('./jit-funding');   // 0.124.0 (S67): WALLET TRUSTS LSP — the held open (the funding published only once the wallet has claimed)   // 0.104.0 (S59): the JIT guard — funded-but-failed opens counted, JIT halted at three   // 0.97.0 (S58): LIJOX's Tatara — the provider's part of the Mix; see tatara.js
 const { createKitHolder } = require('./kits.js');
 const { createNwc } = require('./nwc.js');   // 0.86.0 (S50, DP GO — NWC): the provider's half — registration, the relay at /nwc, the wake; see nwc.js
+const { incomingBroadcastDelta } = require('./lnd-margins');   // 0.133.4: how many blocks below an incoming HTLC's expiry the running LND goes on-chain (16 from LND 0.21; 10 before)
+const { createSentWatch } = require('./sent-watch');   // 0.133.0 (S70): a wallet's sent payment settled or failed here while that wallet is offline — the wake and the Console's line; see sent-watch.js
 const { createPushRail } = require('./push.js');   // 0.82.0 (S49, DP GO — PUSH KEY step B): lock / claim / deliver / void / status; see push.js // 0.79.0 (S48, DP GO — LIJOX BLACK START BS1): the kit holder — sealed escape kits, one per identity, newest-wins; see kits.js
 const lijDelegate = require('./delegate.js'); // v0.23: DELEGATE PAYMENT — S25 side trip; the module's entire adapter footprint is this require + one router branch
 // 0.78.0: the delegate rail's same-LSP hold reaches the adapter's own machinery through these hooks
@@ -472,6 +474,90 @@ const registerQuote = require('./register-quote');
 const regQuote = registerQuote.createRegisterQuote({ dataDir: DATA_DIR, log: (m) => console.log(m) });
 try { require('fs').mkdirSync(DATA_DIR, { recursive: true }); }
 catch (e) { console.error('DATA_DIR is not writable: ' + DATA_DIR + ' — ' + e.message); process.exit(1); }
+// 0.131.0 (S70 Mon 2026-11-16, DP 22:07 "Yes, put it in and be careful not to break any other code. Go."): ZAPS (NIP-57)
+// on the address rail — zap.js. Off unless ZAPS_ENABLED=true; off, the address answer and the callback are exactly as
+// before. On: allowsNostr + nostrPubkey on the plain answer, the zap request checked at the callback and tied into the
+// invoice, the receipt sent once the invoice settles (zapSettled, at each place an address entry becomes 'settled').
+//
+// 0.132.0 (S70 Tue 2026-11-17, DP after the review: "It sounds serious if every user is exposed when the box switch is
+// on. I saw this more to be a wallet-privacy choice. Fix this in one go"): ZAPS ARE THE WALLET'S CHOICE. 0.131.0 never
+// ran on a box. ZAPS_ENABLED=true now means this provider OFFERS zaps; an address takes them only while the wallet
+// that owns it has said yes — its own signed choice, POST /client/prefs { zaps: true|false } (the node key's proof
+// over `prefs-zaps:1|0`), kept beside its holding choice in client-prefs.json. A wallet that never chose: nothing is
+// advertised for its addresses and nothing is published, exactly as before 0.131.0. Also in zap.js: one receipt key
+// per address, and a receipt dated when the sender's payment reached this provider, not when the wallet took it.
+//
+// 0.133.0 (S70 Thu 2026-11-19, DP "Go" 11-18 22:06 and, on the words, 11-19 06:37 — the wallet repo's
+// docs/design/htlc/offline-sender-r1.md §4 A and C): A WALLET'S SENT PAYMENT, SETTLED OR FAILED HERE WHILE THAT WALLET
+// IS OFFLINE. The settle or the fail waits on the channel until the wallet connects; a settled one makes LND close the
+// channel on-chain 10 blocks below the HTLC's expiry if the wallet has not come back. sent-watch.js sorts each such
+// HTLC (in flight / completed / returned / undecided — on any doubt nothing is sent) and wakes the wallet: at once,
+// then about a day, six hours and one hour before the block (kinds sent_completed / sent_returned; the words are the
+// wallet's). The Console gets a card and a Guardrails row for every HTLC within 100 blocks of the block at which a
+// channel goes on-chain over it — report only. lnd-grpc.js: the interceptor wrapper now keeps which HTLCs it still
+// holds unanswered and reports each answer it writes to LND. Nothing here settles, fails, closes or pays.
+//
+// 0.133.1 (S70 Thu 2026-11-19, found on the stand-in Console before any box ran 0.133.0): in the first minutes after
+// a start the new card said "no HTLC within 100 blocks of its on-chain block" and a count of 0 — before LND had been
+// read at all — and "first read 180 s from now" while the first read came with the 2-minute timer, up to a minute
+// later. Now the card says only when the first read comes, and the first read is made as the 3-minute grace ends.
+//
+// 0.133.2 (S70 Thu 2026-11-19, DP 08:18 before any ride: "Make sure the pane stays its condensed size like all other
+// panes until its header is clicked to expand … we had this problem in the past"): THE CONSOLE'S CARDS MEASURED IN A
+// BROWSER (console-layout.check.mjs, new — no test had looked at the page in one). The new card itself was a tile of
+// the right size; the measurement found that 0.133.0's Guardrails row, with a 44-letter label, widened that pane's
+// label column from 158 px to 302 px and left every value 70 px (26 px on a phone). The label is now "HTLCs near a
+// close"; the new card has ONE table (two shared its condensed height); how a row was sorted has its own column.
+//
+// 0.133.3 (S70 Thu 2026-11-19, DP 09:18 on his first look after the ride: "The pane only shows the one zombie, but
+// channels still show the four including acinc-pending, so they don't match." — and 09:43, on the proposal, "Agreed
+// with your position. Go"): THE CARD LISTS EVERY PENDING HTLC. It had listed only those within 100 blocks of their
+// on-chain block (and the sent payments sorted for offline wallets), and said nothing of the rest, so it could not be
+// reconciled with the Channels pane's count. Now every pending HTLC on every channel is a row (title: "Pending
+// HTLCs"), nearest its block first; the 100 blocks only marks the warning — the amber of the blocks-left figure and
+// the Guardrails row. Every incoming HTLC is therefore sorted at each read, not only those of offline wallets and
+// the near ones. The wakes are untouched.
+//
+// 0.133.4 (S70 Thu 2026-11-19, DP 10:51 "Go for 0.133.4"): LND'S MARGIN, READ FROM ITS VERSION. The wake for a
+// completed payment counted to "expiry − 10" — LND's DefaultIncomingBroadcastDelta as it was up to 0.20. Read in
+// LND's source while checking the ACINQ clock for DP: from 0.21.0 it is 16 (0.19.3 and 0.20.1: 10; 0.21.0, 0.21.6,
+// 0.21.8 and the boxes' own branch: 16; no lnd.conf setting). So on LND 0.21 the wake's deadline was 6 blocks too
+// high: the time stated to the wallet user could be 10 to 30 minutes later than LND's own block, and the last wake
+// left at that block. lnd-margins.js (new) gives the figure for the running LND — 16 from 0.21, 10 before, 16 when
+// the version cannot be read, LND_INCOMING_BROADCAST_DELTA to override — read at every sweep (sent-watch.js) and
+// with every Push Key sender's wake (push.js, which had the same fixed 10 since 0.113.0). The Console's on-chain
+// block for an incoming HTLC follows; the Settings report shows the figure and where it came from.
+function zapsWalletOn(name) {   // has the wallet that owns this address turned zaps on?
+  try {
+    const rec = lnurlpRegistry[String(name || '').toLowerCase()];
+    if (!rec) return false;
+    const p = clientPrefs[String(rec.client_pubkey || '').toLowerCase()];
+    return !!(p && p.zaps === true);
+  } catch (_) { return false; }
+}
+function zapsWalletsOn() { try { return Object.values(clientPrefs).filter((p) => p && p.zaps === true).length; } catch (_) { return null; } }
+/// POST /client/prefs { client_pubkey, zaps: true|false } — the wallet's zap choice. Nothing is written before the node
+/// key's proof over `prefs-zaps:1` / `prefs-zaps:0` holds. No "awake" stamp is made here (the heartbeat is that proof).
+function clientPrefsZaps(body, res) {
+  const zpk = String(body.client_pubkey || '').toLowerCase();
+  if (!/^[0-9a-f]{66}$/.test(zpk)) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
+  { const zpr = lnurlpAuthCheck(body, 'client-prefs', zpk, 'prefs-zaps:' + (body.zaps ? '1' : '0')); if (!zpr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + zpr.code }, zpr.status); }
+  if (body.zaps && !zaps.on) return jsonResponse(res, { ok: false, error: 'not_offered', zaps: !!(clientPrefs[zpk] && clientPrefs[zpk].zaps === true), zaps_offered: false }, 409);
+  clientPrefs[zpk] = Object.assign(clientPrefs[zpk] || {}, { zaps: body.zaps, zaps_updated: Date.now() });
+  clientPrefsPersist();
+  console.log(`[prefs] ${zpk.slice(0, 16)}… zaps=${body.zaps ? 'on' : 'off'}`);
+  return jsonResponse(res, { ok: true, zaps: body.zaps, zaps_offered: zaps.on });
+}
+const zaps = require('./zap').createZaps({
+  enabled: String(process.env.ZAPS_ENABLED || 'false').trim().toLowerCase() === 'true',
+  dataDir: DATA_DIR, relays: process.env.ZAP_RELAYS,
+  requestRelays: String(process.env.ZAP_REQUEST_RELAYS || 'false').trim().toLowerCase() === 'true',
+  allowed: (name) => zapsWalletOn(name), countOn: () => zapsWalletsOn(),   // 0.132.0: the wallet's choice
+  log: (m) => console.log(m), persist: () => lnurlpPersist(),
+});
+function zapSettled(name, entry) {   // 0.131.0: never throws into the settle path; zap.js sends once per entry
+  try { if (entry && entry.zap) zaps.onSettled(name, entry).catch((e) => console.error(`[ZAP] ${name}: ${e.message}`)); } catch (_) {}
+}
 // v0.48 (P4): client IPs are NOT logged unless the operator opts in.
 const LOG_CLIENT_IP = (process.env.LOG_CLIENT_IP || 'off') === 'on';
 // v0.54 (O3): wallet-side channel reserve at JIT open, in SATS.
@@ -615,7 +701,27 @@ const TOWER_ENABLED = String(process.env.TOWER_ENABLED || 'false').toLowerCase()
 const TOWER_QUOTA_BYTES = parseInt(process.env.TOWER_QUOTA_BYTES || '', 10) > 0 ? parseInt(process.env.TOWER_QUOTA_BYTES, 10) : 5 * 1024 * 1024;
 const TOWER_KEEP_DAYS = parseInt(process.env.TOWER_KEEP_DAYS || '', 10) > 0 ? parseInt(process.env.TOWER_KEEP_DAYS, 10) : 400;
 const TOWER_POLL_MS = Math.max(5000, (parseInt(process.env.TOWER_POLL_SECONDS || '', 10) || 30) * 1000);
-const tower = TOWER_ENABLED ? towerLib.createTower({ dataDir: DATA_DIR, quotaBytes: TOWER_QUOTA_BYTES, keepDaysSilent: TOWER_KEEP_DAYS, log: (m) => console.log(m) }) : null;
+// 0.130.0 (S70 Sun 2026-11-15, DP "Agree, and go with the build" — the wallet repo's docs/design/watchtower/
+// watchtower-r4-spam.md and -r5-voucher.md): THE WAY IN (tower-admit.js). Until now any key could sign in, so somebody
+// with no wallet could take every key slot. A wallet key is now ADMITTED BY A VOUCHER: its provider's node-key
+// signature on the wallet's voucher key, shown with a use line that names this tower and the wallet's tower key.
+// TOWER_ADMIT=open (the default while the boxes and the wallets move over) still takes a key without one;
+// TOWER_ADMIT=voucher requires it. Keys held before stay admitted. The two fixed numbers became settings
+// (TOWER_MAX_KEYS, and TOWER_MAX_BYTES for every key together); per vouching provider TOWER_ISSUER_MAX_KEYS and
+// TOWER_ISSUER_NEW_PER_DAY; another provider's vouchers count only when this box's own node sees it with at least
+// TOWER_ISSUER_MIN_CAPACITY_SATS of public channels (LND GetNodeInfo; 0 = not asked) or it is named in
+// TOWER_ISSUERS_ALLOW. This box, as a provider, gives each of its own wallets ONE voucher at its first fee
+// (POST /v1/tower/voucher).
+const towerAdmitLib = require('./tower-admit');
+const TOWER_ADMIT = String(process.env.TOWER_ADMIT || 'open').trim().toLowerCase() === 'voucher' ? 'voucher' : 'open';
+const towerWhole = (name, dflt) => { const raw = String(process.env[name] || '').trim(); return /^[0-9]{1,15}$/.test(raw) && Number(raw) > 0 ? Number(raw) : dflt; };
+const TOWER_MAX_KEYS = towerWhole('TOWER_MAX_KEYS', 20000);
+const TOWER_MAX_BYTES = towerWhole('TOWER_MAX_BYTES', 20 * 1024 * 1024 * 1024);
+const TOWER_ISSUER_MAX_KEYS = towerWhole('TOWER_ISSUER_MAX_KEYS', 2000);
+const TOWER_ISSUER_NEW_PER_DAY = towerWhole('TOWER_ISSUER_NEW_PER_DAY', 50);
+const TOWER_ISSUER_MIN_CAPACITY_SATS = /^[0-9]{1,15}$/.test(String(process.env.TOWER_ISSUER_MIN_CAPACITY_SATS || '').trim()) ? Number(String(process.env.TOWER_ISSUER_MIN_CAPACITY_SATS).trim()) : 2000000;
+const TOWER_ISSUERS_ALLOW = String(process.env.TOWER_ISSUERS_ALLOW || '').split(',').map((s) => s.trim().toLowerCase()).filter((s) => /^0[23][0-9a-f]{64}$/.test(s));
+const tower = TOWER_ENABLED ? towerLib.createTower({ dataDir: DATA_DIR, quotaBytes: TOWER_QUOTA_BYTES, keepDaysSilent: TOWER_KEEP_DAYS, maxWallets: TOWER_MAX_KEYS, maxBytes: TOWER_MAX_BYTES, log: (m) => console.log(m) }) : null;
 const towerState = { watching: false, why: TOWER_ENABLED ? 'the block reads have not been tried yet' : 'TOWER_ENABLED is not true', probed_ms: null, height: null };
 const towerLnd = {
   bestBlock: async () => { const j = await lndGetOk('/v2/chainkit/bestblock'); return { height: Number(j.block_height), hash: String(j.block_hash || '') }; },
@@ -624,6 +730,54 @@ const towerLnd = {
   publish: async (hex) => lndOrThrow(await lndPost('/v2/wallet/tx', { tx_hex: Buffer.from(hex, 'hex').toString('base64'), label: 'lijox tower penalty' }), 'PublishTransaction'),
 };
 const towerWatch = tower ? createTowerWatch({ tower, lnd: towerLnd, dataDir: DATA_DIR, log: (m) => console.log(m) }) : null;
+// 0.130.0: can this box's key read the public graph (GetNodeInfo)? null = not tried yet.
+const towerGraph = { ok: null, why: '' };
+/// A node's public channel capacity as THIS box's node sees it, in sats; 0 = not in the public graph; null = the read
+/// could not be made (the key lacks it, or LND did not answer).
+async function towerNodeCapacity(pubkey) {
+  if (!/^0[23][0-9a-f]{64}$/.test(String(pubkey || ''))) return null;
+  const r = await lndGet('/v1/graph/node/' + pubkey).catch(() => null);
+  if (!r) return null;
+  const m = lndBodyError(r);
+  if (/permission denied|macaroon|unauthorized/i.test(m)) { towerGraph.ok = false; towerGraph.why = 'the key lacks /lnrpc.Lightning/GetNodeInfo'; return null; }
+  towerGraph.ok = true; towerGraph.why = '';
+  if (m) return /unable to find|not found/i.test(m) ? 0 : null;
+  return Number(r.total_capacity || 0);
+}
+const towerListed = async () => { for (const reg of CONFIG.registries) { const r = await httpsGetJson(reg + '/lsps'); if (r && r.json && Array.isArray(r.json.lsps)) return r.json.lsps; } return []; };
+const towerAdmit = tower ? towerAdmitLib.createAdmit({
+  dataDir: DATA_DIR, mode: TOWER_ADMIT, keepDays: TOWER_KEEP_DAYS, log: (m) => console.log(m),
+  issuerMaxKeys: TOWER_ISSUER_MAX_KEYS, issuerNewPerDay: TOWER_ISSUER_NEW_PER_DAY, minCapacitySats: TOWER_ISSUER_MIN_CAPACITY_SATS, allow: TOWER_ISSUERS_ALLOW,
+  self: () => String(LOCAL_PUBKEY || '').toLowerCase(),
+  held: (k) => tower.has(k),
+  listed: towerListed,
+  verifyNode: async (text, sig) => { const r = await lndPost('/v1/verifymessage', { msg: Buffer.from(text, 'utf8').toString('base64'), signature: sig }); return String((r && r.pubkey) || '').toLowerCase() || null; },
+  capacity: towerNodeCapacity,
+}) : null;
+/// Has this wallet paid this provider a fee yet? DP's rule (2026-11-15): after the JIT funding, or after a first
+/// payment that paid the provider. Read as: a fee from this wallet in this box's own ledger (pl-events.ndjson — the
+/// open fee of a JIT channel, a hold fee), or one of its channels having carried a payment (LND ListChannels).
+async function towerVoucherEligible(wallet) {
+  try {
+    const text = require('fs').readFileSync(require('path').join(DATA_DIR, 'pl-events.ndjson'), 'utf8');
+    for (const line of text.split('\n')) {
+      if (!line || line.indexOf(wallet) < 0) continue;
+      let e = null; try { e = JSON.parse(line); } catch (x) { continue; }
+      if (e && String(e.wallet || '').toLowerCase() === wallet && (e.kind === 'open_fee' || e.kind === 'hold_fee') && Number(e.msat) > 0) return { ok: true, why: 'a fee from it is in the ledger' };
+    }
+  } catch (e) {}
+  const r = await lndGet('/v1/channels').catch(() => null);
+  if (!r || !Array.isArray(r.channels)) return { ok: false, why: 'the channels could not be read just now' };
+  for (const c of r.channels) {
+    if (String(c.remote_pubkey || '').toLowerCase() !== wallet) continue;
+    if (Number(c.total_satoshis_sent || 0) + Number(c.total_satoshis_received || 0) > 0) return { ok: true, why: 'its channel has carried a payment' };
+  }
+  return { ok: false, why: 'no fee from this wallet yet' };
+}
+const towerDesk = tower ? towerAdmitLib.createDesk({
+  dataDir: DATA_DIR, log: (m) => console.log(m), eligible: towerVoucherEligible,
+  sign: async (text) => { const r = await lndPost('/v1/signmessage', { msg: Buffer.from(text, 'utf8').toString('base64') }); return String((r && r.signature) || ''); },
+}) : null;
 // 0.129.0 (S69, DP "I like this, do it"): THE JOINING DRILL — tower-drill.js. This box, with its own coins, proves
 // that ANOTHER provider's tower publishes: a small transaction of its own stands in for an old state, the tower is
 // handed the answer, and must publish it by itself within six blocks. Started by a command on the box only
@@ -643,6 +797,13 @@ const towerDrillPost = (endpoint, body) => new Promise((resolve) => {
 });
 const towerDrill = TOWER_ENABLED ? createTowerDrill({
   dataDir: DATA_DIR, log: (m) => console.log(m), post: towerDrillPost, chain: towerLnd,
+  // 0.130.0: the drill's one-time key is admitted as a wallet's is — this provider vouches for it with its node key
+  voucher: async (towerNodeKey, towerKey) => {
+    const vsk = crypto.randomBytes(32), vk = require('./schnorr.js').pubkey(vsk).toString('hex');
+    const s = await lndPost('/v1/signmessage', { msg: Buffer.from(towerAdmitLib.voucherText(vk), 'utf8').toString('base64') });
+    const sig = String((s && s.signature) || ''); if (!sig) return null;
+    return { key: vk, issuer: String(LOCAL_PUBKEY || '').toLowerCase(), issuer_sig: sig, use_sig: towerAdmitLib.signUse(vsk, towerNodeKey, towerKey) };
+  },
   lnd: {
     fundPsbt: async (b) => lndOrThrow(await lndPost('/v2/wallet/psbt/fund', b), 'FundPsbt'),
     finalizePsbt: async (b) => lndOrThrow(await lndPost('/v2/wallet/psbt/finalize', b), 'FinalizePsbt'),
@@ -671,9 +832,12 @@ async function towerDrillStart(pubkey, by) {
   try { const rec = await towerDrill.start(c, Number(process.env.TOWER_DRILL_SATS) || 20000); console.log(`[TOWER-DRILL] started by ${by}`); return { ok: true, drill: rec }; }
   catch (e) { console.error(`[TOWER-DRILL] not started (${by}): ${e.message}`); return { ok: false, error: String(e.message || e).slice(0, 240) }; }
 }
-const towerCapability = () => tower ? Object.assign({}, tower.capability, { offered: towerState.watching, watching: towerState.watching }) : { offered: false };
+const towerCapability = () => tower ? Object.assign({}, tower.capability, { offered: towerState.watching, watching: towerState.watching, admit: TOWER_ADMIT, vouchers: true }) : { offered: false };   // 0.130.0: admit = how a key gets in here; vouchers = this provider gives its own wallets theirs
 const towerReport = () => ({ drills: towerDrill ? towerDrill.list().slice(-8) : [], drill_candidates: towerDrillCands.list, enabled: TOWER_ENABLED, watching: towerState.watching, why: towerState.why, quota_bytes: TOWER_QUOTA_BYTES, keep_days_silent: TOWER_KEEP_DAYS, poll_s: TOWER_POLL_MS / 1000,
-  held: tower ? tower.summary() : null, watch: towerWatch ? towerWatch.summary() : null });
+  held: tower ? tower.summary() : null, watch: towerWatch ? towerWatch.summary() : null,
+  // 0.130.0: the way in — who vouched for how many keys, what was refused, the vouchers this box gave, the graph read
+  admit: towerAdmit ? towerAdmit.summary((k) => tower.usage(k)) : null, vouchers: towerDesk ? towerDesk.summary() : null, graph: { ok: towerGraph.ok, why: towerGraph.why },
+  issuer_names: Object.assign({}, ...towerDrillCands.list.map((x) => ({ [x.pubkey]: x.name })), LOCAL_PUBKEY ? { [String(LOCAL_PUBKEY).toLowerCase()]: 'this box' } : {}) });
 // The three block reads, tried end to end with the key the adapter holds. Said once in the journal; tried again every
 // ten minutes while it fails (LND may still be starting), and the watch begins the moment it passes.
 let towerTimer = null;
@@ -690,9 +854,20 @@ async function towerBoot() {
   if (towerState.registered_offered === false) registerWithRegistry().catch(() => {});   // 0.129.0: the record said "not offered" (it was signed before the block reads were tried) — say it again now
   const h = tower.summary();
   console.log(`[TOWER] key probe: the three block reads answer (best block ${p.height}, ${p.txs} transactions) — WATCHING every ${TOWER_POLL_MS / 1000} s · ${h.items} item(s) held for ${h.wallets} wallet key(s), ${h.bytes} bytes · ${TOWER_QUOTA_BYTES} bytes a wallet key, dropped after ${TOWER_KEEP_DAYS} silent days`);
+  // 0.130.0: the way in. Keys held from before stay admitted; the graph read is tried once, on this box's own node.
+  if (!towerState.admit_said) {
+    towerState.admit_said = true;
+    try { towerAdmit.seed(tower.heldKeys()); } catch (e) { console.error(`[TOWER] the admitted keys could not be written: ${e.message}`); }
+    await towerNodeCapacity(String(LOCAL_PUBKEY || '').toLowerCase()).catch(() => null);
+    const ad = towerAdmit.summary();
+    console.log(`[TOWER] the way in: ${TOWER_ADMIT === 'voucher' ? 'BY VOUCHER ONLY' : 'OPEN — a key is taken with or without a voucher (TOWER_ADMIT=voucher requires one)'} · ${ad.admitted} key(s) admitted, ${ad.by_voucher} by voucher · at most ${TOWER_MAX_KEYS} keys and ${TOWER_MAX_BYTES} bytes in all · per vouching provider ${TOWER_ISSUER_MAX_KEYS} keys, ${TOWER_ISSUER_NEW_PER_DAY} new a day`);
+    if (TOWER_ISSUER_MIN_CAPACITY_SATS > 0) console.log(towerGraph.ok === true
+      ? `[TOWER] key probe: the graph read answers — another provider's vouchers count when this node sees it with at least ${TOWER_ISSUER_MIN_CAPACITY_SATS} sats of public channels (${TOWER_ISSUERS_ALLOW.length} provider(s) named in TOWER_ISSUERS_ALLOW)`
+      : `[TOWER] key probe: the graph read did NOT answer (${towerGraph.why || 'LND gave no answer'}) — another provider's vouchers are taken only when it is named in TOWER_ISSUERS_ALLOW (${TOWER_ISSUERS_ALLOW.length} named); the key needs /lnrpc.Lightning/GetNodeInfo (MACAROON.md)`);
+  }
   const look = () => towerWatch.poll().then((r) => { if (!r.ok && towerState.why !== r.why) console.error(`[TOWER] a look at the chain failed: ${r.why}`); towerState.why = r.ok ? '' : r.why; if (r.ok && r.height) towerState.height = r.height; }).catch(() => {});
   look(); towerTimer = setInterval(look, TOWER_POLL_MS); towerTimer.unref();
-  setInterval(() => { try { tower.sweep(); } catch (e) { console.error(`[TOWER] sweep failed: ${e.message}`); } }, 86400000).unref();
+  setInterval(() => { try { tower.sweep(); towerAdmit.forgetSilent(); } catch (e) { console.error(`[TOWER] sweep failed: ${e.message}`); } }, 86400000).unref();
   // 0.129.0: the drills move with the chain (a look a minute); the list of providers that could be drilled, read every ten minutes
   setInterval(() => { towerDrill.tick().catch(() => {}); }, 60000).unref();
   // 0.129.1: a drill is asked for on the box (`--tower-drill`), never from the Console — the request file is read here
@@ -743,7 +918,7 @@ async function pushSenderHtlc(clientPubkey, hashHex) {
   for (const c of chans.channels) {
     if (String(c.remote_pubkey || '').toLowerCase() !== String(clientPubkey).toLowerCase()) continue;
     const h = (c.pending_htlcs || []).find((x) => x && x.incoming && x.hash_lock === want);
-    if (h) return { ok: true, chan_point: c.channel_point, active: !!c.active, expiration_height: Number(h.expiration_height), height: Number(info && info.block_height) };
+    if (h) return { ok: true, chan_point: c.channel_point, active: !!c.active, expiration_height: Number(h.expiration_height), height: Number(info && info.block_height), incoming_delta: incomingBroadcastDelta(info && info.version, process.env.LND_INCOMING_BROADCAST_DELTA).delta };   // 0.133.4: the running LND's margin, for the sender's wake
   }
   return { ok: false, reason: 'no open channel of the sender\'s carries this lock' };
 }
@@ -760,6 +935,20 @@ const pushRail = createPushRail({
   proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),   // 0.116.0 (F4): the node key's proof on the claim routes
   lndDelete: (p) => lndRequest('DELETE', p, null),   // 0.116.0 (F6): DeleteCanceledInvoice
 });
+// 0.133.0 (S70): a payment a wallet sent that was settled or failed here while that wallet is offline — the wake, tied
+// to the block at which a channel would go on-chain, and the Console's line. It reads LND and sends pushes; nothing else.
+const sentWatch = createSentWatch({
+  dataDir: DATA_DIR, log: (m) => console.log(m),
+  lndGet: (p) => lndGet(p), lndPost: (p, b) => lndPost(p, b),
+  isWalletPeer: (pk) => leaseIsWalletPeer(pk),
+  interceptOpen: (k) => !!(htlcInterceptor && htlcInterceptor.isOpen && htlcInterceptor.isOpen(k)),
+  sendWakePush: (pk, ms, kind, extra, ttlS) => sendWakePush(pk, ms, kind, extra, ttlS),
+  hasPushSub: (pk) => !!pushSubs[String(pk || '').toLowerCase()],
+  isPushLock: (h) => { try { return !!pushRail._reg().out[String(h)]; } catch (_) { return false; } },   // the Push rail wakes its own sender first
+  incomingDeltaSetting: process.env.LND_INCOMING_BROADCAST_DELTA,   // 0.133.4: the operator's own figure, when LND's differs from the rule in lnd-margins.js
+});
+setInterval(() => { sentWatch.sweep().catch((e) => console.error(`[SENT-WATCH] sweep: ${e.message}`)); }, 120000).unref();
+setTimeout(() => { sentWatch.sweep().catch((e) => console.error(`[SENT-WATCH] sweep: ${e.message}`)); }, 181000).unref();   // 0.133.1: the first read comes as the start's 3-minute grace ends — when the Console says it will
 // 0.120.0 (S66 Mon 2026-11-02, DP 23:12 "Go on Phase 1" — LIGHTNING PAYS ON-CHAIN, design v0.6): the rail. The float
 // wallet's door opens only when ONCHAIN_PAY_RPC_URL/_USER/_PASS are set; the take-back key from ONCHAIN_PAY_TAKEBACK_SEED;
 // without either the rail answers "off" and does nothing (open payments, if any, are named at boot). The notifiers are
@@ -1627,6 +1816,7 @@ function lnurlpPruneNotes() {
     for (const e of ((rec && rec.entries) || [])) {
       if (e && e.note != null && Number(e.note_ts || 0) < cutoff) { delete e.note; delete e.note_ts; }
       if (e && e.pr && e.status !== 'reserved') delete e.pr;   // 0.125.0: the kept invoice text serves the same-stamp retry only while it is unpaid
+      if (e && e.zap) { try { zaps.prune(e); } catch (_) {} }   // 0.131.0: a zap record goes with an entry that did not settle, and after a week
     }
   }
 }
@@ -2241,6 +2431,7 @@ async function lnurlpProbeInflight(name, entry) {
     }
     entry.status = 'settled'; entry.settled_at = Date.now(); delete entry._inflight_at; delete entry.settle_error; lnurlpPersist(); lnurlpStopWatch(entry.hash);
     console.log(`[LNURLP] ${name}: SETTLED (late — inner succeeded after the RPC deadline) hash=${entry.hash.slice(0,16)}…`);
+    zapSettled(name, entry);   // 0.131.0
   } else if (pay.status === 'FAILED') {
     delete entry._inflight_at;
     const reason = String(pay.failure_reason || '');
@@ -2519,6 +2710,7 @@ async function lnurlpDeliver(name, entry) {
     console.log(`[LNURLP] ${name}: SETTLED ${innerMsat} msat delivered, fee ${feeMsat} msat kept, hash=${entry.hash.slice(0,16)}…`);
     plRecord(feeMsat > 0n ? 'open_fee' : 'hold_fee', { msat: Number(feeMsat), moved_msat: Number(innerMsat), wallet: client, name, hash: entry.hash });   // 0.72.0 PL ledger · 0.76.0: moved_msat = what was delivered
     leaseTouch(client, 'lnurl:delivered');   // 0.73.0
+    zapSettled(name, entry);   // 0.131.0
   } finally {
     delete entry._delivering;
   }
@@ -2639,11 +2831,13 @@ function lnurlpWatch(name, entry) {
             plRecord(feeK > 0 ? 'open_fee' : 'hold_fee', { msat: feeK, moved_msat: Number(entry.delivered_msat || entry.amount_msat || 0), wallet: rec3 ? rec3.client_pubkey : '', name, hash: entry.hash });
             if (rec3) leaseTouch(rec3.client_pubkey, 'lnurl:delivered');
             console.log(`[LNURLP] ${name}: SETTLED on retry hash=${entry.hash.slice(0,16)}… (try ${entry.settle_tries})`);
+            zapSettled(name, entry);   // 0.131.0
           } catch (e) { entry.settle_error = String(e.message || e).slice(0, 160); entry.settle_tries = (entry.settle_tries || 0) + 1; lnurlpPersist(); }
         }
       } else if (state === 'SETTLED') {
         if (entry.status !== 'settled') { entry.status = 'settled'; delete entry.settle_error; lnurlpPersist(); }
         lnurlpStopWatch(entry.hash);
+        zapSettled(name, entry);   // 0.131.0 (sent once: zap.js takes only a 'waiting' record)
       } else if (state === 'CANCELED') {
         if (entry.status === 'settle_pending') { entry.status = 'paid_unsettled'; entry.burn_reason = 'the recipient was paid but the payer\'s hold was cancelled before the settle — MANUAL ATTENTION'; lnurlpPersist(); console.error(`[LNURLP] ${name}: PAID BUT UNSETTLED hash=${entry.hash} (${entry.settle_error || 'settle failed'}) — MANUAL ATTENTION`); }   // 0.114.0 (F3)
         else if (entry.status !== 'burned' && entry.status !== 'chit') { entry.status = 'burned'; entry.burn_reason = 'canceled/expired'; lnurlpPersist(); }   // 0.91.0: a chit's cancel is not a burn
@@ -2674,6 +2868,7 @@ function lnurlpBootResume() {
   if (resumed) console.log(`[LNURLP] boot: resumed ${resumed} in-flight watcher(s)`);
 }
 setTimeout(lnurlpBootResume, 8000);   // after LND connect settles
+setTimeout(() => { try { zaps.resume(lnurlpRegistry); } catch (e) { console.error(`[ZAP] boot resume failed: ${e.message}`); } }, 15000);   // 0.131.0: receipts not sent before a restart
 setTimeout(() => { try { pushRail.bootResume(); } catch (e) { console.error(`[PUSH-KEY] boot resume failed: ${e.message}`); } }, 9000);   // 0.82.0
 setTimeout(() => { onchainPay.boot().catch((e) => console.error(`[ONCHAIN-PAY] boot failed: ${e.message}`)); }, 9500);   // 0.120.0: the float probe, the records, the watches re-armed
 setTimeout(() => { towerBoot().catch((e) => console.error(`[TOWER] boot failed: ${e.message}`)); }, 12000);   // 0.128.0: the block reads tried, then the watch
@@ -2891,6 +3086,7 @@ const recoverCloseKeyLimit = windowLimiter(CONFIG.security.recover_close_key_req
 const peerStorageIpLimit  = windowLimiter(parseInt(process.env.PEER_STORAGE_IP_PER_HOUR  || '600', 10) || 600, 3600000);
 const towerIpLimit  = windowLimiter(parseInt(process.env.TOWER_IP_PER_HOUR  || '1200', 10) || 1200, 3600000);   // 0.128.0
 const towerKeyLimit = windowLimiter(parseInt(process.env.TOWER_KEY_PER_HOUR || '600', 10) || 600, 3600000);
+const towerVoucherKeyLimit = windowLimiter(30, 3600000);   // 0.130.0: a wallet's asks for its voucher, by its node key
 const peerStorageKeyLimit = windowLimiter(parseInt(process.env.PEER_STORAGE_KEY_PER_HOUR || '300', 10) || 300, 3600000);
 const lnurlFetchIpLimit = windowLimiter(parseInt(process.env.LNURL_FETCH_IP_PER_MIN || '30', 10) || 30, 60000);
 let lnurlFetchCounts = { asked: 0, served: 0, refused: 0 };   // the only record kept — never the URL
@@ -3213,6 +3409,23 @@ function buildLsps2HumanSummary() {
        + `Your offer is valid for ${validMin} minutes.`;
 }
 
+// ── the arrived-amount rule (0.130.1) ───────────────────────────────────────────────────────────────────────────────
+// An intercepted HTLC carries two amounts: what ARRIVED on it (incoming_amount_msat) and what its onion asks this node
+// to send on (outgoing_amount_msat). LND compares the two only when it forwards the HTLC itself (its own check sits
+// behind the interceptor). A JIT open, and every delivery this adapter pays with an HTLC of its own, is paid by the
+// adapter and settled back against what arrived — so the adapter must compare them. Until 0.130.1 it did not: the
+// open forwarded (the sum of the onions' amounts − the open fee) whatever had arrived, and a payer whose onion asked
+// for more than it sent was paid the difference out of this node's funds.
+//   · one HTLC:  refused when less arrived than its onion asks to send on (an HTLC with no arrived amount is short);
+//   · a set:     refused when the arrived amounts sum to less than what will be paid on plus the open fee.
+function htlcArrivedMsat(x) { try { const v = x && x.incoming_amount_msat; return (v === undefined || v === null || v === '') ? 0n : BigInt(String(v)); } catch (_) { return 0n; } }
+function htlcAskedMsat(x) { try { const v = x && x.outgoing_amount_msat; return (v === undefined || v === null || v === '') ? 0n : BigInt(String(v)); } catch (_) { return 0n; } }
+function htlcArrivedShort(x) { const a = htlcArrivedMsat(x); return a <= 0n || a < htlcAskedMsat(x); }
+function setArrivedShort(arrivedSumMsat, forwardMsat, feeMsat) { return BigInt(arrivedSumMsat) < BigInt(forwardMsat) + BigInt(feeMsat); }
+// what arrived on a recorded set (each part remembers its own arrived amount; a part without one counts as nothing)
+function shardsArrivedMsat(shards) { let a = 0n; if (shards) for (const [, sh] of shards) a += (sh && typeof sh.in_msat === 'bigint') ? sh.in_msat : 0n; return a; }
+// ── end of the arrived-amount rule
+
 // v0.18 Phase D.2: htlc-interceptor request handler — trampoline path.
 //
 // MAY return synchronously (for non-matches / FAIL cases) or return a
@@ -3244,6 +3457,16 @@ async function handleInterceptedHtlc(req) {
     action: 'FAIL',
     failure_code: 1,   // LND lnrpc INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS (was mislabeled 16=REQUIRED_NODE_FEATURE_MISSING, which LND rejects -> crashes interceptor)
   };
+
+  // 0.130.1 THE DOOR (the arrived-amount rule): an HTLC on which less arrived than its onion asks this node to send on
+  // is failed back here, before any path — nothing is held, nothing opens, nothing is paid on. No honest forward looks
+  // like this (a forward never carries less in than out), and LND would refuse it too if it forwarded it itself.
+  if (htlcArrivedShort(req)) {
+    const _shHash = (req.payment_hash && req.payment_hash.toString) ? req.payment_hash.toString('hex') : String(req.payment_hash || '');
+    console.error(`[LSPS2] SHORT: an HTLC arrived with ${htlcArrivedMsat(req)} msat and its onion asks ${htlcAskedMsat(req)} msat to be sent on (hash ${_shHash.slice(0, 16)}…) — failing back at the door, nothing opens`);
+    try { SM.emit('hold_refused', { hash: _shHash, why: 'arrived short' }); } catch (_) {}
+    return FAIL_TEMP;
+  }
 
   try {
     {   // 0.114.0 (F1): a re-delivered (the interceptor stream came back) or sibling HTLC of a parked hash joins the park — the probe resolves it
@@ -3300,7 +3523,7 @@ async function handleInterceptedHtlc(req) {
               const dCk = req.incoming_circuit_key || {};
               const dKey = `${dCk.chan_id || '0'}:${dCk.htlc_id || '0'}`;
               if (!dPromise._shards.has(dKey)) {
-                dPromise._shards.set(dKey, { incoming_circuit_key: req.incoming_circuit_key, msat: dOut });
+                dPromise._shards.set(dKey, { incoming_circuit_key: req.incoming_circuit_key, msat: dOut, in_msat: htlcArrivedMsat(req) });   // 0.130.1: what arrived on this part
                 try { SM.emit('shard_registered', { hash: _dHash }); } catch (_) {}
                 dPromise._shard_sum_msat += dOut;
               }
@@ -3437,7 +3660,7 @@ async function handleInterceptedHtlc(req) {
                 const _dCk = req.incoming_circuit_key || {};
                 const _dKey = `${_dCk.chan_id || '0'}:${_dCk.htlc_id || '0'}`;
                 if (!_pr._shards.has(_dKey)) {
-                  _pr._shards.set(_dKey, { incoming_circuit_key: req.incoming_circuit_key, msat: _dOut });
+                  _pr._shards.set(_dKey, { incoming_circuit_key: req.incoming_circuit_key, msat: _dOut, in_msat: htlcArrivedMsat(req) });   // 0.130.1: what arrived on this part
                   try { SM.emit('shard_registered', { hash: _eHash }); } catch (_) {}
                   _pr._shard_sum_msat += _dOut;
                 }
@@ -3555,6 +3778,13 @@ async function handleInterceptedHtlc(req) {
       return handleVariableShard(req, promise, outgoingScidHex, paymentHashHex);
     }
 
+    // 0.130.1 (the arrived-amount rule, the fixed path, per part): nothing is recorded for a part on which less
+    // arrived than its onion asks to be sent on
+    if (htlcArrivedShort(req)) {
+      console.error(`[LSPS2] SHORT part for scid=${outgoingScidHex}: arrived ${htlcArrivedMsat(req)} msat, asked ${outAmtMsat} msat — failing back, nothing opens`);
+      try { SM.emit('hold_refused', { hash: paymentHashHex, why: 'arrived short' }); } catch (_) {}
+      return FAIL_TEMP;
+    }
     const promiseSizeMsat = BigInt(promise.payment_size_msat);
     const promiseFeeMsat = BigInt(promise.fee_msat);
     const grossTotalMsat = promiseSizeMsat + promiseFeeMsat;
@@ -3603,7 +3833,7 @@ async function handleInterceptedHtlc(req) {
       const ck = req.incoming_circuit_key || {};
       const ckKey = `${ck.chan_id || '0'}:${ck.htlc_id || '0'}`;
       if (!promise._shards.has(ckKey)) {
-        promise._shards.set(ckKey, { incoming_circuit_key: req.incoming_circuit_key, msat: outAmtMsat });
+        promise._shards.set(ckKey, { incoming_circuit_key: req.incoming_circuit_key, msat: outAmtMsat, in_msat: htlcArrivedMsat(req) });   // 0.130.1: what arrived on this part
         try { SM.emit('shard_registered', { hash: (req.payment_hash && req.payment_hash.toString) ? req.payment_hash.toString('hex') : String(req.payment_hash || '') }); } catch (_) {}
         promise._shard_sum_msat += outAmtMsat;
       }
@@ -4042,6 +4272,14 @@ function handleVariableShard(req, promise, outgoingScidHex, paymentHashHex) {
   };
   const outAmtMsat = BigInt(req.outgoing_amount_msat || '0');
 
+  // 0.130.1 (the arrived-amount rule, the variable path, per part): the channel is sized from, and the wallet paid
+  // from, the parts' asked amounts — a part on which less arrived is never recorded
+  if (htlcArrivedShort(req)) {
+    console.error(`[LSPS2] v0.20 SHORT part for scid=${outgoingScidHex}: arrived ${htlcArrivedMsat(req)} msat, asked ${outAmtMsat} msat — failing back, nothing opens`);
+    try { SM.emit('hold_refused', { hash: paymentHashHex, why: 'arrived short' }); } catch (_) {}
+    return FAIL_TEMP;
+  }
+
   // Straggler after the set was committed: FAIL. If the flush settled, the
   // sender already holds the preimage (payment proven; this part refunds).
   if (promise._var_flushing) {
@@ -4073,7 +4311,7 @@ function handleVariableShard(req, promise, outgoingScidHex, paymentHashHex) {
   const ck = req.incoming_circuit_key || {};
   const ckKey = `${ck.chan_id || '0'}:${ck.htlc_id || '0'}`;
   if (!promise._shards.has(ckKey)) {
-    promise._shards.set(ckKey, { incoming_circuit_key: req.incoming_circuit_key, msat: outAmtMsat });
+    promise._shards.set(ckKey, { incoming_circuit_key: req.incoming_circuit_key, msat: outAmtMsat, in_msat: htlcArrivedMsat(req) });   // 0.130.1: what arrived on this part
     promise._shard_sum_msat += outAmtMsat;
     try { SM.emit('shard_registered', { hash: paymentHashHex, mode: 'variable' }); } catch (_) {}
   }
@@ -4140,6 +4378,20 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
       htlcInterceptor.getCounters()._lastWrite(r);
     }
   };
+
+  // 0.130.1 (the arrived-amount rule, the variable path, the whole set): what arrived across the parts must cover
+  // what will be paid on (net) plus the open fee — else every part is failed back and nothing opens
+  const arrived = shardsArrivedMsat(promise._shards);
+  if (net > 0n && setArrivedShort(arrived, net, fee)) {
+    console.error(`[LSPS2] v0.20 flush SHORT: ${arrived} msat arrived across ${promise._shards.size} part(s), ${net} msat to pay on + ${fee} msat fee — FAILing all, nothing opens`);
+    for (const [, sh] of promise._shards) {
+      writeOne({ incoming_circuit_key: sh.incoming_circuit_key, action: 'FAIL', failure_code: 15 });
+    }
+    try { SM.emit('var_flush_failed', { hash: paymentHashHex, why: 'arrived short' }); } catch (_) {}
+    if (promise._b16_hash) promiseByPaymentHash.delete(promise._b16_hash);
+    promise._shards = null; promise._shard_sum_msat = 0n; promise._var_flushing = false;
+    return;
+  }
 
   if (net <= 0n) {
     console.warn(`[LSPS2] v0.20 flush: gross ${sum} msat <= fee ${fee} — FAILing all ${promise._shards.size} part(s)`);
@@ -4215,7 +4467,7 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
         client_pubkey: promise.client_pubkey,
         outgoing_scid_hex: scidHex,
         outgoing_amount_msat: sh.msat.toString(),
-        incoming_amount_msat: sh.msat.toString(),
+        incoming_amount_msat: ((typeof sh.in_msat === 'bigint') ? sh.in_msat : 0n).toString(),   // 0.130.1: what arrived, not what was asked
         outgoing_expiry: varExpiry,
         auto_fail_height: holdAutoFail,
         htlc_received_at: Date.now(),
@@ -4240,7 +4492,7 @@ async function flushVariable(promise, scidHex, paymentHashHex) {
   const synthetic = {
     incoming_circuit_key: first.incoming_circuit_key,
     outgoing_amount_msat: sum.toString(),
-    incoming_amount_msat: sum.toString(),
+    incoming_amount_msat: arrived.toString(),   // 0.130.1: what arrived across the parts
     outgoing_expiry: String(promise._var_min_expiry === Number.POSITIVE_INFINITY ? 0 : promise._var_min_expiry),
     auto_fail_height: String(promise._var_min_autofail === Number.POSITIVE_INFINITY ? 0 : promise._var_min_autofail),
     custom_records: {},
@@ -4433,6 +4685,23 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     return FAIL_TEMP;
   }
   let _guardCp = '';   // 0.104.0: the channel point the guard remembers, once the funding is published
+
+  // 0.130.1 THE ARRIVED-AMOUNT RULE, THE WHOLE SET, BEFORE ANYTHING OPENS. What will be paid on is (the asked amounts −
+  // the open fee); what arrived across the parts (or on the one HTLC) must cover that plus the fee. Short: every part
+  // is failed back and no channel is opened.
+  {
+    const _setSh = !!(promise._shards && promise._shard_sum_msat > 0n);
+    const _askedSet = _setSh ? promise._shard_sum_msat : htlcAskedMsat(req);
+    const _arrivedSet = _setSh ? shardsArrivedMsat(promise._shards) : htlcArrivedMsat(req);
+    const _feeSet = BigInt(promise.fee_msat || 0);
+    if (setArrivedShort(_arrivedSet, _askedSet - _feeSet, _feeSet)) {
+      trampolineForwardsFailed += 1;
+      console.error(`[LSPS2] SHORT set for scid=${scidHex}: ${_arrivedSet} msat arrived, ${_askedSet - _feeSet} msat to pay on + ${_feeSet} msat fee (hash=${String(paymentHashHex).slice(0,16)}…) — failing every part back, nothing opens`);
+      try { SM.emit('hold_refused', { hash: paymentHashHex, why: 'arrived short' }); } catch (_) {}
+      jitFailSiblings(promise, req, 'arrived short');
+      return FAIL_TEMP;
+    }
+  }
 
   // D-1 2b: fresh peer-liveness gate. The chain-bridge registry that routed
   // us here can lag ~30 min, so confirm the wallet is a connected LND peer
@@ -4632,6 +4901,17 @@ async function openChannelAndForward(req, promise, scidHex, paymentHashHex) {
     ? promise._shard_sum_msat
     : BigInt(req.outgoing_amount_msat);
   const forwardAmountMsat = (_inGross - BigInt(promise.fee_msat)).toString();
+  {   // 0.130.1: the arrived-amount rule once more, on the amount now fixed (a part may have joined while the open ran)
+    const _arrivedNow = (promise._shards && promise._shard_sum_msat > 0n) ? shardsArrivedMsat(promise._shards) : htlcArrivedMsat(req);
+    if (setArrivedShort(_arrivedNow, forwardAmountMsat, promise.fee_msat || 0)) {
+      trampolineForwardsFailed += 1;
+      console.error(`[LSPS2] SHORT at the forward for scid=${scidHex}: ${_arrivedNow} msat arrived, ${forwardAmountMsat} msat to pay on + ${promise.fee_msat} msat fee — nothing is paid on`);
+      jitGuard.fail(_guardCp, 'arrived short');
+      if (_held) jitHeldFailed(_guardCp, 'arrived short');
+      jitFailSiblings(promise, req, 'arrived short');
+      return FAIL_TEMP;
+    }
+  }
   // Option B: payment_secret is registered out-of-band by the wallet (POST
   // /lsps2/register_secret) right after it builds the invoice, BEFORE it is
   // shown to the payer. It is NOT in the intercepted HTLC: it lives in the
@@ -4963,7 +5243,7 @@ async function processPendingHtlcsForPubkey(pubkeyHex) {
       const _ck = _en.incoming_circuit_key || {};
       const _key = `${_ck.chan_id || '0'}:${_ck.htlc_id || '0'}`;
       if (!promise._shards.has(_key)) {
-        promise._shards.set(_key, { incoming_circuit_key: _en.incoming_circuit_key, msat: BigInt(_en.outgoing_amount_msat || '0') });
+        promise._shards.set(_key, { incoming_circuit_key: _en.incoming_circuit_key, msat: BigInt(_en.outgoing_amount_msat || '0'), in_msat: htlcArrivedMsat(_en) });   // 0.130.1: what arrived on this part, as the held record wrote it
         promise._shard_sum_msat += BigInt(_en.outgoing_amount_msat || '0');
       }
     }
@@ -5510,6 +5790,10 @@ async function trampolineForwardHeld(held, paymentHashHex, invSec) {
   const info = await lndGet('/v1/getinfo').catch(() => null);
   const tip = (info && info.block_height) || 0;
   if (!tip) { console.warn('[B-10] no live tip -- skip trampoline this tick'); return false; }
+  if (htlcArrivedShort(held)) {   // 0.130.1 (the arrived-amount rule): this delivery is paid by the adapter — never more than arrived
+    console.error(`[B-10] SHORT: the held HTLC ${String(paymentHashHex).slice(0,16)}… arrived with ${htlcArrivedMsat(held)} msat and asks ${htlcAskedMsat(held)} msat — not paid on`);
+    return false;
+  }
   const amtMsat = String(held.outgoing_amount_msat);
   const expiry = tip + 80;
   const route = {
@@ -6246,6 +6530,15 @@ function settingsReport() {
     row('NWC', 'switch', 'NWC_ENABLED', nwc.settings().enabled ? 'on' : 'off', '', 'off by default; on = this provider keeps and relays NWC requests for its wallets (never pays, never reads one) — 0.86.0'),
     row('NWC', 'request ttl ceiling', 'NWC_REQUEST_TTL_CEILING_S', nwc.settings().request_ttl_ceiling_s, 's', 'the longest a waiting request is kept; the wallet\'s own dial governs within it'),
     row('NWC', 'relay', '', nwc.settings().relay || 'n/a', '', 'derived from PUBLIC_HTTPS_URL — the same tunnel, path /nwc'),
+    row('Zaps', 'offered', 'ZAPS_ENABLED', zaps.summary().enabled ? 'on' : 'off', '', zaps.summary().enabled ? 'this provider OFFERS zaps (NIP-57); an address takes them only while its wallet has turned them on (Privacy → LSP → Nostr zaps in the wallet) — 0.132.0' : 'off by default — ' + zaps.summary().why_off),
+    row('Zaps', 'wallets with zaps on', '', zaps.summary().wallets_on === null ? 'n/a' : String(zaps.summary().wallets_on), '', 'each wallet\'s own signed choice (client-prefs.json); a wallet that never chose has them off'),
+    row('Zaps', 'receipt keys', '', zaps.summary().key_file ? 'one per address' : 'n/a', '', 'each address\'s nostrPubkey is made from DATA_DIR/zap-receipt.key and the address name — no one key signs for two addresses (0.132.0)'),
+    row('Sent payments, wallet offline', 'wakes', '', 'at once, then 144 / 36 / 6 blocks before the block', '', 'a wallet\'s sent payment settled or failed here while that wallet is offline: its wallet user is woken (kinds sent_completed / sent_returned); nothing is sent when the sorting is in doubt, or past the block — 0.133.0, sent-watch.js'),
+    (() => { const sr = sentWatch.report(); return row('Sent payments, wallet offline', 'the block', 'LND_INCOMING_BROADCAST_DELTA', 'expiry \u2212 ' + sr.incoming_delta + ' (completed) \u00b7 expiry + 3 (returned)', 'blocks', 'completed: LND closes the channel on-chain at that block to collect \u2014 ' + sr.incoming_delta + ' blocks below the expiry here (' + sr.incoming_delta_note + '; LND 0.21 and above: 16, before: 10; the setting overrides \u2014 0.133.4); returned: a wallet engine before v376 closes its own channel when it returns past it (v376 and newer wait 4,032 blocks)'); })(),
+    row('Sent payments, wallet offline', 'Console warning', '', '100', 'blocks', 'the Console\'s card "Pending HTLCs" lists every pending HTLC; one within this many blocks of the block at which a channel goes on-chain over it is marked, and counted on Guardrails; read every 2 min; report only'),
+    row('Zaps', 'relays', 'ZAP_RELAYS', zaps.summary().relays.join(', '), '', 'where every receipt is sent'),
+    row('Zaps', 'sender\'s relays', 'ZAP_REQUEST_RELAYS', zaps.summary().request_relays ? 'on' : 'off', '', 'on = receipts also go to the relays the sender names (any server the sender picks; off by default)'),
+    row('Zaps', 'since start', '', (() => { const c = zaps.summary().counts; return c.requests + ' taken, ' + c.refused + ' refused, ' + c.sent + ' receipt(s) sent, ' + c.failed + ' failed, ' + c.dropped + ' not sent (the wallet had zaps off, or a chit paid)'; })(), '', ''),
     row('Tatara', 'switch', 'TATARA_ENABLED', tatara.settings().enabled ? (tatara.settings().ok ? 'on' : 'REFUSED') : 'off', '', tatara.settings().problems.length ? tatara.settings().problems.join(' · ') : 'off by default; on = this provider offers Mix pools and declares its limits in the registry record (0.97.0: slice 1 — declared only)'),
     row('Tatara', 'sizes', 'TATARA_SIZES', (tatara.settings().sizes || []).join(', '), 'sats', 'on-chain → on-chain pools'),
     row('Tatara', 'channel pools', 'TATARA_CHANNEL_POOLS / TATARA_CHANNEL_SIZES', tatara.settings().channel_pools ? ((tatara.settings().channel_sizes || []).join(', ') || 'on') : 'off', 'sats', tatara.settings().lnd_limits ? `sizes checked against LND's own limits ${tatara.settings().lnd_limits.min_chan_size}–${tatara.settings().lnd_limits.max_chan_size} sats (minchansize/maxchansize in TATARA_LND_CONF, LND's defaults where absent; 0.103.2)` : 'sizes are checked against LND\'s limits read from TATARA_LND_CONF (0.103.2)'),
@@ -6529,6 +6822,7 @@ async function consoleSnapshot() {
     registry_records: (() => { const out = {}; try { for (const [pk, inner] of registryChannelStore.byPubkey) out[pk] = Array.from(inner.values()).map((r) => ({ channel_id: r.channel_id, funding: r.funding_txid + ':' + r.funding_vout, value_sat: r.channel_value_sat, close_height: r.close_height || null })); } catch (_) {} return out; })(),
     registry: { url: CONFIG.registry || '', urls: CONFIG.registries, doors: registryStatus.doors, last_ok: registryStatus.last_ok, last_error: registryStatus.last_error, next_ms: registryStatus.next_ms, every_h: registryStatus.every_h, https_url: CONFIG.public.https_url, wss_url: CONFIG.public.wss_url, filter: Object.assign({}, filterStatus), routes: routesStatus.routes, routes_notes: routesStatus.notes },   // 0.87.0: the filter server as last checked · 0.108.0: the routes as registered
     backups, loops, watchdog: !!process.env.NOTIFY_SOCKET,
+    sent_watch: (() => { try { return sentWatch.report(); } catch (_) { return null; } })(),   // 0.133.0: HTLCs near the block at which a channel goes on-chain; sent payments settled or failed here for offline wallets
     jit_now: jitNowMemory(),   // 0.111.0: the live promises, aggregating sets and held payments (was the public /health/jit)
     deliver_opening: [...deliverOpening.entries()].map(([pk, o]) => ({ wallet: pk.slice(0, 16), size_sats: o.sizeSats, tag: o.tag, age_s: Math.round((Date.now() - o.at) / 1000), after_deadline: !!o.deadline })),   // 0.117.0 (F21)
     inflight_parked: [...jitInflight.values()].map((r) => ({ hash: r.hash.slice(0, 16), circuits: r.circuits.length, kind: r.kind, age_s: Math.round((Date.now() - r.at) / 1000), fail_by: r.auto_fail_height ? r.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS : null })),   // 0.114.0 (F1)
@@ -6926,8 +7220,10 @@ const MY_CHANNELS_DOMAIN = 'lij-my-channels-v1:';
 //   POST /v1/tower/put     { key, group, ts, signature, items: [{ hint, blob (base64) }] }  → { ok, kept, items, bytes, quota_bytes }
 //   POST /v1/tower/drop    { key, group, ts, signature }                                    → { ok, dropped }
 //   POST /v1/tower/status  { key, ts, signature }                                           → { ok, items, bytes, quota_bytes, last_ms, keep_days_silent, watching }
+//   0.130.0: a put or a status may carry `voucher: { key, issuer, issuer_sig, use_sig }` (tower-admit.js); the answers say `admitted`.
 // The box cannot read what it keeps: an item opens only with the id of the old state it answers, seen in a block.
 async function handleTower(req, res, ip, action) {
+  if (action === 'voucher') return handleTowerVoucher(req, res, ip);   // 0.130.0: the provider's side — one of THIS provider's wallets asks for its voucher
   if (action !== 'put' && action !== 'drop' && action !== 'status') return errResponse(res, 'Not found', 404);
   if (!tower) return jsonResponse(res, { ok: false, code: 'not_offered' }, 404);
   const ipLim = towerIpLimit.hit(ip);
@@ -6940,11 +7236,42 @@ async function handleTower(req, res, ip, action) {
   const keyLim = towerKeyLimit.hit(body.key);
   if (!keyLim.ok) return errResponse(res, 'Rate limit exceeded', 429);
   if (action === 'put') {
+    // 0.130.0: THE WAY IN (tower-admit.js). A key is admitted by a voucher, once; TOWER_ADMIT=open still takes a key
+    // without one. A refused key gets 403 with the reason and nothing of it is kept.
+    const adm = await towerAdmit.admit(body.key, body.voucher);
+    if (!adm.ok) return jsonResponse(res, { ok: false, code: adm.code, admit: TOWER_ADMIT }, 403);
     const r = tower.put(body.key, body.group, v.items);
+    if (r.ok) { towerAdmit.noteHeld(body.key); r.admitted = adm.admitted; if (adm.voucher_refused) r.voucher_refused = adm.voucher_refused; }
     return jsonResponse(res, r, r.ok ? 200 : (r.code === 'quota' ? 413 : 507));
   }
   if (action === 'drop') return jsonResponse(res, tower.drop(body.key, body.group));
-  return jsonResponse(res, Object.assign(tower.status(body.key), { watching: towerState.watching }));
+  // status: a voucher may ride it, so a wallet with nothing new to send can still be admitted by its voucher
+  let adm = null;
+  if (body.voucher && towerState.watching) adm = await towerAdmit.admit(body.key, body.voucher);
+  const st = Object.assign(tower.status(body.key), { watching: towerState.watching, admit: TOWER_ADMIT, admitted: towerAdmit.standing(body.key) });
+  if (adm && (!adm.ok || adm.voucher_refused)) st.voucher_refused = adm.ok ? adm.voucher_refused : adm.code;
+  return jsonResponse(res, st);
+}
+// 0.130.0: THE PROVIDER'S SIDE OF THE VOUCHER. One of this provider's own wallets asks — once, at its first fee, whether
+// its Watchtower switch is on or off — for this node's signature on its voucher key. The ask is signed by the wallet's
+// NODE key (the registry challenge; action "tower-voucher", record "voucher:<voucher key>" — the engine's lsp_proof).
+// One voucher a wallet, for its life: the same key asked again gets the same signature; another key is refused.
+//   POST /v1/tower/voucher  { node_pubkey, nonce, signature, voucher_key }  → { ok, issuer, voucher_key, issuer_sig }
+async function handleTowerVoucher(req, res, ip) {
+  if (!towerDesk) return jsonResponse(res, { ok: false, code: 'not_offered' }, 404);
+  const ipLim = towerIpLimit.hit(ip);
+  if (!ipLim.ok) { console.warn(`[Security] Tower limit hit for ${ip} — resets in ${ipLim.reset_s} s`); return errResponse(res, 'Rate limit exceeded', 429); }
+  let body;
+  try { body = await readBody(req, 4000); } catch (e) { return errResponse(res, 'Invalid JSON or body too large'); }
+  const pk = String((body && body.node_pubkey) || '').toLowerCase(), vk = String((body && body.voucher_key) || '').toLowerCase();
+  if (!/^0[23][0-9a-f]{64}$/.test(pk) || !/^[0-9a-f]{64}$/.test(vk)) return jsonResponse(res, { ok: false, code: 'bad_request' }, 400);
+  const auth = lnurlpAuthCheck(body, 'tower-voucher', pk, 'voucher:' + vk);
+  if (!auth.ok) return jsonResponse(res, { ok: false, code: 'auth', error: 'auth: ' + auth.code }, auth.status);
+  const keyLim = towerVoucherKeyLimit.hit(pk);
+  if (!keyLim.ok) return errResponse(res, 'Rate limit exceeded', 429);
+  const r = await towerDesk.issue(pk, vk);
+  if (!r.ok) return jsonResponse(res, { ok: false, code: r.code, why: r.why || '' }, r.code === 'not_yet' ? 403 : (r.code === 'already_issued' ? 409 : 503));
+  return jsonResponse(res, { ok: true, issuer: String(LOCAL_PUBKEY || '').toLowerCase(), voucher_key: r.voucher_key, issuer_sig: r.issuer_sig });
 }
 async function handlePeerStorage(req, res, ip, action) {
   if (action !== 'put' && action !== 'meta' && action !== 'get') return errResponse(res, 'Not found', 404);
@@ -7418,6 +7745,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
         peer_storage:    peerStorage.capability,   // 0.126.0: this box holds a wallet's channel state file (BOLT #1110's file over HTTPS; max_bytes 65531)
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
         push_key:        Object.assign({}, pushRail.capability, pushRail.summary()),   // 0.82.0: this box locks and delivers Push Keys
+        zaps:            zaps.capability(),   // 0.131.0: NIP-57 · 0.132.0: { enabled, choice: 'wallet' } — whether this provider OFFERS zaps; which addresses take them is each wallet's choice
         lnurl_fetch:     { enabled: true },   // 0.119.3 (S66, item 2): POST /v1/lnurl/fetch — the provider fetches a payee's pay terms or invoice for a phone the payee refused
         onchain_pay:     onchainPay.capability(),   // 0.120.0: Lightning pays on-chain — offered or not, the flat fee, the limits, the take-back window
         jit_funding_hold: jitFunding.capability(),   // 0.124.0: wallet trusts LSP — held funding offered (enabled, the key, the wallet's bit)
@@ -7603,6 +7931,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       metadata: lnurlpMetadata(name, lnurlpAddrHost(req, rec), isRegister ? rec.display : null),   // 0.68.0: the address host; 0.119.1: the display name; 0.125.0: on the Register answer only
       commentAllowed: LNURLP_COMMENT_MAX,   // 0.81.0 (S49, DP): the payer may write to the payee (LUD-12)
     };
+    if (!isRegister) Object.assign(answer, zaps.answerFields(name));   // 0.131.0: allowsNostr + nostrPubkey (NIP-57) on the plain answer only · 0.132.0: only while THIS address's wallet has zaps on — else nothing, as before 0.131.0
     if (isRegister) {
       const cur = lnurlpRegisterCurrency(rec);
       let stamp = '-';
@@ -7635,6 +7964,18 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (amt < minMsat || amt > BigInt(CONFIG.lsps2.variable_ceiling_msat)) {
       return jsonResponse(res, { status: 'ERROR', reason: 'amount out of range' }, 400);
     }
+    // 0.131.0: a zap request (NIP-57, the `nostr` parameter) on the PLAIN callback — checked here, before a hash is
+    // reserved; a bad one is refused with its reason. Zaps off, or a Register callback: ignored, as before.
+    // 0.132.0: read only while this address's wallet has zaps on — else ignored, and the payment is a plain one.
+    let zapReq = null;
+    if (!isRegisterCb) {
+      const zc = zaps.fromCallback(name, parsed.search, amt);
+      if (zc.error) {
+        console.log(`[ZAP] ${name}: zap request refused — ${zc.error}`);
+        return jsonResponse(res, { status: 'ERROR', reason: 'invalid zap request: ' + zc.error }, 400);
+      }
+      zapReq = zc.zap;
+    }
     // 0.127.4: receivability first (see receive-words.js) — a payment this wallet cannot be delivered is refused HERE,
     // with its reason, before a hash is used and before the payer sends anything. No answer about the room → as before.
     {
@@ -7664,6 +8005,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     entry.amount_msat = amt.toString();
     entry.reserved_at = Date.now();
     delete entry.register; delete entry.pr;   // 0.125.0: written below, after the invoice exists
+    delete entry.zap; if (zapReq) entry.zap = zaps.entryRecord(zapReq);   // 0.131.0: the request kept for the receipt
     // 0.81.0: the payer's note rides the callback (LUD-12 `comment`); cleaned, kept on the entry, never logged
     const _note = lnurlpCleanNote(parsed.searchParams.get('comment'));
     if (_note) { entry.note = _note; entry.note_ts = Date.now(); } else { delete entry.note; delete entry.note_ts; }
@@ -7681,7 +8023,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       const mintBody = {
         hash: Buffer.from(entry.hash, 'hex').toString('base64'),
         value_msat: amt.toString(),
-        description_hash: require('crypto').createHash('sha256').update(metaStr, 'utf8').digest('base64'),
+        description_hash: require('crypto').createHash('sha256').update(zapReq ? zapReq.text : metaStr, 'utf8').digest('base64'),   // 0.131.0: a zap's invoice is tied to the zap request alone, by its description hash (NIP-57 step 6)
         expiry: quote ? String(registerQuote.STAMPED_INVOICE_LIFE_S) : '1200',   // 0.67.0: an unpaid reservation lives 20 min (was 60) — a payer pays in seconds; a griefer burns fewer hashes · 0.125.0: an invoice at an agreed rate lives 10 min, so a rate never lives longer than 20 in all
         cltv_expiry: '144',
         private: true,
@@ -7715,6 +8057,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       entry.pr = hodl.payment_request;
       lnurlpPersist();
     }
+    if (zapReq) { zaps.minted(entry, hodl.payment_request); lnurlpPersist(); console.log(`[ZAP] ${name}: zap request taken — the invoice is tied to it; the receipt follows the settle`); }   // 0.131.0 · 0.132.0: "tied to" (a hash, nothing is encrypted)
     lnurlpWatch(name, entry);
     console.log(`[LNURLP] ${name}: minted hold invoice ${amt} msat hash=${entry.hash.slice(0,16)}…${entry.note ? ' note=' + Array.from(entry.note).length + ' chars' : ''}${quote ? ` \u00b7 Register: ${entry.register.units} ${quote.code} smallest unit(s) at ${quote.multiplier} msat each, 10 min` : (isRegisterCb ? ' \u00b7 Register callback, no agreed rate (' + (stampWhy || 'no currency filed or no rate held') + ') \u2014 a plain request' : '')}`);
     return jsonResponse(res, { pr: hodl.payment_request, routes: [] });
@@ -7780,6 +8123,11 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     });
     let body = null;
     try { body = JSON.parse(bodyStr); } catch (e) {}
+    // 0.132.0: THE WALLET'S ZAP CHOICE — a body { client_pubkey, zaps: true|false } with no hold_ms, proven by the node
+    // key over `prefs-zaps:1` or `prefs-zaps:0` (the engine's lsp_proof, action "client-prefs"). Off is always taken.
+    // On is refused (409 not_offered) while this provider does not offer zaps, so no "on" lies waiting to start
+    // publishing on a day the wallet's holder did not pick. The choice covers every address the wallet owns here.
+    if (body && typeof body.zaps === 'boolean' && body.hold_ms === undefined) return clientPrefsZaps(body, res);   // (the holding choice, below, is untouched)
     if (!body || !/^[0-9a-f]{66}$/.test((body.client_pubkey || '').toLowerCase())
         || typeof body.hold_ms !== 'number' || body.hold_ms < 0 || body.hold_ms > 86400000) {
       return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
@@ -7792,7 +8140,8 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     const eff = clientHoldCapMs(pk);
     touchWalletActive(String((body && body.client_pubkey) || '').toLowerCase());  /* v0.54.4 (d): prefs = awake proof */
     console.log(`[prefs] ${pk.slice(0, 16)}… hold_ms=${body.hold_ms} effective=${eff} (lsp cap ${OFFLINE_HOLD_CAP_MS})`);
-    return jsonResponse(res, { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED });   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
+    return jsonResponse(res, { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED,   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
+      zaps: !!(clientPrefs[pk] && clientPrefs[pk].zaps === true), zaps_offered: zaps.on });   // 0.132.0: the wallet's zap choice as this provider holds it, and whether zaps are offered — the wallet's switch shows this, not a note of its own
   }
   // 0.116.0 (S63, Kimi round 2 F10 — DP "Agreed"): THE AWAKE PROOF. The page sends this every 30 s while it is open:
   // the node key's proof (engine v355 lsp_proof, action "heartbeat") over `hb:<unix s>`; within 90 s of now. It is the
@@ -9081,7 +9430,8 @@ async function main() {
       // HtlcInterceptor and SendToRouteV2.
       routerClient = makeRouterClient(grpcOpts);
       lightningOpenChannelClient = makeLightningOpenChannelClient(grpcOpts);
-      htlcInterceptor = subscribeHtlcInterceptor(routerClient, handleInterceptedHtlc, 'Interceptor');
+      htlcInterceptor = subscribeHtlcInterceptor(routerClient, handleInterceptedHtlc, 'Interceptor',
+        { onResolve: (ck, action) => sentWatch.noteResolution(ck, action) });   // 0.133.0: each answer written to LND is remembered for the sorting
       console.log('[Startup] HtlcInterceptor: subscribed (LSPS2 Phase D.2 — trampoline-via-interceptor)');
 
       // v0.18: kick off reconnect-poll timer for offline-HTLC processing.
@@ -9174,6 +9524,7 @@ async function main() {
     setTimeout(() => lnurlpNameSweep().catch((e) => console.warn(`[LNURLP] name sweep failed: ${e.message}`)), 20000);
     console.log(`[Startup] Neutral address host: ${CONFIG.lnurlp.address_host}`);
   }
+  console.log(zaps.bootLine());   // 0.131.0
   // 0.66.0: channel fee-policy sweep — 30 s after boot, then hourly.
   if (CONFIG.chan_policy.enforce) {
     setTimeout(() => enforceChannelPolicy('boot').catch(e => console.warn(`[POLICY] boot sweep failed: ${e.message}`)), 30000);
@@ -9204,6 +9555,7 @@ function shutdown(signal) {
   if (htlcInterceptor) {
     try { htlcInterceptor.stop(); } catch (e) { console.error('[Shutdown] interceptor stop error:', e.message); }
   }
+  try { sentWatch.flush(); } catch (_) {}   // 0.133.0: the answers given to LND and the wakes sent, written before the exit
   if (chainBridge) {
     try { chainBridge.stop(); } catch (e) { console.error('[Shutdown] bridge stop error:', e.message); }
   }

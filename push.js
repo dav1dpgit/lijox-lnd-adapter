@@ -24,7 +24,7 @@
 //       sender's HTLC only when the sender's wallet is online; a wallet that stays closed past the HTLC's timelock
 //       risks a force close (the holder's LND goes to chain to collect a settled HTLC; the sender's own LDK goes to
 //       chain to reclaim an expired one). The wake carries the time by which to open (the HTLC's expiry height less
-//       LND's 10-block broadcast delta, at ten minutes a block).
+//       LND's broadcast delta — 16 blocks on LND 0.21 and above, 10 before (0.133.4) — at ten minutes a block).
 //   (2) THE TIMELOCK MARGIN IS 144 BLOCKS (PUSH_CLTV_MARGIN_BLOCKS; was 40): after a last-minute claim the sender
 //       has about a day to come online before the holder must collect on-chain.
 //   (3) A HOLD FEE: PUSH_HOLD_FEE_PPM_PER_DAY — per million of the amount, per day of the window (rounded up to whole
@@ -82,7 +82,7 @@ function createPushRail(deps) {
   const FEE_PPM = int(env.PUSH_DELIVERY_FEE_PPM, 2000);
   const CLTV_MARGIN_BLOCKS = int(env.PUSH_CLTV_MARGIN_BLOCKS, 144);   // 0.113.0 (2): was 40 (DP 2026-10-26: "raise … for example to 144 (about a day)")
   const HOLD_FEE_PPM_PER_DAY = int(env.PUSH_HOLD_FEE_PPM_PER_DAY, 0);   // 0.113.0 (3): the hold fee, per million per day of the window; 0 until the operator sets it
-  const LND_INCOMING_BROADCAST_DELTA = 10;   // LND goes to chain for a settled incoming HTLC this many blocks before its expiry
+  const LND_INCOMING_BROADCAST_DELTA = 16;   // LND goes to chain for a settled incoming HTLC this many blocks before its expiry — 16 on LND 0.21 and above, 10 before. 0.133.4: the figure for the RUNNING LND comes with the lock's read (senderHtlc → incoming_delta, lnd-margins.js); this is used only when it does not, and is the larger one (an earlier time, never a later one). It was a fixed 10 from 0.113.0, read from older LND.
   const DEFAULT_WINDOW_S = 72 * 3600;
   const MIN_AMOUNT_SATS = int(env.PUSH_MIN_SATS, 100);
   const MAX_AMOUNT_SATS = int(env.PUSH_MAX_SATS, 5_000_000);
@@ -205,7 +205,8 @@ function createPushRail(deps) {
     try {
       const lk = await senderHtlc(rec.client_pubkey, rec.hash);
       if (lk && lk.ok && Number.isFinite(Number(lk.expiration_height)) && Number.isFinite(Number(lk.height))) {
-        const left = Number(lk.expiration_height) - Number(lk.height) - LND_INCOMING_BROADCAST_DELTA;
+        const delta = (Number.isInteger(Number(lk.incoming_delta)) && Number(lk.incoming_delta) > 0) ? Number(lk.incoming_delta) : LND_INCOMING_BROADCAST_DELTA;   // 0.133.4
+        const left = Number(lk.expiration_height) - Number(lk.height) - delta;
         if (left > 0) untilMs = left * 600 * 1000;
       }
     } catch (_) {}

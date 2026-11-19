@@ -84,4 +84,19 @@ H.put(key2, 'd2'.repeat(16), [{ hint: 'aa'.repeat(16), blob: Buffer.alloc(50, 1)
 t('a wallet silent for more than the declared days is cleared, a live one kept', H.sweep() === 1 && H.status(key).items === 0 && H.status(key2).items === 2);
 t('the wallet limit', (() => { const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'tower-')); const h = T.createTower({ dataDir: d2, maxWallets: 1 }); h.put(key, group, [{ hint: 'aa'.repeat(16), blob: Buffer.alloc(40, 1) }]); return h.put(key2, group, [{ hint: 'bb'.repeat(16), blob: Buffer.alloc(40, 1) }]).code === 'full'; })());
 t('the journal names 8 characters of the tower key and no more', logs.length > 0 && logs.every((l) => !l.includes(key) && !l.includes(key2)));
+// 0.130.0: the ceiling for every key together, and the lookups the way in uses
+t('the ceiling for every key together: a put that would pass it is refused whole (full); a drop frees the room; a restart counts again', (() => {
+  const d3 = fs.mkdtempSync(path.join(os.tmpdir(), 'tower-')); const mk3 = () => T.createTower({ dataDir: d3, maxBytes: 120 });
+  let h = mk3(); const it = (c) => [{ hint: c.repeat(16), blob: Buffer.alloc(50, 1) }];
+  const a = h.put(key, group, it('aa')), b = h.put(key2, group, it('bb')), c = h.put(key, group, it('cc'));
+  const full = a.ok && b.ok && !c.ok && c.code === 'full' && h.summary().bytes === 100 && h.summary().max_bytes === 120;
+  h = mk3(); const again = h.put(key, group, it('cc'));   // loaded from disk: still 100 of 120
+  h.drop(key2, group); const freed = h.put(key, group, it('cc'));
+  return full && !again.ok && again.code === 'full' && freed.ok && h.summary().bytes === 100;
+})());
+t('has / usage / heldKeys say which keys are held and how much for one', (() => {
+  const d4 = fs.mkdtempSync(path.join(os.tmpdir(), 'tower-')); const h = T.createTower({ dataDir: d4 });
+  h.put(key, group, [{ hint: 'aa'.repeat(16), blob: Buffer.alloc(50, 1) }]);
+  return h.has(key) && !h.has(key2) && h.usage(key) === 50 && h.usage(key2) === 0 && h.heldKeys().length === 1 && h.heldKeys()[0] === key && h.summary().max_wallets === 20000;
+})());
 console.log(`\n${pass} passed, ${fail} failed`); process.exit(fail ? 1 : 0);

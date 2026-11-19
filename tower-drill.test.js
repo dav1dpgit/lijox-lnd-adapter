@@ -127,6 +127,28 @@ const mkDrill = (w, lnd, tw, lines) => D.createTowerDrill({ lnd, chain: w.reads,
     w.mine(); await tw.watch.poll(); w.mine(); await drill.tick();
     t('after a restart the drill is picked up from disk and finishes', drill.list()[0].state === 'passed');
   }
+  // ── 0.130.0: a tower that admits by voucher — the drill's one-time key is vouched for by the drilling provider ──
+  {
+    const AD = require('./tower-admit.js'); const schnorr = require('./schnorr.js');
+    const w = world(), lnd = lndOf(w), tw = towerOf(w), lines = [];
+    await tw.watch.poll();
+    const DRILLER = '02' + 'd'.repeat(64), book = new Map();
+    const admit = AD.createAdmit({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'drill-adm-')), mode: 'voucher', self: () => TWR.pubkey, listed: async () => [{ pubkey: DRILLER, tower: { offered: true } }],
+      verifyNode: async (text, sig) => book.get(sig + '|' + text) || null, capacity: async () => 5000000, log() {} });
+    let seen = null;
+    const post = async (url, body) => {   // the drilled tower, with the way in ahead of its holder
+      if (url.endsWith('/put')) { seen = body; const a = await admit.admit(body.key, body.voucher); if (!a.ok) return { status: 403, json: { ok: false, code: a.code } }; }
+      return tw.post(url, body);
+    };
+    const voucher = async (towerNodeKey, towerKey) => { const vsk = crypto.randomBytes(32), vk = schnorr.pubkey(vsk).toString('hex'); const sig = 'z' + crypto.randomBytes(20).toString('hex'); book.set(sig + '|' + AD.voucherText(vk), DRILLER);
+      return { key: vk, issuer: DRILLER, issuer_sig: sig, use_sig: AD.signUse(vsk, towerNodeKey, towerKey) }; };
+    const mk = (v) => D.createTowerDrill({ lnd, chain: w.reads, post, voucher: v, dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'drill-')), log: (l) => lines.push(l) });
+    let threw = ''; try { await mk(undefined).start(TWR, 20000); } catch (e) { threw = String(e.message || e); }
+    t('a tower that requires a voucher refuses a drill that carries none, and nothing is published', threw !== '' && lnd.published.length === 0 && tw.tower.summary().items === 0, threw);
+    const rec = await mk(voucher).start(TWR, 20000);
+    t('the drill\'s put carries a voucher of the drilling provider, with a use line for THAT tower and the drill\'s key', !!(seen && seen.voucher) && seen.voucher.issuer === DRILLER && schnorr.verify(seen.voucher.use_sig, AD.useDigest(TWR.pubkey, seen.key), seen.voucher.key));
+    t('…the tower admits the key by it and the drill starts', rec.state === 'waiting_t1' && admit.standing(seen.key) === 'voucher' && tw.tower.summary().items === 1 && lnd.published.length === 1);
+  }
   console.log(`${fail ? 'FAIL' : 'PASS'} · tower-drill · ${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();

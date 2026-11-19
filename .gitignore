@@ -42,3 +42,6 @@ lease-wallet-peers.json
 pl-events.ndjson
 pl-daily.json
 console-notes.json
+# 0.133.0 operator state (per instance, never shared): the sent payments sorted for offline wallets and the answers given to LND
+sent-watch.json
+sent-watch.json.tmp

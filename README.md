@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.129.1, 2026-11-14). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.133.5, 2026-11-19). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -53,7 +53,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone <this repository> && cd lijox-adapter
        git fetch --tags
-       git checkout v0.129.1         # the newest tag — the last row of RELEASES.md
+       git checkout v0.133.5         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -249,6 +249,64 @@ other provider's tower the transaction that spends it back — encrypted under t
 uploads — and then publishes the first. A tower that works publishes the answer by itself; the drill passes when the
 answer is in a block at most six above the first transaction's. If it is not, this box publishes the answer itself to
 take the coins back and the drill has failed. The cost is the two transactions' fees. See `tower-drill.js`.
+
+**Who may use the tower: the voucher (0.130.0).** Until this release any key could sign in at a tower, so somebody
+with no wallet at all could take every key slot. A wallet key is now admitted by a VOUCHER. The wallet makes one
+voucher key from its 12 words; its own provider signs `lijox-voucher-v1|tower|<voucher key>` with its node key — once,
+at the wallet's first fee, for the wallet's life (`POST /v1/tower/voucher`, the ask proven by the wallet's node key).
+At a tower the wallet shows that signature with a use line signed by the voucher key,
+`lijox-voucher-use-v1|<this tower's node key>|<the wallet's tower key here>`. The tower checks both, once, and the key
+stays admitted for as long as it keeps coming; the provider is never asked again and can take nothing back. A copied
+voucher is useless — at another tower the use line names the wrong tower — so nothing a tower keeps has to be secret
+from a spammer. The registry is open, so a tower also counts per vouching provider (`TOWER_ISSUER_MAX_KEYS`,
+`TOWER_ISSUER_NEW_PER_DAY`) and takes another provider's vouchers only when its own node sees that provider with at
+least `TOWER_ISSUER_MIN_CAPACITY_SATS` of public channels (LND GetNodeInfo — both key recipes carry it from this
+release) or the operator named it (`TOWER_ISSUERS_ALLOW`). `TOWER_ADMIT=open` (the default while wallets move over)
+still takes a key without a voucher; `TOWER_ADMIT=voucher` requires one; keys held before stay admitted. The total
+keys and the total bytes are settings now (`TOWER_MAX_KEYS`, `TOWER_MAX_BYTES`). The joining drill vouches for its own
+one-time key. See `tower-admit.js` and KNOWN-FINDINGS 0.130.0.
+
+**What arrived must cover what is paid on (0.130.1).** An intercepted HTLC carries two amounts: what arrived on it,
+and what its onion asks this node to send on. LND compares them only when it forwards the HTLC itself. A JIT open —
+and a held forward the adapter delivers with an HTLC of its own — is paid by the adapter, so the adapter compares
+them: an HTLC on which less arrived than it asks to be sent on is failed back at the interceptor's door, and a set
+of parts is refused whole, before any channel is opened, when the parts' arrived amounts sum to less than what would
+be paid on plus the open fee. Every operator must run 0.130.1 or later before serving wallets. See KNOWN-FINDINGS
+0.130.1 and `jit-arrived.test.js`.
+
+**Zaps — each wallet's choice (0.131.0, 0.132.0).** With `ZAPS_ENABLED=true` the provider OFFERS zaps from Nostr
+apps (NIP-57). An address takes them only while the wallet that owns it has turned them on: the wallet's own signed
+choice, `POST /client/prefs { client_pubkey, zaps: true|false }` with the node key's proof over `prefs-zaps:1` or
+`prefs-zaps:0`, kept beside its holding choice. A wallet that never chose has them off: its addresses answer as they
+did before zaps existed and nothing is ever published for it. For a wallet that has them on: the plain address answer
+carries `allowsNostr: true` and `nostrPubkey`; the Register answer does not. `nostrPubkey` is that ADDRESS's own
+receipt key, made from the box's secret (`DATA_DIR/zap-receipt.key`, made once) and the address name — no one key
+signs for two addresses. A zap request in the callback's `nostr` parameter is checked before a hash is reserved —
+signature, kind 9734, one `p` tag, at most one `e`, `a`, `P`, `k` and `amount` tag, the amount tag equal to the
+amount — and a bad one is refused with its reason; a good one's invoice is tied to the request itself (its
+description hash) instead of the address metadata. When the invoice settles, and the wallet still has zaps on, a
+receipt (kind 9735) signed with the address's key goes to `ZAP_RELAYS` (default relay.primal.net, relay.damus.io,
+nos.lol), tried three times. The receipt is dated when the SENDER'S payment reached this provider, not when the
+wallet took it. The relays the sender names are used only with `ZAP_REQUEST_RELAYS=true`, because they are any
+server the sender picks. Every relay connection is wss:// to a public address, checked when the socket connects.
+What an operator should know: the box connects to the relays itself, so they see its outgoing address; and a receipt
+can only be sent after the wallet took the payment, so the relays see when that was. See `zap.js`, `zap.test.js` and
+KNOWN-FINDINGS 0.131.0 and 0.132.0.
+
+**A wallet's sent payment, settled or failed here while the wallet is offline (0.133.0).** An HTLC leaves a channel
+only when both sides sign, so a payment the provider settles or fails while the sending wallet is offline waits on
+that wallet's channel until it connects. A settled one makes LND close the channel on-chain 16 blocks below the
+HTLC's expiry if the wallet has not come back (LND 0.21 and above; 10 before — `lnd-margins.js` reads the running
+LND's version, `LND_INCOMING_BROADCAST_DELTA` overrides; 0.133.4). `sent-watch.js` reads LND every 2 minutes (it settles, fails, closes
+and pays nothing), sorts each such HTLC — in flight, completed, returned, or undecided — and wakes the wallet through
+its push subscription: at once, then about a day, six hours and one hour before the block (kinds `sent_completed`,
+with the time to open by, and `sent_returned`). On any doubt nothing is sent, and nothing is sent past the block. The
+Console's card "Pending HTLCs" lists every pending HTLC on the box with the block at which a channel goes on-chain
+over it (0.133.3 — it then holds what the Channels pane counts); one within 100 blocks of that block is marked, and
+counted on Guardrails. It is a report and has no button. No setting; the state is `DATA_DIR/sent-watch.json`. See
+`sent-watch.js`, `sent-watch.test.js`, `console-sent-watch.test.js` and KNOWN-FINDINGS 0.133.0. From 0.133.2 the
+Console's cards are measured in a browser before a release (`console-layout.check.mjs`: every card one tile of the
+condensed size, at a desk width and a phone width; it needs `PLAYWRIGHT_MODULE`).
 
 **A delivery in parts (0.127.0).** When the provider itself delivers a payment to a wallet (a Lightning address
 payment, a Push Key, a chit) and no one channel to the wallet has the room but its channels together do, the payment

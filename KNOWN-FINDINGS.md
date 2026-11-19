@@ -785,3 +785,237 @@ node key>"` writes a request file (`DATA_DIR/tower/drill-request`) and exits; th
 twenty seconds, removes it, and starts the drill or says in the journal why not. The Console's Tower card lists the
 drills and their results. No drill was run with the button.
 
+**0.130.0.** Who may use the tower: the voucher. What was open before: `verifyRequest` took any BIP-340 key, the
+holder allowed 20,000 keys (a fixed number) and one address may send 1,200 requests an hour — so one address could
+take every key slot in under 17 hours with one small item a key, after which every NEW wallet was refused (`full`)
+until those keys had been silent for 400 days. Nothing could be read, published or removed by it; it locked new
+wallets out. From this release a key is admitted by a voucher (`tower-admit.js`; README, "Who may use the tower").
+What is NOT solved, said plainly: (1) with `TOWER_ADMIT=open` — the default, so that wallets on an older page are
+not locked out on the day of the release — the old opening is still there; the operator sets `TOWER_ADMIT=voucher`
+once its wallets show "admitted by voucher". (2) The tower learns WHICH PROVIDER vouched for a key. (3) A provider
+and a tower working together can match a voucher to a wallet; they can already do that by the times of the uploads
+and by the hints (both towers of a channel hold the same items). (4) A real provider that turns bad can use its whole
+allowance at a tower (`TOWER_ISSUER_MAX_KEYS`); the Console's Tower card shows keys and bytes per vouching provider.
+(5) A provider with no public channels is taken only when named in `TOWER_ISSUERS_ALLOW`; a box whose key cannot read
+the graph (GetNodeInfo) takes NO other provider's vouchers except those named — the start-up line "[TOWER] key
+probe: the graph read" says which. (6) A wallet whose provider gives no voucher (an older release, or the wallet has
+paid it no fee yet — `not_yet`) is not admitted at a tower that requires one; a paid way in is designed, not built.
+(7) The first-fee check reads this box's own fee ledger and LND's channel totals; a wallet whose only channel is
+closed and whose fee predates the ledger gets `not_yet`. Not run against real boxes before this release — the
+checks are `tower-admit.test.js` (45), `tower-route.test.js` (51), `tower-drill.test.js` (23) and the stand-in boot.
+
+**0.130.1.** The arrived-amount rule — a provider could be made to pay out more than it received. Found on
+2026-11-03, fixed on 2026-11-16; every release before this one has it. An intercepted HTLC carries what ARRIVED on it
+(`incoming_amount_msat`) and what its onion asks this node to send on (`outgoing_amount_msat`). LND compares the two
+only when it forwards an HTLC itself: its check (`CheckHtlcForward`, on the outgoing link) sits behind the
+interceptor (`interceptForward`) — read in LND 0.21.8. The adapter's JIT open paid the wallet the sum of the onions'
+amounts less the open fee, and settled the incoming HTLCs for whatever had arrived, without comparing them. So a
+payer whose onion asked for 1,000,000 sats on while 1,000 sats arrived — with a wallet of its own as the payee —
+was paid the difference from the provider's own funds, once per channel open. The same held for a held forward the
+adapter delivers with an HTLC of its own (B-10). Whether it was ever used against the two nodes that ran these
+releases is not known; nothing in their journals records the arrived amount beside the amount paid on.
+What 0.130.1 does: (1) THE DOOR — the interceptor's handler fails back, before any of its paths, an HTLC on which
+less arrived than its onion asks to be sent on (an HTLC with no arrived amount counts as short); (2) every part of a
+set remembers what arrived on it, on all five paths that record parts; (3) the fixed and the open-amount JIT paths
+refuse a short part before recording it; (4) the open-amount flush and the open itself refuse the WHOLE SET — every
+part failed back, no channel opened — when the arrived amounts sum to less than what would be paid on plus the open
+fee, and the open compares once more at the moment the amount is fixed; (5) a held forward that arrived short is not
+paid on by the adapter (it falls back to LND's own forward, which checks). `jit-arrived.test.js` (39 checks) lifts
+those functions out of the adapter's source: the payer's onion asks for more than arrived — one HTLC, one part of a
+set, a part with no record — and nothing opens. One limit: a set of open-amount parts that 0.130.0 was HOLDING for an
+offline wallet at the moment of the upgrade was written with the asked amount in the arrived field, and is taken at
+that word once.
+
+**0.131.0.** Zaps to a LiJ Lightning address failed in Nostr apps — found 2026-11-16 from a Primal (Android) user's
+error `FailedToFetchZapInvoice(cause=kotlin.IllegalArgumentException: Failed requirement.)` zapping
+lij@lightninginajar.xyz. Primal's `LightningPayHelper.fetchInvoice` opens with `require(payRequest.allowsNostr ==
+true)` when it sends a zap request; no address answer of this adapter had ever carried `allowsNostr` or
+`nostrPubkey` (the worker passes the answer through unchanged), so the app stopped before it asked for an invoice and
+nothing reached the box. NIP-57 tells apps to check those two fields first, so this was the provider's gap, not the
+app's. Known since S66 (2026-11-02: "our Lightning-address service publishes no zap receipts"), held for the
+operator's privacy vetting; built on his word the same evening. What 0.131.0 does, behind `ZAPS_ENABLED=true`:
+(1) the two fields on the plain answer (the Register answer is unchanged); (2) the callback checks a zap request as
+NIP-57 Appendix D says, before a hash is reserved, and refuses a bad one with its reason — the text is read with
+decodeURIComponent, and once more with `+` as a space only when the first reading does not verify, so a request
+sent with either encoding is taken exactly as the sender signed it; (3) the invoice's description hash is SHA-256 of
+the request (step 6) — an invoice without a zap request is sealed to the metadata as before; (4) at each of the four
+places an address entry becomes `settled`, the receipt (Appendix E: p, P, e, a, k carried over, bolt11, description;
+no preimage) is signed with DATA_DIR/zap-receipt.key and sent once to `ZAP_RELAYS`, tried again after 60 s and
+5 min, then given up (the payment itself is settled either way); a receipt not sent before a restart is sent at
+boot within a day; a chit-paid entry sends none (its invoice was cancelled). The receipt key file is made once and
+never overwritten — a file there that holds no key leaves zaps off. Not done: the sender's own relays by default
+(they are any server the sender picks, and would learn the box's address — `ZAP_REQUEST_RELAYS=true` turns them on);
+the zap request's content as the payee's note when no `comment` comes with it (note.test.js pins the note line).
+Checks: `zap.test.js` (105), the full suite, the stand-in boot with a zap request; a zap request built by nostr-tools
+(a separate library) is taken in all three encodings and nostr-tools verifies the receipt. Not yet run against a
+real zap on a box.
+
+**0.132.0.** Zaps are each wallet's choice — the review of 0.131.0, which never ran on a box. The review (the same
+night, by a second Session) found four things a zap-enabled box would have made public, and the operator ruled the
+whole of it a wallet's privacy choice. What was wrong in 0.131.0, and what 0.132.0 does:
+(1) THE SWITCH COVERED THE WHOLE BOX. With `ZAPS_ENABLED=true` every address advertised zaps, so any sender could
+cause a public receipt for any wallet on the provider, and the wallet's holder had no say. Now the setting means the
+provider OFFERS zaps; an address takes them only while its wallet has said yes (`POST /client/prefs { zaps }`, the
+node key's proof over `prefs-zaps:1|0`; the choice covers every address the wallet owns here). Never chosen = off =
+exactly the answers and the callback of 0.130.1. "On" is refused (409 `not_offered`) while the provider does not
+offer zaps, so no stored "on" starts publishing on a day the holder did not pick. The wallet's word at the moment a
+receipt would be sent decides: zaps turned off while a zap is held — no receipt.
+(2) THE RECEIPT'S DATE WAS THE SETTLE TIME, and a LiJ payment settles only when the phone is online — every receipt
+recorded for good when the wallet was open. Now a receipt is dated when the sender's payment reached this provider
+(`accepted_at`), else when the invoice was made; never the settle time, never "now".
+(3) ONE KEY SIGNED EVERY RECEIPT OF THE BOX, so one question to a relay ("every kind-9735 event by this key") listed
+every zap of every wallet on the provider. Now each address has its own receipt key:
+HMAC-SHA256(the box's secret, "lijox-zap-receipt-key-v1|<name>"). Receipts of one address share that key, as they
+already share the recipient's Nostr key; nothing is added there.
+(4) Found in the same read: an entry a chit paid, whose record still waited, would have had a receipt sent at the
+next start (the boot resume took any settled entry with a waiting record). It sends none now.
+(5) Wording: the invoice is "tied to" the zap request — a hash; nothing is encrypted.
+WHAT IS NOT CLOSED, said plainly: (a) A receipt can only be SENT after the wallet took the payment. The relays, and
+anyone reading them at that moment, see when it appears; with a held zap that is when the phone came online. It is
+no longer written into the receipt, and a reader who comes later cannot see it. (b) The box connects to `ZAP_RELAYS`
+itself, so those relays see its outgoing address. This is not new with zaps: since 0.119.3 `POST /v1/lnurl/fetch`
+(the fetch for a wallet whose payee refused its browser) makes the box fetch any public https address for anyone who
+holds the route token, and that token is published in the registry record — so any party can already learn the
+box's outgoing address; the rates source and the push services see it too. Hiding it needs ONE outgoing path for
+every call the adapter makes (a relay or Tor), not a setting for zaps alone; not built. (c) The receipt's invoice
+names this provider's node, as every receipt of a provider-made invoice does. (d) A sender can name any Nostr key as
+the recipient; the provider cannot check it. (e) An address that moves to another provider gets another
+`nostrPubkey`; an app that checks old receipts against the new key will not count the old ones.
+Checks: `zap.test.js` (129; the per-address key against a plain HMAC, the date, the choice read from the registry's
+owner, a wallet that turns zaps off while a zap is held, the chit-paid entry at the next start), the full suite, and
+the stand-in boot — an address whose wallet chose answers the two fields, one whose wallet did not answers none and
+its callback ignores a `nostr` parameter; the signed choice turns it on and off; a proof over the other value is
+refused. Not yet run against a real zap, a real relay, or a real wallet's switch.
+
+**0.133.0.** A wallet's sent payment, settled or failed here while that wallet is offline — the wake, and the
+Console's line. Found 2026-11-18 on a provider box: an HTLC a wallet had sent sat on its channel past its expiry. The
+provider had failed it back; the wallet had gone offline before the fail could be signed. What is true of every
+Lightning channel: an HTLC leaves a channel only when BOTH sides sign. A provider can settle or fail a wallet's
+payment on its own, but the settle or the fail then waits on the channel until that wallet connects. Two things
+follow, and a wallet that is a phone app is offline most of the time:
+(1) THE PAYMENT WAS SETTLED HERE (the provider holds the preimage and has paid it on). If the wallet has not come
+back, LND goes on-chain to collect it 10 blocks below the HTLC's expiry — the wallet's channel is closed on-chain.
+Only the wallet opening before that block prevents it. A payment to an offline wallet can be taken hours after the
+sender closed the app, so this is an ordinary case, not a rare one.
+(2) THE PAYMENT WAS FAILED HERE. Nothing is owed to the provider. But a wallet engine older than v376 closed its
+OWN channel when it next opened to a chain 3 blocks past the expiry — before the provider's waiting fail could
+arrive. Engine v376 (the wallet repo, the same week) makes the wallet wait 4,032 blocks for its own sends.
+Until 0.133.0 only the Push rail told the sender (push_taken / push_returned, 0.113.0); every other rail was silent.
+What 0.133.0 does — `sent-watch.js`, read-only to LND:
+(A) THE WAKE. Every 2 minutes it reads the HTLCs that are incoming on wallet channels whose wallet is offline and
+sorts each one: still in flight · completed (settled here) · returned (failed here) · undecided. The evidence, in
+order: LND's own record of a forward (the outgoing half still on its channel = in flight; gone, and LND's forwarding
+history holds the forward under the HTLC's own number = completed; gone with no such record and the outgoing channel
+still open = returned); the interceptor still holds it unanswered = in flight; this adapter's own answer to LND
+(SETTLE = completed, FAIL = returned; `lnd-grpc.js` now reports every answer it writes); this node's invoice, read
+on its record of THIS HTLC (SETTLED / CANCELED / ACCEPTED). A sorting counts only when two sweeps in a row agree,
+and none is made in the first 3 minutes after a start. ON ANY DOUBT NOTHING IS SENT. The wallet is then woken — kind
+`sent_completed` (with the time to open by, stated short of the estimate because blocks can come faster than ten
+minutes) or `sent_returned` — at once, and again when about a day (144 blocks), six hours (36) and one hour (6) are
+left before the block: expiry − 10 for a completed payment, expiry + 3 for a returned one. Nothing is sent past that
+block. A wallet with several such payments gets ONE line of wakes, by its completed payment with the lowest block
+(else its returned one). A Push Key lock's first wake stays the Push rail's own. The words shown are the wallet's
+(page v1141 and newer; an older wallet shows "Payment waiting — Open the LiJ app.").
+(C) THE CONSOLE. A card, "HTLCs near their on-chain block", and a Guardrails row: every HTLC within 100 blocks of
+the block at which a channel goes on-chain over it — an outgoing HTLC at its expiry, a completed incoming one at
+expiry − 10, a returned incoming one on a wallet channel at expiry + 3 (shown past that block too) — with peer,
+channel, amount, hash, the block, what happens at it, and the wakes sent. Report only; it has no button.
+WHAT IS NOT CLOSED, said plainly: (a) An HTLC with no evidence at all — not held by the interceptor, not forwarded,
+no invoice here, no remembered answer — is UNDECIDED and gets no wake. That is what an HTLC answered by an adapter
+older than 0.133.0 looks like (its answers were not remembered), and what an HTLC LND refused by itself looks like.
+The Console still lists it only if it is one of the sorted kinds; an undecided one is not listed. (b) The settle of
+a FORWARDED payment is read from LND's forwarding history by the HTLC's number on its channel; an LND whose records
+carry no such numbers leaves every forwarded payment undecided, and the Console says so. (c) Which channel number
+the interceptor's circuit key uses for a zero-conf channel, that LND's forwarding record is written when the settle
+comes back (not when the sender signs), and that a held HTLC shows no forwarding channel — these are recalled from
+LND's code, not re-read at the commit the boxes run; the sorting matches a channel under every number LND gives for
+it, and falls to "undecided" where a recalled fact would be wrong. (d) A wake needs the wallet's push subscription
+and a phone that shows notifications; a wallet without one is named on the Console and cannot be woken. (e) The
+provider's own rule is not changed: LND still closes 10 blocks below the expiry for a settled payment whose sender
+stays away. (f) The stuck HTLC that started this is left as it is (the operator's decision); it is past its block
+and gets no wake.
+Checks: `sent-watch.test.js` (the marks, the sorting case by case, the sweep against a stand-in LND: two-sweep rule,
+the start's grace, one line of wakes per wallet, nothing past the block, a restart, a wallet with no subscription, a
+Push Key lock, a wake that did not go out, LND unreadable), `console-sent-watch.test.js` (the card and the Guardrails
+row as written in the page; no button), the full suite, and the stand-in boot: the adapter started against a
+stand-in LND with two offline wallets — the returned and the completed payment were sorted through the real REST
+calls, the two wakes left through the real push call to a stand-in push service, and the Console showed the card.
+Not yet seen on a box: a real HTLC sorted, an interceptor answer remembered, a real phone woken.
+
+**0.133.1.** The Console's new card spoke before it had read. For the first minutes after a start 0.133.0's card
+said "no HTLC within 100 blocks of its on-chain block" and a count of 0 — LND had not been read yet — and "first
+read 180 s from now" while the first read came with the 2-minute timer, up to a minute after that. Seen on the
+stand-in Console the hour 0.133.0 was tagged; 0.133.0 ran on no box. Now the card says only when the first read
+comes ("nothing is said about any HTLC before it"), and the first read is made as the 3-minute grace ends, so the
+time shown is the time it happens. The Guardrails row was already absent until the first read. Nothing else changed.
+
+**0.133.2.** The Console's cards, measured in a browser — and what the first measurement found. The operator asked,
+before any ride, that the new card keep the condensed size every card has until its header is clicked. It did: one
+tile, never taller than 56 % of the window, its table scrolling inside, expanded and put back by its header. But no
+test had ever looked at the Console in a browser, and the first measurement found something else: 0.133.0's new
+GUARDRAILS row had a 44-letter label ("HTLCs within 100 blocks of an on-chain close"). A pane's rows share one
+label column, sized to the longest label, so that column grew from 158 px to 302 px and every value in Guardrails
+was left 70 px wide (26 px on a phone) — the pane's content three to seven times as long. Neither 0.133.0 nor
+0.133.1 ran on a box. What 0.133.2 does: the label is "HTLCs near a close" (the count and the 100 blocks moved into
+the value); the new card has ONE table, as every other pane has — the sent payments further out than 100 blocks
+follow the near HTLCs in it (two tables shared the card's condensed height, and the second was a sliver when the
+first was long); how each row was sorted has its own column instead of sitting inside the long sentence.
+`console-layout.check.mjs` (new) serves the real page with a stand-in box's snapshot and measures every card at a
+desk width and a phone width: all cards one tile of the same width, none taller than the condensed height, the page
+never scrolling sideways, the new card's table scrolling inside it, Guardrails' label column as wide with the new row
+as without it, the header click expanding and putting back, nothing moving at a refresh. Run on 0.133.1's files it
+fails eight ways; on 0.133.2 it passes. It needs a browser (PLAYWRIGHT_MODULE) and says so when there is none — it
+never passes unseen. Found by the same look, NOT changed here: the Console's own CSP refuses inline `style=""`
+attributes, and sixteen of them in older panes (small spacings) are therefore not applied.
+
+**0.133.3.** The card lists every pending HTLC. Seen by the operator on his first look after the 0.133.2 ride: the
+new card showed one HTLC while the Channels pane showed four channels with a pending HTLC. Nothing was missorted:
+0.133.0's card listed only the HTLCs within 100 blocks of the block at which a channel goes on-chain over them (and
+the sent payments sorted for offline wallets), and the other three were 192 blocks and more from theirs. But the
+card said nothing about HTLCs further out, so the two panes could not be reconciled by looking — a pending HTLC that
+is hours old is unusual on its own, and the operator should see every one. Now the card ("Pending HTLCs") lists
+EVERY pending HTLC on every channel, the fewest blocks left first, each with its sorting and the block at which a
+channel goes on-chain over it; its head counts them all and, of them, those within 100 blocks. The 100 blocks is
+the WARNING only: the amber of the blocks-left figure (red at 6 or fewer, and past the block) and the Guardrails
+row, which now also says how many are pending in all. Every incoming HTLC is sorted at each read (before: only
+those on offline wallets' channels and the near ones) — one invoice read for an HTLC that is not forwarded, not held
+and not answered by the adapter; the forwarding history is read only when a forwarded HTLC's outgoing half is gone.
+The wakes are untouched. Also seen on that box, and now a fact rather than a recollection: LND 0.21.8's forwarding
+record carries `incoming_htlc_id` and `outgoing_htlc_id`.
+
+**0.133.4.** LND's margin for an incoming HTLC it holds the preimage of is 16 blocks on LND 0.21, not 10 — and the
+adapter had the 10 written in. Found 2026-11-19 while reading LND's source for another question (when LND closes a
+channel over an outgoing HTLC — at its expiry exactly; that part stood). LND goes on-chain to collect a settled
+incoming HTLC `DefaultIncomingBroadcastDelta` blocks below its expiry; `server.go` wires the default in and lnd.conf
+has no setting. Read tag by tag in `lncfg/config.go`: v0.19.3-beta and v0.20.1-beta say 10; v0.21.0-beta,
+v0.21.6-beta and v0.21.8-beta say 16 ("up to 6 blocks waiting for close tx confirmation" were added). The
+adapter's fixed 10 — in `push.js` since 0.113.0 (the Push Key sender's wake) and in `sent-watch.js` since 0.133.0
+— had been taken from older LND and marked "not re-read". WHAT WAS WRONG ON LND 0.21: (1) the wake of a completed
+sent payment counted to expiry − 10, 6 blocks above LND's block. The time it states keeps a tenth and three blocks
+back, which covered the 6 only while more than 20 blocks were left; inside that, the time shown to the wallet user
+was 10 to 30 minutes LATER than LND's block, and the last wake (6 blocks by the old count) left when LND was
+already at its block. (2) The Push Key sender's wake stated a time an hour later than LND's block (it keeps no
+margin back for fast blocks — unchanged here, noted). (3) The Console showed an incoming HTLC's on-chain block 6 too
+high. No wake under the wrong figure had been seen on the operator's first box when it was found. WHAT 0.133.4
+DOES: `lnd-margins.js` (new) gives the figure for the running LND from its version — 16 from 0.21, 10 before, 16
+when the version cannot be read (the larger figure is the lower block number: an earlier time for the wallet user,
+never a later one) — and `LND_INCOMING_BROADCAST_DELTA` overrides it for an LND that differs. `sent-watch.js` reads
+it at every sweep (an LND replaced under a running adapter is followed at the next read, and the journal says the
+figure once); `push.js` gets it with each read of the sender's lock. The Settings report shows the figure and where
+it came from. A release of LND that changes the figure again needs a new line in `lnd-margins.js`. READ THE SAME DAY, AND NOT
+CHANGED: the Lightning-address hold. LND cancels an accepted hold invoice's HTLC by itself
+`DefaultHoldInvoiceExpiryDelta` blocks below its expiry — the incoming margin + 2: 18 on LND 0.21, 12 before
+(`lncfg/invoices.go`; lnd.conf `invoices.holdexpirydelta` overrides). The adapter never holds an address payment
+longer than the time of 144 − 18 = 126 blocks (`LSPS2_OFFLINE_MIN_HEADROOM_BLOCKS`), and less when the wallet's dial
+or the provider's ceiling is shorter. On LND 0.20 that left 6 blocks between the adapter's longest hold and LND's own
+cancel; on LND 0.21 it leaves none. It matters only for a provider whose hold ceiling (`LSPS2_OFFLINE_HOLD_CAP_MS`)
+is 21 hours or more: there, with blocks faster than ten minutes, LND can cancel a held address payment before the
+time the wallet was told. Below that ceiling the adapter's own timer ends the hold long before. The interceptor's
+paths count from the `auto_fail_height` LND sends with each HTLC and so follow LND by themselves.
+
+**0.133.5.** No change to what the adapter does. Two lines were changed before the 0.130.0–0.133.4 work went to
+the public copy of this repository: the first comment line of `zap.js` named the place the operator was in when he
+gave his word for 0.131.0, and one of the private addresses `zap.test.js` feeds to the relay check was an address of
+the operator's own network. The place name is out; the test's address is now `192.168.1.12`, an address of the same
+private range (the check refuses the whole range, and the test says so as before). A box on 0.133.4 runs the same
+code as 0.133.5; the version exists so that one version number names one set of file hashes in RELEASES.md.

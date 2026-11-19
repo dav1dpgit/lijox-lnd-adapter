@@ -158,6 +158,16 @@ The delegate REFUND path still calls it (`POST /v1/channels/transactions`) — D
 `/v2/router/send` (SendPaymentV2) so the full list bakes on every LND build. Until then, omit SendPaymentSync on such
 nodes and expect delegate refunds to fail there.
 
+## 2026-11-15 — the no-delegate list gains `/lnrpc.Lightning/GetNodeInfo` (0.130.0)
+
+The tower takes another provider's vouchers only when this box's own node sees that provider in the public graph
+with enough channel capacity (`TOWER_ISSUER_MIN_CAPACITY_SATS`). That is one read, `/lnrpc.Lightning/GetNodeInfo`
+("info read"; REST `GET /v1/graph/node/{pub_key}`). `bake-permissions.json` already carried it;
+`bake-permissions-nodelegate.json` now does too (41 names). A key baked from the older no-delegate list still runs
+everything else: the start-up line "[TOWER] key probe: the graph read did NOT answer" says so, and until the re-bake
+(`ops/rebake.py`, as on 2026-11-13) the tower takes other providers' vouchers only from those named in
+`TOWER_ISSUERS_ALLOW`. The voucher itself needs `SignMessage` and `VerifyMessage`, which both lists have always had.
+
 ## 2026-11-13 — `/lnrpc.Lightning/SendPaymentSync` is out of the list
 
 LND 0.21 no longer has it (in 0.20.1's rpcserver.go, absent from 0.21.8's): a bake that names it is refused whole

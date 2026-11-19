@@ -542,14 +542,20 @@ function sendToRouteV2(client, paymentHash, route, timeoutMs) {
  *
  * Reconnect-with-backoff matches the unidirectional wrapper.
  *
- * Returns: { stop(), getCounters() } where counters is
+ * Returns: { stop(), getCounters(), isOpen(key), openCount() } where counters is
  * { connected, htlcs_seen, reconnects, errors, last_error }.
+ *
+ * 0.133.0 (S70): the wrapper also keeps which intercepted HTLCs are still unanswered — isOpen("chan_id:htlc_id") —
+ * and tells the caller of every answer it has written to LND's stream: hooks.onResolve(incoming_circuit_key, action).
+ * Both are additive and wrapped: nothing here can stop, delay or change an answer. A queued answer (the stream was
+ * down) counts when it is written, not when it is queued. The record is not cleared when the stream reconnects.
  *
  * @param client       Router gRPC client from makeRouterClient()
  * @param onRequest    (req: ForwardHtlcInterceptRequest) => ForwardHtlcInterceptResponse
  * @param name         log prefix, default 'Interceptor'
+ * @param hooks        optional { onResolve(incoming_circuit_key, action) }
  */
-function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
+function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor', hooks = null) {
   let stopped = false;
   let backoffMs = 1000;
   let currentCall = null;
@@ -568,9 +574,26 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
   // writes vanished silently. (0.54.1 placed this in the generic streaming
   // helper by anchor mistake, breaking bridge + interceptor init — repaired.)
   const pendingResolutions = [];
+  // 0.133.0: the HTLCs handed to this adapter and not yet answered ("chan_id:htlc_id" → ms), and the word to the caller
+  const openKeys = new Map();
+  const ckStr = (ck) => `${String((ck && ck.chan_id) || '0')}:${String((ck && ck.htlc_id) || '0')}`;
+  const noteOpen = (ck) => {
+    try {
+      if (!ck) return;
+      if (openKeys.size > 5000) { const old = Date.now() - 30 * 86400 * 1000; for (const [k, t] of openKeys) if (t < old) openKeys.delete(k); }
+      openKeys.set(ckStr(ck), Date.now());
+    } catch (_) { /* never in the way of an HTLC */ }
+  };
+  const noteAnswer = (resp) => {
+    try {
+      if (!resp || !resp.incoming_circuit_key) return;
+      openKeys.delete(ckStr(resp.incoming_circuit_key));
+      if (hooks && typeof hooks.onResolve === 'function') hooks.onResolve(resp.incoming_circuit_key, resp.action);
+    } catch (_) { /* never in the way of an answer */ }
+  };
   counters._lastWrite = (resp) => {
     if (currentCall) {
-      try { currentCall.write(resp); return true; }
+      try { currentCall.write(resp); noteAnswer(resp); return true; }
       catch (e) { console.error(`[${name}] live-stream write failed: ${e && e.message} — queueing`); }
     } else {
       console.warn(`[${name}] stream down — queueing resolution action=${resp && resp.action}`);
@@ -592,7 +615,7 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
       console.warn(`[${name}] stream back — flushing ${pendingResolutions.length} queued resolution(s)`);
       const _q = pendingResolutions.splice(0, pendingResolutions.length);
       for (const _r of _q) {
-        try { call.write(_r); }
+        try { call.write(_r); noteAnswer(_r); }
         catch (e) { console.error(`[${name}] queued-resolution flush failed: ${e && e.message} — re-queueing`); pendingResolutions.push(_r); break; }
       }
     }
@@ -609,6 +632,7 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
 
     call.on('data', (req) => {
       counters.htlcs_seen += 1;
+      noteOpen(req && req.incoming_circuit_key);   // 0.133.0
 
       // v0.4: handler may return a value OR a Promise. Promise.resolve()
       // normalizes both cases. We write the response back on the stream
@@ -628,6 +652,7 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
         console.error(`[${name}] onRequest threw sync: ${e && e.message}; RESUME`);
         try {
           call.write({ incoming_circuit_key: req.incoming_circuit_key, action: 'RESUME' });
+          noteAnswer({ incoming_circuit_key: req.incoming_circuit_key, action: 'RESUME' });
         } catch (we) {
           console.error(`[${name}] sync-fallback write failed: ${we && we.message}`);
         }
@@ -648,6 +673,7 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
           }
           try {
             call.write(resp);
+            noteAnswer(resp);
           } catch (e) {
             counters.errors += 1;
             counters.last_error = `write failed: ${e && e.message}`;
@@ -660,6 +686,7 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
           console.error(`[${name}] onRequest rejected: ${e && e.message}; RESUME`);
           try {
             call.write({ incoming_circuit_key: req.incoming_circuit_key, action: 'RESUME' });
+            noteAnswer({ incoming_circuit_key: req.incoming_circuit_key, action: 'RESUME' });
           } catch (we) {
             console.error(`[${name}] reject-fallback write failed: ${we && we.message}`);
           }
@@ -718,6 +745,8 @@ function subscribeHtlcInterceptor(client, onRequest, name = 'Interceptor') {
       console.log(`[${name}] stopped`);
     },
     getCounters: () => ({ ...counters }),
+    isOpen: (key) => openKeys.has(String(key)),   // 0.133.0
+    openCount: () => openKeys.size,
   };
 }
 

@@ -17,7 +17,8 @@
 //   · `group` is 16 random bytes the wallet picks per channel, so one channel's items can be dropped at its close
 //     without the holder learning the channel;
 //   · several items may share a hint (the same penalty signed at two fee rates);
-//   · limits: bytes per wallet, wallets in all, days kept after a wallet's last upload.
+//   · limits: bytes per wallet, wallets in all, bytes in all (0.130.0), days kept after a wallet's last upload.
+//     WHO may sign in is tower-admit.js (0.130.0, the voucher); this file keeps what it is handed.
 // No network and no LND in this file: the routes and the block watch (lij-adapter.js, to come) prove nothing here —
 // this verifies the wallet's signature, keeps the bytes, matches a block's ids and opens what matches.
 const fs = require('fs');
@@ -91,7 +92,9 @@ function createTower(opts) {
   const dir = path.join(opts.dataDir, 'tower');
   const quota = opts.quotaBytes || 5 * 1024 * 1024;
   const keepDays = opts.keepDaysSilent || 400;
-  const maxWallets = opts.maxWallets || 20000;
+  const maxWallets = opts.maxWallets > 0 ? opts.maxWallets : 20000;
+  const maxBytes = opts.maxBytes > 0 ? opts.maxBytes : 20 * 1024 * 1024 * 1024;   // 0.130.0: every key together (the disk's ceiling)
+  let total = 0;                                                             // bytes held for every key together
   const log = opts.log || function () {};
   const now = opts.now || (() => Date.now());
   try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
@@ -115,7 +118,7 @@ function createTower(opts) {
         w.bytes += Buffer.byteLength(r.b, 'base64'); w.items++; w.last = Math.max(w.last, Number(r.t) || 0);
         addIndex(key, r.g, r.h, r.b);
       }
-      wallets.set(key, w);
+      wallets.set(key, w); total += w.bytes;
     }
   }
   load();
@@ -131,10 +134,11 @@ function createTower(opts) {
       fresh.push({ g: group, h: it.hint, b: b64, t: now() }); add += it.blob.length;
     }
     if (w.bytes + add > quota) return { ok: false, code: 'quota', quota_bytes: quota, held_bytes: w.bytes };
+    if (add && total + add > maxBytes) return { ok: false, code: 'full' };   // 0.130.0: the box's ceiling for every key together
     if (fresh.length) {
       fs.appendFileSync(fileOf(key), fresh.map((r) => JSON.stringify(r)).join('\n') + '\n');
       for (const r of fresh) addIndex(key, r.g, r.h, r.b);
-      w.bytes += add; w.items += fresh.length;
+      w.bytes += add; w.items += fresh.length; total += add;
     }
     w.last = now(); wallets.set(key, w);
     if (fresh.length) log(`[TOWER] kept ${fresh.length} item(s), ${add} bytes, for wallet key ${key.slice(0, 8)} (${w.items} held, ${w.bytes} of ${quota} bytes)`);
@@ -150,6 +154,7 @@ function createTower(opts) {
       keep.push(line); bytes += Buffer.byteLength(r.b, 'base64'); last = Math.max(last, Number(r.t) || 0);
     }
     if (!gone) return 0;
+    total -= (w.bytes - bytes);
     if (keep.length) { const t = fileOf(key) + '.tmp-' + process.pid; fs.writeFileSync(t, keep.join('\n') + '\n'); fs.renameSync(t, fileOf(key)); wallets.set(key, { bytes, items: keep.length, last: Math.max(last, w.last) }); }
     else { try { fs.unlinkSync(fileOf(key)); } catch (e) {} wallets.delete(key); }
     log(`[TOWER] dropped ${gone} item(s) for wallet key ${key.slice(0, 8)} (${why})`);
@@ -183,9 +188,13 @@ function createTower(opts) {
     if (!tx.inputs.every((i) => i.txid === txid)) return { ok: false, code: 'spends_something_else' };
     return { ok: true, tx_hex: plain.toString('hex'), penalty_txid: btc.txid(tx), vsize: btc.vsize(tx) };
   }
-  const summary = () => ({ wallets: wallets.size, items: Array.from(wallets.values()).reduce((s, w) => s + w.items, 0), bytes: Array.from(wallets.values()).reduce((s, w) => s + w.bytes, 0), hints: index.size });
+  const summary = () => ({ wallets: wallets.size, items: Array.from(wallets.values()).reduce((s, w) => s + w.items, 0), bytes: Array.from(wallets.values()).reduce((s, w) => s + w.bytes, 0), hints: index.size, max_wallets: maxWallets, max_bytes: maxBytes });
+  // 0.130.0: for the way in (tower-admit.js) — which keys are held, and how much for one
+  const has = (key) => wallets.has(key);
+  const usage = (key) => { const w = wallets.get(key); return w ? w.bytes : 0; };
+  const heldKeys = () => Array.from(wallets.keys());
   const capability = { offered: true, quota_bytes: quota, keep_days_silent: keepDays, hint_bytes: HINT_BYTES, form: 'teos-v1' };
-  return { put, drop, status, sweep, match, open, summary, capability };
+  return { put, drop, status, sweep, match, open, summary, capability, has, usage, heldKeys };
 }
 
 module.exports = { createTower, verifyRequest, signedText, itemsSha, hintOf, encrypt, decrypt, HINT_BYTES, BLOB_MAX, ITEMS_PER_PUT_MAX, DOMAIN };

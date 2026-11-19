@@ -93,7 +93,10 @@ function createTowerDrill(opts) {
     const sk = rand(32), pk = schnorr.pubkey(sk).toString('hex'), group = rand(16).toString('hex');
     const items = [{ hint: T.hintOf(t1Txid), blob: T.encrypt(Buffer.from(t2.hex, 'hex'), t1Txid) }];
     const base = String(tower.endpoint).replace(/\/+$/, '');
-    const put = await post(base + '/v1/tower/put', signed('put', sk, pk, group, items));
+    const putBody = signed('put', sk, pk, group, items);
+    // 0.130.0: a tower admits a key by a voucher — this provider vouches for the drill's one-time key
+    if (opts.voucher) { try { const v = await opts.voucher(tower.pubkey, pk); if (v) putBody.voucher = v; } catch (e) {} }
+    const put = await post(base + '/v1/tower/put', putBody);
     if (!(put && put.status === 200 && put.json && put.json.ok && put.json.kept === 1)) {
       // nothing was published: the funded coins are only leased by LND and come free on their own
       throw new Error(`the tower did not accept the item (${put ? put.status + (put.json && put.json.code ? ' ' + put.json.code : '') : 'no answer'}) — nothing was published`);

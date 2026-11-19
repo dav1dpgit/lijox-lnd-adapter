@@ -159,7 +159,7 @@ const nowS = () => Math.floor(clock / 1000);
   check(delivered.length === 1 && delivered[0].client === RECIP && delivered[0].hashHex === A.hash && delivered[0].secretHex === SECRET && delivered[0].amountMsat === '20000000', 'one delivery of exactly the amount (the fee stays with the provider)');
   check(invoices[A.hash].state === 'SETTLED', 'the sender\'s hold settled with the recipient\'s preimage');
   await new Promise((r2) => setImmediate(r2));
-  check(wakes.length === 1 && wakes[0].pk === SENDER && wakes[0].kind === 'push_taken' && wakes[0].ms === (900_576 - 900_100 - 10) * 600 * 1000, '0.113.0 (1): the SENDER is woken on the take — push_taken, with the time to open: (expiry 900,576 − height 900,100 − LND\'s 10) blocks × 10 min');
+  check(wakes.length === 1 && wakes[0].pk === SENDER && wakes[0].kind === 'push_taken' && wakes[0].ms === (900_576 - 900_100 - 16) * 600 * 1000, '0.113.0 (1): the SENDER is woken on the take — push_taken, with the time to open: (expiry 900,576 − height 900,100 − LND\'s margin) blocks × 10 min · 0.133.4: with no figure from the adapter the margin is 16 (LND 0.21\'s; it was a fixed 10)');
   check(pl.some((e) => e.kind === 'push_fee' && e.msat === 41000 && e.moved_msat === 20000000), 'PL: the fee kept (41 sats), 20,000 moved');
   r = await call('GET', '/push/status/' + A.hash, null, false);
   check(r.data.status === 'taken' && r.data.taken_at, 'status: taken');
@@ -397,9 +397,10 @@ const nowS = () => Math.floor(clock / 1000);
   senderLock = { error: 'lnd down' };
   r = await call('POST', '/push/deliver', { client_pubkey: RECIP, hash: W.hash, bolt11: 'lnfar-W' });
   check(r.status === 503 && r.data.error === 'sender_channel_unknown' && payments.length === pW, 'the sender\'s channel unreadable: 503, nothing paid (never on a guess)');
-  senderLock = { ok: true, chan_point: 'ab'.repeat(32) + ':0', active: false, expiration_height: 900_576, height: 900_100 };
+  senderLock = { ok: true, chan_point: 'ab'.repeat(32) + ':0', active: false, expiration_height: 900_576, height: 900_100, incoming_delta: 10 };   // 0.133.4: the adapter says the running LND's margin (here LND 0.20's 10)
   r = await call('POST', '/push/deliver', { client_pubkey: RECIP, hash: W.hash, bolt11: 'lnfar-W' });
   check(r.status === 200 && r.data.status === 'taken' && wakes.length === wW + 1 && wakes[wW].kind === 'push_taken', 'the lock back on an open channel (the sender merely offline): delivered, TAKEN, the sender woken');
+  check(wakes[wW].ms === (900_576 - 900_100 - 10) * 600 * 1000, '0.133.4: the time to open counts to the margin the adapter gives for the running LND (10 on LND 0.20) — not to a fixed figure');
   // 0.113.0 (3): the hold fee is a box setting inside the lock's fee — per million of the amount per day of the window
   const rail3 = createPushRail(Object.assign({}, deps, { dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'push3-')), env: { PUSH_HOLD_FEE_PPM_PER_DAY: '100' } }));
   check(rail3.holdFeeMsat(20_000_000, 72 * 3600) === 6000, 'hold fee 100 ppm/day: 20,000 sats × 100/1e6 × 3 days = 6 sats');
