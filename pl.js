@@ -49,7 +49,8 @@ function emptyRow(key) {
     routing_out_msat: 0, open_moved_msat: 0, open_moved_count: 0, open_moved_fee_msat: 0, hold_moved_msat: 0, hold_moved_count: 0, hold_moved_fee_msat: 0,
     payment_value_msat: 0, chain_moved_open_sats: 0, chain_moved_close_sats: 0, chain_moved_sweep_sats: 0, chain_moved_other_sats: 0,
     // 0.120.0 (S66): Lightning pays on-chain — the provider's fees earned (revenue) and the chain costs it bore (bumps, take-backs)
-    onchain_pay_fee_msat: 0, onchain_pay_count: 0, onchain_pay_moved_msat: 0, chain_fee_onchain_pay_sats: 0, onchain_pay_chain_count: 0 };
+    onchain_pay_fee_msat: 0, onchain_pay_count: 0, onchain_pay_moved_msat: 0, chain_fee_onchain_pay_sats: 0, onchain_pay_chain_count: 0,
+    subs_fee_msat: 0, subs_count: 0, subs_moved_msat: 0 };   // 0.134.0: the seller service's fee (LIJOX Subscriptions)
 }
 
 function createPL(deps) {
@@ -136,6 +137,7 @@ function createPL(deps) {
       if (e.ts < start || e.ts >= end) continue;
       if (e.kind === 'open_fee') { row.open_fee_msat += Number(e.msat || 0); row.open_count++; if (Number(e.moved_msat) > 0) { row.open_moved_msat += Number(e.moved_msat); row.open_moved_count++; row.open_moved_fee_msat += Number(e.msat || 0); } }
       else if (e.kind === 'hold_fee') { row.hold_fee_msat += Number(e.msat || 0); row.hold_count++; if (Number(e.moved_msat) > 0) { row.hold_moved_msat += Number(e.moved_msat); row.hold_moved_count++; row.hold_moved_fee_msat += Number(e.msat || 0); } }
+      else if (e.kind === 'subs_fee') { row.subs_fee_msat += Number(e.msat || 0); row.subs_count++; row.subs_moved_msat += Number(e.moved_msat || 0); }   // 0.134.0
       else if (e.kind === 'onchain_pay_fee') { row.onchain_pay_fee_msat += Number(e.msat || 0); row.onchain_pay_count++; row.onchain_pay_moved_msat += Number(e.moved_msat || 0); }   // 0.120.0
       else if (e.kind === 'onchain_pay_lock' || e.kind === 'onchain_pay_bump' || e.kind === 'onchain_pay_takeback') { if (e.kind !== 'onchain_pay_lock') { row.chain_fee_onchain_pay_sats += Number(e.chain_fee_sats || 0); row.onchain_pay_chain_count++; } }   // 0.120.0: the lock's own fee is the sender's; bumps and take-backs are the provider's
     }
@@ -224,7 +226,9 @@ function createPL(deps) {
       for (let k = from; k <= to; k = nextDay(k)) {
         const r = daily[k]; if (!r) { if (k === to) break; continue; }
         for (const f of ['routing_fee_msat', 'routing_count', 'open_fee_msat', 'open_count', 'hold_fee_msat', 'hold_count', 'chain_fee_open_sats', 'chain_fee_close_sats', 'chain_fee_sweep_sats', 'chain_fee_other_sats', 'chain_tx_count', 'chain_fee_unknown_count', 'payment_fee_msat', 'payment_count', 'delivery_count',
-          'routing_out_msat', 'open_moved_msat', 'open_moved_count', 'open_moved_fee_msat', 'hold_moved_msat', 'hold_moved_count', 'hold_moved_fee_msat', 'payment_value_msat', 'chain_moved_open_sats', 'chain_moved_close_sats', 'chain_moved_sweep_sats', 'chain_moved_other_sats']) acc[f] += r[f] || 0;
+          'routing_out_msat', 'open_moved_msat', 'open_moved_count', 'open_moved_fee_msat', 'hold_moved_msat', 'hold_moved_count', 'hold_moved_fee_msat', 'payment_value_msat', 'chain_moved_open_sats', 'chain_moved_close_sats', 'chain_moved_sweep_sats', 'chain_moved_other_sats',
+          // 0.134.0: the Lightning-pays-on-chain fields were recorded each day and never added into a period (the Console's line read 0 since 0.120.0); the seller service's fee joins them
+          'onchain_pay_fee_msat', 'onchain_pay_count', 'onchain_pay_moved_msat', 'chain_fee_onchain_pay_sats', 'onchain_pay_chain_count', 'subs_fee_msat', 'subs_count', 'subs_moved_msat']) acc[f] += r[f] || 0;
         for (const [c, v] of Object.entries(r.routing_by_chan || {})) { const x = byChan[c] || (byChan[c] = { fee_msat: 0, count: 0 }); x.fee_msat += v.fee_msat; x.count += v.count; }
         if (k === to) break;
       }

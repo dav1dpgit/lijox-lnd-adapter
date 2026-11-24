@@ -7,9 +7,9 @@ const src = fs.readFileSync(__dirname + '/lij-adapter.js', 'utf8');
 let passed = 0, failed = 0; const t = (n, ok) => { if (ok) { passed++; console.log('  ok · ' + n); } else { failed++; console.log('  FAIL · ' + n); } };
 t('the cap is a box setting, 500 by default', /const LNURLP_MAX_LIVE_PER_NAME = parseInt\(process\.env\.LNURLP_MAX_LIVE_PER_NAME \|\| '500', 10\) \|\| 500;/.test(src));
 const loop = src.match(/let added = 0, capped = false;\n\s*let liveNow = lnurlpLiveFree\(rec\)\.length;[\s\S]*?rec\.entries\.push\(entry\);/);
-t('the register loop counts the LIVE free entries and breaks at the cap BEFORE the push', !!loop && /if \(liveNow \+ added >= LNURLP_MAX_LIVE_PER_NAME\) \{ capped = true; break; \}/.test(loop[0]) && loop[0].indexOf('capped = true; break;') < loop[0].indexOf('rec.entries.push(entry)'));
+t('the register loop counts the LIVE free entries and breaks at the cap BEFORE the push', !!loop && /if \(liveNow \+ added >= nameCap\) \{ capped = true; break; \}/.test(loop[0]) && src.includes("const nameCap = nameKind.kind === 'one-use' ? subsLib.ONE_USE_MAX_HASHES : LNURLP_MAX_LIVE_PER_NAME;")   /* 0.134.0: the cap is the box setting for an address, five for a one-use name */ && loop[0].indexOf('capped = true; break;') < loop[0].indexOf('rec.entries.push(entry)'));
 t('the dedup (seen) still runs before the cap check — a repeat never counts against it', !!loop && loop[0].indexOf('if (seen.has(hh)) continue;') < loop[0].indexOf('capped = true; break;'));
-t('the answer says capped and names the cap', /if \(capped\) \{ ans\.capped = true; ans\.cap = LNURLP_MAX_LIVE_PER_NAME; \}/.test(src) && /return jsonResponse\(res, ans\);/.test(src));
+t('the answer says capped and names the cap', /if \(capped\) \{ ans\.capped = true; ans\.cap = nameCap; \}/.test(src) && /return jsonResponse\(res, ans\);/.test(src));
 t('the log line says AT THE CAP', /AT THE CAP ' \+ LNURLP_MAX_LIVE_PER_NAME/.test(src));
 // F14
 const pend = src.match(/if \(path === '\/lsps2\/pending' && method === 'GET'\) \{[\s\S]*?const byHash = \{\};/);

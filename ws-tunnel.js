@@ -12,6 +12,14 @@
 //      caller its own local address and port: LND names an inbound peer by the address it connected from, so the
 //      caller can find the wallet's node key in ListPeers and send the first chain data unasked (findPeerOn).
 // Nothing here reads, keeps or changes the bytes; the noise handshake makes them unreadable to the tunnel anyway.
+//
+// 0.136.0 (S71 Fri 2026-11-20, DP 09:45 "'The choices are: catch up, or close on purpose.' Agreed. […] go beyond A-E —
+// approved" — state-marks.js): THE PASS AT THE TUNNEL'S OPENING. A wallet that asked this box for a pass presents it as
+// a TEXT frame ("lijox-pass:" + 64 hex) before its first bytes. The frame is kept here and never sent to LND. When
+// the wallet's first bytes come, the pass is taken (good once, before it expires): a pass that is not good closes
+// the WebSocket (4403) and NOTHING is opened to LND — LND is never shown that wallet's reconnect message. A wallet
+// that presents no pass is passed through as before, unless the operator has set passes as required (4401). The
+// reason this is asked BEFORE LND: LND closes a channel by force the moment a wallet reconnects with an older state.
 
 'use strict';
 
@@ -19,14 +27,20 @@ const net = require('net');
 
 const HANDSHAKE_BYTES = 116;   // BOLT 8: act one 50 + act three 66, the initiator's handshake
 const QUIET_MS = 90000;        // a WebSocket that says nothing this long is closed
+const PASS_FRAME = 'lijox-pass:';   // 0.136.0: the text frame that carries a wallet's pass (state-marks.js names the same)
+const CLOSE_PASS_REFUSED = 4403;    // the pass presented is not good (unknown, used, expired)
+const CLOSE_PASS_REQUIRED = 4401;   // this provider passes no wallet through without a pass
 
-// Pipe one wallet WebSocket to LND. opts: { host, port, onHandshake(local), log, quietMs }.
-// local = { address, port, alive() } — the tunnel's own end of the TCP connection; alive() is false once either side
-// has closed. Returns a small view for tests and logs.
+// Pipe one wallet WebSocket to LND. opts: { host, port, onHandshake(local), log, quietMs, gate }.
+// local = { address, port, alive(), passKey } — the tunnel's own end of the TCP connection; alive() is false once either
+// side has closed; passKey is the wallet key the presented pass was made for (null without a pass).
+// gate (0.136.0) = { take(passHex) → { ok, pubkey } | { ok:false, code }, required() → bool }; without it nothing is asked.
+// Returns a small view for tests and logs.
 function tunnel(ws, opts) {
-  const { host, port, onHandshake, log = console, quietMs = QUIET_MS } = opts || {};
+  const { host, port, onHandshake, log = console, quietMs = QUIET_MS, gate } = opts || {};
   const openedAt = Date.now();
   let tcp = null, sent = 0, told = false, closed = false;
+  let presented = null, passKey = null, refused = null;   // 0.136.0
 
   const quiet = setTimeout(() => {
     if (!tcp && !closed) {
@@ -40,7 +54,7 @@ function tunnel(ws, opts) {
     if (told || closed || !tcp || sent < HANDSHAKE_BYTES || !tcp.localPort) return;
     told = true;
     if (typeof onHandshake !== 'function') return;
-    try { onHandshake({ address: tcp.localAddress, port: tcp.localPort, alive: () => !closed }); } catch (_) {}
+    try { onHandshake({ address: tcp.localAddress, port: tcp.localPort, alive: () => !closed, passKey }); } catch (_) {}
   };
 
   const open = () => {
@@ -61,13 +75,37 @@ function tunnel(ws, opts) {
     });
   };
 
-  ws.on('message', (data) => {
+  // 0.136.0: the WebSocket is closed with a reason and nothing is opened to LND
+  const refuse = (code, why) => {
+    refused = why; closed = true; clearTimeout(quiet);
+    log.log(`[WS] not passed through to LND: ${why}`);
+    try { ws.close(code, why); } catch (_) {}
+  };
+
+  ws.on('message', (data, isBinary) => {
     if (closed) return;
     const buf = Buffer.isBuffer(data) ? data
       : Array.isArray(data) ? Buffer.concat(data)
       : (data instanceof ArrayBuffer) ? Buffer.from(new Uint8Array(data))
       : Buffer.from(data);
-    if (!tcp) { clearTimeout(quiet); open(); }
+    // 0.136.0: a text frame that carries a pass, before the wallet's first bytes — kept, never sent to LND
+    if (isBinary === false && !tcp && buf.length <= 200) {
+      const text = buf.toString('utf8');
+      if (text.startsWith(PASS_FRAME)) { presented = text.slice(PASS_FRAME.length).trim(); return; }
+    }
+    if (!tcp) {
+      if (gate) {
+        if (presented !== null) {
+          let r = null; try { r = gate.take(presented); } catch (_) { r = null; }
+          if (!r || !r.ok) return refuse(CLOSE_PASS_REFUSED, 'the pass is not good (' + ((r && r.code) || 'error') + ')');
+          passKey = r.pubkey || null;
+        } else {
+          let need = false; try { need = !!gate.required(); } catch (_) { need = false; }
+          if (need) return refuse(CLOSE_PASS_REQUIRED, 'a pass is required');
+        }
+      }
+      clearTimeout(quiet); open();
+    }
     if (tcp.destroyed) return;
     tcp.write(buf);
     sent += buf.length;
@@ -82,7 +120,7 @@ function tunnel(ws, opts) {
   ws.on('close', end);
   ws.on('error', (err) => { log.error(`[WS] WebSocket error: ${err.message}`); end(); });
 
-  return { sentBytes: () => sent, connected: () => !!tcp, told: () => told };
+  return { sentBytes: () => sent, connected: () => !!tcp, told: () => told, passKey: () => passKey, refused: () => refused };
 }
 
 // ── The LND peer on a tunnel ──────────────────────────────────────────────────────────────────────────────────────
@@ -120,4 +158,4 @@ async function findPeerOn(local, listPeers, { schedule = FIND_SCHEDULE_MS, sleep
   return null;
 }
 
-module.exports = { tunnel, findPeerOn, sameAddress, HANDSHAKE_BYTES, QUIET_MS, FIND_SCHEDULE_MS };
+module.exports = { tunnel, findPeerOn, sameAddress, HANDSHAKE_BYTES, QUIET_MS, FIND_SCHEDULE_MS, PASS_FRAME, CLOSE_PASS_REFUSED, CLOSE_PASS_REQUIRED };

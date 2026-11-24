@@ -132,7 +132,7 @@ const bytes = (n, fill) => Buffer.alloc(n, fill);
     const src = require('fs').readFileSync(require('path').join(__dirname, 'lij-adapter.js'), 'utf8');
     const s = src.indexOf('async function pushFirstBundle(');
     const e = src.indexOf('\n}\n', s) + 3;
-    check(s > 0 && /wsTunnel\(ws, \{[\s\S]{0,200}onHandshake: \(local\) => \{ pushFirstBundle\(local\)/.test(src), 't11 the proxy runs every wallet socket through the tunnel and hands the handshake to pushFirstBundle');
+    check(s > 0 && /wsTunnel\(ws, \{[\s\S]{0,600}onHandshake: \(local\) => \{ pushFirstBundle\(local\)/.test(src), 't11 the proxy runs every wallet socket through the tunnel and hands the handshake to pushFirstBundle');   // 0.136.0: the gate's lines stand between (600, was 200)
     const run = async (bridge, peers) => {
       const fn = new Function('chainBridge', 'findPeerOn', 'lndGet', 'console', src.slice(s, e) + '\n; return pushFirstBundle;')(
         bridge, (local, lp) => findPeerOn(local, lp, { sleep: async () => {} }), async () => ({ peers }), quiet);
@@ -152,7 +152,104 @@ const bytes = (n, fill) => Buffer.alloc(n, fill);
     ok('t11 no bridge: nothing tried, nothing thrown');
   }
 
+  // ── 0.136.0: the pass at the tunnel's opening (state-marks.js keeps the passes; the real one is used here) ──
+  {
+    const fs = require('fs'), os = require('os'), path = require('path');
+    const { createStateMarks, PASS_FRAME: FRAME } = require('./state-marks');
+    const { PASS_FRAME, CLOSE_PASS_REFUSED, CLOSE_PASS_REQUIRED } = require('./ws-tunnel');
+    check(PASS_FRAME === FRAME && PASS_FRAME === 'lijox-pass:', 'g0 the tunnel and the marks name the same frame ("lijox-pass:")');
+    const PKW = '02' + 'cd'.repeat(32);
+    const marks = createStateMarks({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'wst-')) });
+    let clock = Date.now();
+    const newPass = () => { clock += 5; const r = marks.state(PKW, {}, clock, true); if (!r.ok || !r.pass) throw new Error('no pass: ' + JSON.stringify(r)); return r.pass; };
+    const serve = async (gate) => {
+      const srv = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+      await new Promise((r) => srv.on('listening', r));
+      const st = { told: [], views: [] };
+      srv.on('connection', (ws) => { st.views.push(tunnel(ws, { host: '127.0.0.1', port: lndPort, log: quiet, quietMs: 700, gate, onHandshake: (local) => st.told.push(local) })); });
+      st.open = () => new Promise((resolve, reject) => {
+        const c = new WebSocket('ws://127.0.0.1:' + srv.address().port);
+        c.binaryType = 'nodebuffer'; c.got = []; c.closedWith = null;
+        c.on('message', (d) => c.got.push(Buffer.from(d)));
+        c.on('close', (code, reason) => { c.closedWith = { code, reason: String(reason || '') }; });
+        c.on('open', () => resolve(c)); c.on('error', reject);
+      });
+      st.close = () => srv.close();
+      return st;
+    };
+    const lndNow = () => lnd.conns.length;
+
+    // g1 — no gate (an adapter that asks nothing): the pass frame is kept back all the same; the bytes pass
+    let S = await serve(undefined), n0 = lndNow();
+    let c = await S.open();
+    c.send(PASS_FRAME + 'ab'.repeat(32)); await sleep(80);
+    check(lndNow() === n0, 'g1 a pass frame alone opens nothing to LND');
+    c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).equals(bytes(50, 1)), 'g1 without a gate the first bytes pass, and the pass frame is NOT among the bytes LND got');
+    c.close(); S.close(); await sleep(80);
+
+    // g2 — a good pass: taken once, the bytes pass whole, the wallet key of the pass is told after the handshake
+    const gate = { take: (h) => marks.takePass(h), required: () => false };
+    S = await serve(gate); n0 = lndNow();
+    const p1 = newPass();
+    c = await S.open();
+    c.send(PASS_FRAME + p1); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).equals(bytes(50, 1)), 'g2 a good pass: the tunnel opens on the first bytes and LND gets exactly those bytes');
+    c.send(bytes(66, 3)); await sleep(120);
+    check(S.told.length === 1 && S.told[0].passKey === PKW && S.views[0].passKey() === PKW, 'g2 after the handshake the caller is told which wallet key the pass was made for');
+    c.close(); await sleep(80);
+
+    // g3 — the same pass a second time: refused, nothing opened to LND
+    n0 = lndNow();
+    c = await S.open();
+    c.send(PASS_FRAME + p1); c.send(bytes(50, 1)); await sleep(200);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REFUSED && /not good \(unknown\)/.test(c.closedWith.reason), 'g3 a pass is good once: the second use closes the WebSocket (4403) and NOTHING reaches LND');
+
+    // g4 — a pass this box never made: refused
+    n0 = lndNow();
+    c = await S.open();
+    c.send(PASS_FRAME + 'ef'.repeat(32)); c.send(bytes(50, 1)); await sleep(200);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REFUSED, 'g4 a pass this box never made: closed (4403), nothing reaches LND');
+    c = await S.open(); n0 = lndNow();
+    c.send(PASS_FRAME + 'not hex'); c.send(bytes(50, 1)); await sleep(200);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REFUSED && /bad_pass/.test(c.closedWith.reason), 'g4 a pass that is not 64 hex: closed (4403)');
+
+    // g5 — no pass, passes not required: passed through as before (an older wallet)
+    n0 = lndNow();
+    c = await S.open();
+    c.send(bytes(50, 7)); await sleep(150);
+    check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).equals(bytes(50, 7)), 'g5 no pass, not required: an older wallet is passed through as before');
+    c.close(); S.close(); await sleep(80);
+
+    // g6 — passes required: no pass closes (4401); a good pass passes; an expired one does not
+    let t = Date.now();
+    const marks2 = createStateMarks({ dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'wst2-')), now: () => t, passTtlMs: 1000 });
+    S = await serve({ take: (h) => marks2.takePass(h), required: () => true }); n0 = lndNow();
+    c = await S.open();
+    c.send(bytes(50, 1)); await sleep(200);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REQUIRED && /a pass is required/.test(c.closedWith.reason), 'g6 passes required and none presented: closed (4401), nothing reaches LND');
+    let r6 = marks2.state(PKW, {}, t, true);
+    c = await S.open();
+    c.send(PASS_FRAME + r6.pass); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1, 'g6 passes required and a good one presented: passed through');
+    c.close(); await sleep(60);
+    t += 10; r6 = marks2.state(PKW, {}, t, true); t += 2000;   // the pass is 2 s old; it was good for 1 s
+    n0 = lndNow();
+    c = await S.open();
+    c.send(PASS_FRAME + r6.pass); c.send(bytes(50, 1)); await sleep(200);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REFUSED && /expired/.test(c.closedWith.reason), 'g6 an expired pass: closed (4403), nothing reaches LND');
+    S.close(); await sleep(60);
+
+    // g7 — a text frame AFTER the first bytes is not a pass (the stream is as it was before 0.136.0)
+    S = await serve(gate); n0 = lndNow();
+    c = await S.open();
+    c.send(bytes(50, 1)); await sleep(120);
+    c.send(PASS_FRAME + 'ab'.repeat(32)); await sleep(120);
+    check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).length === 50 + PASS_FRAME.length + 64, 'g7 after the first bytes nothing is read as a pass');
+    c.close(); S.close(); await sleep(60);
+  }
+
   wss.close(); lndServer.close();
-  console.log(fails ? 'FAIL · ws-tunnel · ' + fails + ' failed' : 'PASS · ws-tunnel (t1–t11)');
+  console.log(fails ? 'FAIL · ws-tunnel · ' + fails + ' failed' : 'PASS · ws-tunnel (t1–t11, g0–g7)');
   process.exit(fails ? 1 : 0);
 })().catch((e) => { console.log('FAIL · ws-tunnel threw: ' + (e && e.stack || e)); process.exit(1); });

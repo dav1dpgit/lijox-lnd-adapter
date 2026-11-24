@@ -29,7 +29,9 @@ t('/lnurl/note requires the proof (from the query) over note:<hash>:<client> bef
 t('register_secret and the JIT buy stamp nothing', !/touchWalletActive\(promise\.client_pubkey\);  \/\* v0\.55\.1 R2 \*\//.test(src) && !/touchWalletActive\(clientPubkey\);  \/\* v0\.55\.1 R2: a buy proves awake \*\//.test(src));
 // every remaining touchWalletActive in the file sits behind a proof or a signed route
 const sites = [...src.matchAll(/touchWalletActive\(([^)]*)\)/g)].map((m) => src.slice(0, m.index).split('\n').length);
-t('the remaining touch sites are few and named (the definition, the rail hook, heartbeat, pending POST, register, note, claim): ' + sites.length, sites.length <= 8);
+t('the remaining touch sites are few and named (the definition, the rail hook, heartbeat, pending POST, register, note, claim; 0.134.0: the reminder times and a seller\'s request, each after its proof): ' + sites.length, sites.length <= 10);
+{ const w = src.slice(src.indexOf("path === '/v1/wake/schedule'"), src.indexOf("path === '/v1/subs/seller'")); const sl = src.slice(src.indexOf("path === '/v1/subs/seller'"), src.indexOf("path === '/v1/subs/mint'"));
+  t('0.134.0: the reminder times and a seller\'s request stamp the wallet awake only after the node key\'s proof held', w.indexOf("lnurlpAuthCheck(wb, 'wake-schedule'") > 0 && w.indexOf("lnurlpAuthCheck(wb, 'wake-schedule'") < w.indexOf('touchWalletActive(wpk)') && sl.indexOf("lnurlpAuthCheck(sb, 'subs-seller'") > 0 && sl.indexOf("lnurlpAuthCheck(sb, 'subs-seller'") < sl.indexOf('touchWalletActive(spk)')); }
 // the rail gets the proof and the delete
 t('the Push rail is handed proofCheck (lnurlpAuthCheck) and lndDelete', /proofCheck: \(fields, action, clientPk, recordId\) => lnurlpAuthCheck\(fields, action, clientPk, recordId\)/.test(src) && /lndDelete: \(p\) => lndRequest\('DELETE', p, null\)/.test(src));
 // K1

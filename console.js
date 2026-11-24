@@ -353,7 +353,7 @@ function sats(msat){return Math.round(Number(msat||0)/1000)}
 function fiat(satsN,rate){if(!rate)return '';var v=satsN/1e8*rate;return '<span class="dim">'+(v<0?'\\u2212':'')+'$'+Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+'</span>'}
 function renderPL(r){
   var p=r.periods[plPeriod];var rate=r.rates_usd;
-  var rev=sats(p.routing_fee_msat)+sats(p.open_fee_msat)+sats(p.hold_fee_msat)+sats(p.onchain_pay_fee_msat||0);   // 0.120.0: the provider's fees from Lightning pays on-chain
+  var rev=sats(p.routing_fee_msat)+sats(p.open_fee_msat)+sats(p.hold_fee_msat)+sats(p.onchain_pay_fee_msat||0)+sats(p.subs_fee_msat||0);   // 0.120.0: the provider's fees from Lightning pays on-chain
   var chain=p.chain_fee_open_sats+p.chain_fee_close_sats+p.chain_fee_sweep_sats+p.chain_fee_other_sats+(p.chain_fee_onchain_pay_sats||0);
   var cost=chain+sats(p.payment_fee_msat);var net=rev-cost;
   // 0.76.0 (DP): each line shows the sats that MOVED for it and the rate it earned or cost (fee \\u00f7 moved).
@@ -369,6 +369,7 @@ function renderPL(r){
    +row('channel-open fees',sats(p.open_fee_msat),sats(p.open_moved_msat),pct(sats(p.open_moved_fee_msat),sats(p.open_moved_msat),opPart),fmt(p.open_count)+' opens')
    +row('hold / LNURL fees',sats(p.hold_fee_msat),sats(p.hold_moved_msat),pct(sats(p.hold_moved_fee_msat),sats(p.hold_moved_msat),hdPart),fmt(p.hold_count)+' holds')
    +row('Lightning pays on-chain fees',sats(p.onchain_pay_fee_msat||0),sats(p.onchain_pay_moved_msat||0),pct(sats(p.onchain_pay_fee_msat||0),sats(p.onchain_pay_moved_msat||0)),fmt(p.onchain_pay_count||0)+' payments')
+   +row('seller service fees',sats(p.subs_fee_msat||0),sats(p.subs_moved_msat||0),pct(sats(p.subs_fee_msat||0),sats(p.subs_moved_msat||0)),fmt(p.subs_count||0)+' payments')
    +row('revenue',rev,0,'','','tot')
    +'<tr><td class="h" colspan="6">Costs</td></tr>'
    +row('chain fees \\u00b7 opens',p.chain_fee_open_sats,p.chain_moved_open_sats,pct(p.chain_fee_open_sats,p.chain_moved_open_sats))

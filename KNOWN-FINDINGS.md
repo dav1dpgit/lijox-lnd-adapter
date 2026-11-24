@@ -1019,3 +1019,30 @@ gave his word for 0.131.0, and one of the private addresses `zap.test.js` feeds 
 the operator's own network. The place name is out; the test's address is now `192.168.1.12`, an address of the same
 private range (the check refuses the whole range, and the test says so as before). A box on 0.133.4 runs the same
 code as 0.133.5; the version exists so that one version number names one set of file hashes in RELEASES.md.
+
+**0.134.0.** LIJOX Subscriptions, the provider's part (see the README's paragraph): reminder times, the plan server's The seller service's fee has two options (design r9 §1): the share per payment, or the provider's monthly plan; the choice, its start on the 1st of the next month and the lapse rule live in the sidecar, and the adapter only honours `no_fee` on a mint request from the sidecar on this box (exactly `true`, nothing else).
+public door and local door, selling names, one-use addresses, the seller service's fee. Two things found while
+building it, both corrected in this release. (1) The PL ledger recorded the Lightning-pays-on-chain fees each day and
+never added them into a period total: `pl.js` summed a fixed list of fields that the 0.120.0 fields were never added
+to, so the Console's "Lightning pays on-chain fees" line and the revenue above it read 0 for those fees since 0.120.0
+(seen in a run: one `onchain_pay_fee` event of 5,000 sats gave a day total of 0). The events themselves were always
+written, so the totals are right from this release on for every past day as well — nothing was lost. (2) Nothing
+stopped the same payment hash from being registered under two names of one wallet (its standing address and a second
+name): the repeat check looked at one name's entries only. No wallet registered two names before this release; now a
+hash offered again under another name is passed over.
+
+**0.136.0.** A wallet that is behind its channels is not passed through to LND — what it does, and its limits. LND
+closes a channel by force the moment the other side reconnects with an older state. The adapter cannot read a
+wallet's reconnect message, and LND's
+API gives out one of the two numbers it compares (`num_updates` is its local chain's height only), so the wallet's
+own signed record decides: the box keeps the highest update number a wallet has stated per channel, and a wallet
+that states a lower number gets no pass for its tunnel. Its limits, as built: (1) A wallet that presents NO pass is
+passed through as before unless `STATE_PASS_REQUIRED=1` is set — wallets older than this release present none, so
+the setting is off by default and the protection is, until it is set, a second record the wallet asks before it
+connects, not a locked entry. (2) The high mark is as fresh as the wallet's last statement: a change of state in the
+last seconds before a wallet's app was put away may not have been stated, and a wallet behind only by that change is
+not seen as behind. (3) The box writes nothing down when a wallet without a pass is passed through, so it cannot
+yet say how many such wallets still connect; that count is needed before the setting can be turned on with
+confidence, and it is not built. (4) The marks name each stated wallet's channels (funding outpoints the box already
+sees in LND) and are kept in `DATA_DIR/state-marks/`; a pass is kept in memory only and is gone at a restart — the
+wallet asks again.

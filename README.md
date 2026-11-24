@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.133.5, 2026-11-19). Runs live on two LND nodes, both the author's. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the two nodes deploy by checking out a tag and comparing the files' hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.136.0, 2026-11-20). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -11,7 +11,7 @@ any provider. A LIJOX Adapter is open-source, self-hosted software
 that translates an operator's existing Lightning services into a
 LIJOX-standard LSP for LiJ-class wallets — JIT channels, offline
 holds, wake push, and the LIJOX manifest — under the operator's own
-keys, own front door, own policies, and own registry choices.
+keys, own public addresses, own policies, and own registry choices.
 Download, configure, serve. No permission asked, no secrets shared,
 no home to phone.
 
@@ -43,6 +43,17 @@ WHAT YOU NEED BEFORE STARTING
 - A running, synced LND node with onchain funds (JIT channels are
   opened from YOUR balance) and its P2P port reachable at a public
   host:port — that address becomes NODE_HOST.
+- LND (Terminus), not stock LND, to serve LiJ wallets. The adapter
+  opens every wallet channel zero-conf and without anchors (static
+  remote key — LSPS2_COMMITMENT_TYPE=STATIC_REMOTE_KEY), because a
+  LiJ wallet's 12 words alone recover such a channel and the wallet
+  refuses an anchors channel from its own provider. Stock LND opens
+  zero-conf channels only with anchors. LND (Terminus) is LND with
+  one 62-line patch:
+  https://github.com/dav1dpgit/lnd/commit/cf8f0d2cbdf380e038f180aa9adb5c4377f95f83
+  It ships as a Docker image (docs/umbrel-operator-guide.md) and a
+  StartOS package; docs/operator-docker-runbook.md §1a has the
+  other routes.
 - A Linux box (the node's own machine is fine). Node.js 20 or newer
   (developed on 22).
 - Two public HTTPS/WSS hostnames you control, fronted however you
@@ -51,15 +62,15 @@ WHAT YOU NEED BEFORE STARTING
   Browser wallets require real TLS — no self-signed.
 
 1. GET THE CODE — pinned to a release, verified
-       git clone <this repository> && cd lijox-adapter
+       git clone https://github.com/dav1dpgit/lijox-lnd-adapter && cd lijox-lnd-adapter
        git fetch --tags
-       git checkout v0.133.5         # the newest tag — the last row of RELEASES.md
+       git checkout v0.136.0         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
-       sha256sum lij-adapter.js tatara.js tatara-list.js tatara-host.js tatara-nostr.js nip04.js config.env.example package.json
-   Every printed hash must equal the one RELEASES.md gives for that
-   file at this version. (Rows up to 0.56.4 hashed a tarball instead —
+       sha256sum lij-adapter.js package.json config.env.example
+   and so on for every file the row names. Every printed hash must
+   equal the one RELEASES.md gives for that file at this version. (Rows up to 0.56.4 hashed a tarball instead —
    RELEASES.md explains both.) Then:
        npm ci
    (npm ci installs the exact locked dependencies, including a small
@@ -185,8 +196,15 @@ WHAT YOU NEED BEFORE STARTING
      (10) and LSPS2_MAX_LIVE_PROMISES (2,000) bound the memory. Promises
      are memory-only: a restart drops them and every held payment.
 
-Design documents live in the LiJ repo:
-docs/lijox-provider-definition.md · docs/separate-adapter-discovery.md
+Design documents: the LIJOX repository's docs/ (start with
+docs/lijox-provider-definition.md). Guides in this repository's docs/:
+adapter-standalone-setup.md (a plain Linux box), operator-docker-runbook.md
+(Docker), umbrel-operator-guide.md (Umbrel), tower-between-providers.md
+(LND's own watchtower between providers). ops/relay is the relay kit: a
+small rented server and a WireGuard tunnel that pass the connection to
+your node unopened, so TLS ends on your own machine and no edge in the
+middle reads the traffic (see ops/relay/README.md for what the rented
+server can still see).
 
 ## The delegate rail and wallets on this LSP (0.78+)
 A delegate spend (a chit) pays the bill from this node's own LND. LND cannot hold its own
@@ -202,7 +220,7 @@ DELEGATE_HOLD_RETRY_MS (20000), DELEGATE_HOLD_MAX_TRIES (30), DELEGATE_HOLD_MIN_
 DELEGATE_HOLD_EXPIRY_MARGIN_S (60). GET /delegate/slip/<nonce> reports `held` and `last_bill`.
 
 ## The kit holder — LIJOX Black start (0.79+)
-Every LIJOX adapter keeps, for any wallet that asks, one sealed ESCAPE KIT per wallet identity:
+Every LIJOX adapter keeps, for any wallet that asks, one encrypted Black start kit per wallet identity:
 the wallet's own fully signed latest force-close and its pre-signed sweep, encrypted under a key
 only the wallet's 12 words can make. The box cannot read it. A wallet whose device, backup and
 LSP are all gone recovers with the words alone by asking every listed adapter for its kit.
@@ -211,7 +229,7 @@ with Node's own crypto, no third-party code) binds the kit and its sequence numb
 wallet's NIP-06 key; the newest sequence wins, an older one is refused (409). `GET /v1/kit?npub=`
 returns the record (ciphertext) or 404. Records live in `DATA_DIR/kits/<npub>.json`, at most
 KIT_MAX_BYTES (65,536) each; the store evicts the oldest untouched record beyond 20,000, never one
-touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the LiJ repo's
+touched in the last 90 days. `/health` advertises `kit_holder`. The standard is the wallet repository's
 docs/black-start-standard.md.
 
 **The channel state file (0.126.0).** `POST /v1/peer-storage/put` takes `{ node_pubkey, nonce, signature, version,
@@ -269,10 +287,60 @@ one-time key. See `tower-admit.js` and KNOWN-FINDINGS 0.130.0.
 **What arrived must cover what is paid on (0.130.1).** An intercepted HTLC carries two amounts: what arrived on it,
 and what its onion asks this node to send on. LND compares them only when it forwards the HTLC itself. A JIT open —
 and a held forward the adapter delivers with an HTLC of its own — is paid by the adapter, so the adapter compares
-them: an HTLC on which less arrived than it asks to be sent on is failed back at the interceptor's door, and a set
+them: an HTLC on which less arrived than it asks to be sent on is failed back at the interceptor, and a set
 of parts is refused whole, before any channel is opened, when the parts' arrived amounts sum to less than what would
 be paid on plus the open fee. Every operator must run 0.130.1 or later before serving wallets. See KNOWN-FINDINGS
 0.130.1 and `jit-arrived.test.js`.
+
+**A wallet that is behind its channels is not passed through to LND (0.136.0).** LND closes a channel by force the
+moment the other side reconnects with an older state; it does not ask why. What travels through the adapter's
+tunnel is encrypted between the wallet
+and LND, so the adapter cannot read the wallet's reconnect message, and LND's API gives out one of the two numbers it
+compares, not both. What can decide is the wallet's own record. A wallet states, signed with its node key, the update
+number of each channel record it holds (`POST /v1/state`); that number rises with every change and never falls. The
+adapter keeps the highest number stated per wallet key and channel (`DATA_DIR/state-marks/`). A wallet that states a
+lower number than its own high mark is behind: the answer names the channels with both numbers and carries no pass.
+A wallet that is not behind gets a pass (good once, for 90 seconds) and presents it on its WebSocket before its first
+bytes; the tunnel takes the pass before anything is opened to LND. A channel LND no longer holds open is left out of
+the comparison. A wallet that presents no pass (an older wallet) is passed through as before, unless
+`STATE_PASS_REQUIRED=1` is set in `.env`: then no wallet reaches LND without a pass. The limit of this: the high mark
+is as fresh as the wallet's last statement (a wallet states after each change of state). See `state-marks.js`,
+`ws-tunnel.js` and their tests.
+
+**Confirmations for a channel a wallet funds (0.135.0).** When a wallet opens a channel to this node with its own
+coins, LND tells the wallet's node how many confirmations it asks for before the channel can be used. LND does not give
+that number out over its API, so the adapter states it on the registry record (`chan_confs: {min, max}`, signed with
+the rest as `lijox-register:v6`) for a wallet to show before anyone opens a channel. It takes the first of these that
+holds: `CHAN_CONFS` in `.env` (one number, `3`, or a range, `3-6`); `bitcoin.defaultchanconfs` in the lnd.conf that
+`TATARA_LND_CONF` names; LND's own rule (3 for a small channel, rising with its size to 6). The boot line
+`[ChanConfs] …` says which one it took. A wallet checks the statement at every channel it funds against the number LND
+really asked for and shows any difference, so a wrong statement is seen. A registry that does not know the block gets
+the record without it. This is not the number for a channel the provider opens to a wallet.
+
+**Subscriptions — the provider's part (0.134.0).** A subscription is an agreement between a wallet user and a
+merchant; nothing is ever sent automatically. The provider does four small things (`subs.js`; the format's design rounds
+are not yet published). (1) **Reminder times:** a wallet hands its own provider a list of times
+(`POST /v1/wake/schedule`, the node key's proof, at most 64, none more than 400 days ahead); at each one the provider
+sends the wake push `{"t":"due"}` — unless the wallet is live at that moment. The provider is told times only: no
+merchant, no plan, no amount. (2) **A plan server beside the adapter** (the sidecar, its own repository), when
+`SUBS_SIDECAR_URL`, `SUBS_SIDECAR_LOCAL` and `SUBS_SIDECAR_SECRET` are set: `/subs/…` is the plan server's public
+route (plans, agreements, status, invoices — handed to the sidecar on this box, the answer returned as it came), and a
+local route that only the sidecar on this box can use (the shared secret, a loopback socket, no mark of the public
+front) gives it what it needs from LND, because only the adapter writes to LND: an invoice of this node for a
+business selling from its own node, or an invoice on a wallet user's next SELLING HASH. (3) **A wallet user who
+sells** registers selling hashes under its selling name (`subs--…`, made from its node key; nobody's address — the
+public address routes answer "unknown name" for it), each with the signature of its selling key, which the paying
+wallet checks: the provider can refuse or delay such a payment and cannot collect it. The payment takes the
+Lightning-address path unchanged — held, the wallet woken, delivered — and the seller's phone takes it only after it
+has read the invoice's description here (`GET /lnurl/note/<hash>`, `subs.description`) and checked its tag. A seller's
+requests to the sidecar pass through `POST /v1/subs/seller` after the node key's proof; the sidecar holds no key of
+any seller. `SUBS_SELLER_FEE_PCT` (and `SUBS_SELLER_FEE_CAP_SAT`) is the seller service's fee, taken off what is
+delivered and shown on its own line of the PL. (4) **One-use addresses**, when `LNURLP_ONE_USE_HOST` is set: a name of
+the form `once--<12 characters>` for one payment back to a wallet (a refund), under the host THIS provider names —
+never claimed at the shared address host — with at most five payment hashes, used up by its first settled payment and
+dropped after 35 days. A name with `--` in it is reserved for these two kinds. A payment hash now lives under one
+name on a box, and a registration's answer carries `wallet_next_index`, the next index across every name of that
+wallet. A seller picks how it pays the provider: the share of each payment above, or — where the sidecar on this box offers a plan with the id `seller-service` — a monthly subscription to it. For a seller on the monthly plan the sidecar marks each invoice it asks for `no_fee`, and no share of that payment is kept.
 
 **Zaps — each wallet's choice (0.131.0, 0.132.0).** With `ZAPS_ENABLED=true` the provider OFFERS zaps from Nostr
 apps (NIP-57). An address takes them only while the wallet that owns it has turned them on: the wallet's own signed
@@ -290,7 +358,7 @@ nos.lol), tried three times. The receipt is dated when the SENDER'S payment reac
 wallet took it. The relays the sender names are used only with `ZAP_REQUEST_RELAYS=true`, because they are any
 server the sender picks. Every relay connection is wss:// to a public address, checked when the socket connects.
 What an operator should know: the box connects to the relays itself, so they see its outgoing address; and a receipt
-can only be sent after the wallet took the payment, so the relays see when that was. See `zap.js`, `zap.test.js` and
+can only be sent after the wallet took the payment, so the relays see when that was. See `zap.js` and
 KNOWN-FINDINGS 0.131.0 and 0.132.0.
 
 **A wallet's sent payment, settled or failed here while the wallet is offline (0.133.0).** An HTLC leaves a channel
@@ -333,8 +401,8 @@ pays at once with its own keys (a repeat of a recent payee waits for the user's 
 limits it refuses), then replies through the same relay. **The adapter never pays, never holds a key
 that reads a request, never sees the invoice, the amount or the payee.**
 
-`NWC_ENABLED=true` turns it on (off by default — an operator's choice; the wallet's Dials → NWC
-greys where a provider does not offer it). `POST /v1/nwc/register` and `/unregister` take the
+`NWC_ENABLED=true` turns it on (off by default — an operator's choice; the wallet's NWC screen
+under Connections greys where a provider does not offer it). `POST /v1/nwc/register` and `/unregister` take the
 route token plus the wallet's node-key signature (LND VerifyMessage on
 `lij-nwc-register:v1|service_pk|client_pk|expires_at|ttl_s|ts`), at most 10 connections per
 wallet, kept in `DATA_DIR/nwc/registry.json`; the adapter drops one at its expiry itself. The
@@ -363,7 +431,7 @@ plain sentence in the journal — wallets are never pointed at a dead server. Un
 v1 as before and wallets read the default server. `/health` carries `filter_server`; the console shows it.
 `node registry-filter.test.js` checks the record and the check.
 
-## The doors into the box — `routes` and `reach` (0.108+)
+## Connection routes into the box — `routes` and `reach` (0.108+)
 
 A wallet reaches a provider through the three addresses in its registry record: the API (`endpoint`), the
 browser's Lightning peer link (`wss_url`) and the block-filter server (`filter_url`). What sits between the
@@ -371,17 +439,17 @@ wallet and the box on those addresses is the operator's business, and the record
 is signed into the record as route 1's `reach` — `cloudflare` when a Cloudflare tunnel ends TLS at
 Cloudflare's edge (the default when unset; the honest word for every box set up with the tunnel), `direct`
 when TLS ends on the operator's own machine (a blind TCP relay such as `ops/relay`, or a port forward).
-Wallets show the word as a badge and may prefer or refuse a reach. A second door into the same box goes in as
+Wallets show the word as a badge and may prefer or refuse a reach. A second connection route into the same box goes in as
 `ROUTE_2_REACH` / `ROUTE_2_HTTPS_URL` / `ROUTE_2_WSS_URL` / `ROUTE_2_FILTER_URL` (a third as `ROUTE_3_*`) —
-for example the direct names as route 1 and the Cloudflare names as route 2, so a wallet that loses one door
+for example the direct names as route 1 and the Cloudflare names as route 2, so a wallet that loses one route
 takes the other. The record is signed as `lijox-register:v4` (registry 0.13.0+; an older registry gets the first
-door alone, as v3). Two checks keep the word honest without the operator's say: a door that claims `direct` but
+route alone, as v3). Two checks keep the word honest without the operator's say: a route that claims `direct` but
 answers with Cloudflare's own header (`cf-ray`) is registered as `cloudflare` and the journal says so; an unset
-`PUBLIC_REACH` on a door that answers without that header gets a hint to set `direct`. A second door's filter
-server is offered only when it answers `/tip`, as route 1's is; a malformed second door is skipped with a line,
-never refused. `/health` carries `routes` and `routes_notes`; the console's Front doors rows show them.
-The doors are asked once this box itself is listening (0.108.1 — until then the boot asked before its own port
-was open, and every door read `HTTP 502` in the journal; the reach reading was right regardless).
+`PUBLIC_REACH` on a route that answers without that header gets a hint to set `direct`. A second route's filter
+server is offered only when it answers `/tip`, as route 1's is; a malformed second route is skipped with a line,
+never refused. `/health` carries `routes` and `routes_notes`; the console's settings report lists them (its rows are still labelled "Front doors").
+The routes are checked once this box itself is listening (0.108.1 — until then the boot asked before its own port
+was open, and every route read `HTTP 502` in the journal; the reach reading was right regardless).
 `node routes.test.js` checks the record against the registry's bytes and every case of the checks.
 
 ## Mix pools — LIJOX's Tatara (0.97+; public rooms 0.106+)
@@ -399,9 +467,9 @@ announcement signed by a key the host makes for the room, open to anyone with a 
 honoured only once a stranger has registered a coin whose ownership proof verifies and whose coin
 is on the chain as registered; the outcome is never read off the relay — the seats' signed reports
 decide. 0.107.0 adds the room's stranger count to a seat's check-in. The registry record carries the
-`tatara` block (`lijox-register:v3`, signed field by field). The design and its security reviews are
-in the wallet repo under `docs/design/mix/` and `docs/security-review-*.md`; the tests are
-`tatara-*.test.js`. Nothing in a room announcement names LIJOX.
+`tatara` block (`lijox-register:v3`, signed field by field). The changes made to the public joinstr
+code are the wallet repository's `docs/joinstr-patches.md`; the design rounds and security reviews are
+not yet published; the tests are `tatara-*.test.js`. Nothing in a room announcement names LIJOX.
 
 ## The operator console (0.71+)
 
