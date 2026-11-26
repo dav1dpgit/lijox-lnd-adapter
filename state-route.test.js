@@ -15,7 +15,7 @@ const rIdx = src.indexOf("path === '/v1/state' && method === 'POST'"), aIdx = sr
 check(rIdx > 0 && aIdx > rIdx, 'the route is dispatched before the registry router and the auth gate (public, the node key\'s proof)');
 check(src.includes("if (path === '/v1/state') kitHolder.openCors(res);"), 'every wallet origin may call it (the kit holder\'s CORS)');
 check(/state_pass:\s+stateMarks\.capability/.test(src), 'the capability is announced (state_pass)');
-check(src.includes("gate: { take: (h) => stateMarks.takePass(h), required: () => stateMarks.required() },"), 'the tunnel is given the gate: a presented pass is taken before anything is opened to LND');
+check(src.includes("gate: { take: (h) => stateMarks.takePass(h), required: () => stateMarks.required(), check: () => {"), 'the tunnel is given the gate: a presented pass is taken before anything is opened to LND');
 check(/const STATE_PASS_REQUIRED = \/\^\(1\|true\|yes\|on\)\$\/i\.test\(String\(process\.env\.STATE_PASS_REQUIRED \|\| ''\)\.trim\(\)\);/.test(src), 'passes are required only when the operator sets STATE_PASS_REQUIRED');
 
 const PK = '02' + 'aa'.repeat(32), OTHER = '03' + 'bb'.repeat(32);

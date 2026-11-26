@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.136.0, 2026-11-20). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.146.0, 2026-11-25). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -64,7 +64,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone https://github.com/dav1dpgit/lijox-lnd-adapter && cd lijox-lnd-adapter
        git fetch --tags
-       git checkout v0.136.0         # the newest tag — the last row of RELEASES.md
+       git checkout v0.146.0         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
@@ -291,6 +291,143 @@ them: an HTLC on which less arrived than it asks to be sent on is failed back at
 of parts is refused whole, before any channel is opened, when the parts' arrived amounts sum to less than what would
 be paid on plus the open fee. Every operator must run 0.130.1 or later before serving wallets. See KNOWN-FINDINGS
 0.130.1 and `jit-arrived.test.js`.
+
+**Requests inside the Lightning connection (0.137.0).** A wallet's payments and channel messages already travel
+inside the Lightning connection, encrypted between the wallet's node key and this node's. Everything else a wallet
+asked its provider was a web request to the API address, readable by whoever ends that address's TLS — on a
+Cloudflare route, Cloudflare. From this release the adapter also takes requests inside the Lightning connection, in the
+form of LSPS0 (bLIP-50): one Lightning message type, 37913, carrying one JSON-RPC 2.0 object. LND hands every message
+of that type to the adapter with the sending peer's key (`cooperative-chain-bridge.js`), and `lijox-rpc.js` answers
+through LND to the same peer. The caller is the connection's key, proven by the Lightning handshake: no signed proof
+and no route token is read on this path. A request's answer is the body its web route gives (a refusal comes back as
+an error whose code is the web route's status). JSON longer than 60,000 bytes travels in numbered parts
+(`lijox.part`, at most 32). Limits are per peer, not per internet address: 120 requests a minute
+(`LIJOX_RPC_PER_MIN`), 2,000,000 bytes held in parts. `lijox.hello` answers what this provider serves on the path;
+`/health` carries `rpc: { lsps0: true }` so a wallet knows to ask. **One request is served both ways in this
+release:** the wallet's settings (`lijox.prefs_set` = `POST /client/prefs`, one function). The web routes are all
+unchanged, and a wallet on an older release never sends a 37913 message. A method that transfers money must carry
+`rid` (32 hex characters) and runs once: a `rid` seen in the last 24 hours gets its stored answer
+(`DATA_DIR/lijox-rid/`, kept across a restart; `lijox.what_became` reads it) — no such method is served yet.
+The adapter also counts, per wallet key and day, tunnel openings with and without a pass and requests that came as a
+web request though they have a form inside the connection (`form-counts.js`; counts only, 40 days).
+`node lij-adapter.js --form-counts` prints the last 30 days; it is the number to read before `STATE_PASS_REQUIRED=1`
+is set. Needs the chain bridge (`CHAIN_BRIDGE_ENABLED`, on by default) and the two custom-message permissions the
+adapter's key already holds. See `lijox-rpc.js`, `form-counts.js` and their tests.
+
+**The send path's asks inside the connection (0.138.0).** Three more requests are answered inside the Lightning
+connection: `lijox.route_build` = `POST /v1/route/build`, `lijox.route_report` = `POST /v1/route/report`,
+`lijox.outcome` = `GET /v1/outcome`. No money moves by these three; the payment is the Lightning payment that
+follows. From this release a request that came inside the connection is carried out by its web route's own code
+(`lijox-web-form.js`): the adapter hands its web handler a request it makes itself, marked with the connection's
+key, and sends back what the route answered. So both forms run one piece of code — the same checks, the same
+limits, the same answer. What stands in for what: the adapter puts its own route token on that request; the signed
+proof a route asks for is met by the connection itself (the key a request names must be the connection's key, or it
+is refused); the client's address becomes `ln:` and the first 16 characters of the wallet's key, so a limit per
+address is a limit per wallet, and the journal's `[HTTP]` line says `inside the connection of <key>…`. No web
+request can claim to have come inside a connection: the mark is not a header, a query field or a JSON field.
+`node lij-adapter.js --form-counts` now also counts the route requests and outcome checks that still come as web
+requests (their web form names no wallet, so they are counted by method).
+
+**The wallet page's asks inside the connection (0.139.0).** Seven more requests are answered inside the Lightning
+connection, each by its web route's own code. None of them moves money:
+`lijox.lnurl_fetch` = `POST /v1/lnurl/fetch` (an answer longer than one message goes back in parts),
+`lijox.onchain_quote` = `POST /v1/onchain-pay/quote`, `lijox.onchain_status` = `GET /v1/onchain-pay/status`,
+`lijox.push_quote` = `GET /push/quote`, `lijox.push_status` = `GET /push/status/<hash>`,
+`lijox.push_receivable` = `GET /push/receivable`, `lijox.push_note` = `GET /push/note/<hash>`.
+Where the web form names the wallet's key, the request inside the connection is answered for the connection's own
+key, whatever it names. The on-chain status read takes its signed proof from the query string; inside a connection
+those fields are given the connection's mark, so the connection's key is the proof there too. `--form-counts` counts
+the web forms of five of the seven. It does not count `GET /push/status/<hash>` and `GET /push/note/<hash>` as
+older-form requests: a wallet of another provider reads a Push Key's status and note here by design, over the web,
+and has no Lightning connection to this box.
+
+**The requests that move money, inside the connection (0.140.0).** Five more requests are answered inside the
+Lightning connection, each by its web route's own code: `lijox.onchain_open` = `POST /v1/onchain-pay/open`,
+`lijox.onchain_release` = `POST /v1/onchain-pay/release`, `lijox.push_lock` = `POST /push/lock`,
+`lijox.push_void` = `POST /push/void`, `lijox.push_claim` = `POST /push/claim` (65 s), and the read
+`lijox.push_claim_status` = `GET /push/claim-status/<hash>`. Each of the five carries `rid`, 32 hex characters the
+wallet makes once per tap. The path runs a route once for a `rid`, keeps the answer 24 hours, and gives that answer
+again to the same `rid`; `lijox.what_became {rid}` says not known, started, or done with the answer. So a wallet
+that got no answer can ask again without the request being carried out twice. A route that gave no answer within
+its limit is not kept as an answer: its `rid` stays "started". `POST /push/deliver` is not moved: it is asked of the
+provider that holds a Push Key by a wallet of another provider, which has no Lightning connection to this box.
+
+**Receiving and channels, inside the connection (0.141.0).** Nine more requests are answered inside the Lightning
+connection, each by its web route's own code: `lijox.jit_info` = `GET /lsps2/get_info`, `lijox.jit_buy` =
+`POST /lsps2/buy`, `lijox.register_secret` = `POST /lsps2/register_secret` (both forms), `lijox.pending` =
+`POST /lsps2/pending`, `lijox.openintent` = `POST /openintent`, `lijox.openintent_status` = `GET /openintent/<id>`,
+`lijox.funding_status` = `GET /v1/jit-funding/status`, `lijox.lease_policy` = `GET /lease/policy`,
+`lijox.wake_schedule` = `POST /v1/wake/schedule`. None moves money, so none carries `rid`: a buy makes a promise that
+ends by itself, a secret is stored under a key, an open intent is a status record. Inside the connection the wallet's
+key is the connection's key: the wake poll and the reminder times need no signature there; a channel secret is taken
+only for a promise that same wallet bought; an open intent must name the connection's key. `GET /lsps2/get_info`
+stays open as a web request: a wallet reads it for a provider it is not connected to.
+
+**The rest of the wallet's requests, inside the connection (0.142.0).** Twenty-two more requests, from one table
+(`REST142` in `lij-adapter.js`): the wallet's addresses (`lijox.lnurl_register`, `lijox.lnurl_release`,
+`lijox.lnurl_display`, `lijox.lnurl_note`, `lijox.lnurl_register_open`), its standing (`lijox.heartbeat`,
+`lijox.push_subscribe`, `lijox.nwc_register`, `lijox.nwc_unregister`, `lijox.subs_seller`, `lijox.tapedrop`), the
+tower and the kit holder (`lijox.tower_voucher`, `lijox.tower_put`, `lijox.tower_status`, `lijox.tower_drop`,
+`lijox.kit_put`), and chits (`lijox.delegate_register`, `lijox.delegate_void`, `lijox.delegate_refund` — these three
+carry `rid` — and the reads `lijox.delegate_claims`, `lijox.delegate_refunds`, `lijox.delegate_slip`). Each is
+carried out by its web route's own code with the body or the query the web request has. Where a route takes the node
+key's challenge proof, the connection's key replaces it; where a route checks a signature the wallet makes by itself
+(NWC, chits, the tower, the kit holder), that signature rides as before. A request inside the connection is limited
+per wallet, not as one shared address.
+
+**Two things the box now says truthfully (0.143.0).** (1) The journal wrote `[NWC] woke <wallet>` whenever the wake
+call returned, also when no push had gone out. The wake now answers what happened, and the line follows it:
+`[NWC] woke …` only for a push that went out; otherwise `[NWC] no wake went to … — <why>` (the wallet is connected and
+needs none; a wake was asked for moments ago; the wallet has no push subscription here; push is off; the push service
+did not take it). The Console's "wakes today" counts the pushes that went out and states the rest beside it. (2) The
+store of diagnostic tapes: once it has filled it stays at its cap, and each new tape pushes out tapes older than
+`TAPES_KEEP_DAYS` — that is routine and the journal line now says so. What matters is the room a new tape can still
+get (the free bytes plus what the tapes older than the keep days hold): at zero a new tape is refused (507) and is not
+kept here. The box states that room at start-up, on each sweep and in the Console ("tape store"), counts the refused
+tapes since its start, and writes a refusal as `[TapeDrop] STORE FULL — … REFUSED and is not kept`. What is deleted
+and when is unchanged.
+
+**Two more requests inside the connection, and the provider's signed word on its record (0.144.0).** Two rows
+joined the table: `lijox.channel_record` — the record a wallet's engine sends when a channel is ready
+(`POST /lsps/registry/channels`); inside the connection it is stored under the connection's key, and the challenge and
+the signature are not asked for — and `lijox.mix_seat` — a Mix seat taken in the wallet's own name
+(`POST /tatara/seat`, signed by its node key). A ring-signed seat names no wallet and is refused inside the connection:
+it stays a web request, as does every other Mix request. The registry record now carries `rpc: ["lsps0"]` while the
+path is up: this provider's signed word that it takes requests inside the Lightning connection
+(`lijox-register:v7`, the twin of lij-worker 0.24.0). Which methods it serves a wallet asks inside the connection
+(`lijox.hello`). A registry that does not know the list is given the record without it.
+
+**The checks a wallet makes before it connects, inside a check tunnel (0.145.0).** Before a wallet connects as itself
+it asks this box up to four things: its statement and the pass, its channel state file, its channel list, and — in a
+recovery — a close. They must be asked before the wallet connects as itself, so they cannot go inside its own
+connection. From this release a wallet can ask them inside a short Lightning connection of its own, under a key made
+for that one start: its WebSocket sends the text frame `lijox-check` before its first bytes. Such a tunnel is passed
+through without a pass even where passes are required, is limited per internet address (`CHECK_TUNNELS_PER_MIN`,
+12), and is closed after 20 seconds. Five more methods, each handed its web request's own body with the wallet's
+real key and that key's signature inside: `lijox.state`, `lijox.registry_challenge`, `lijox.state_file`,
+`lijox.my_channels`, `lijox.recover_close`. The key on a check tunnel is never taken as the wallet. It is served
+those five and `lijox.hello` only, its requests are limited by the tunnel's internet address, and a key there that
+holds a channel with this node gets the tunnel closed. The web forms of the five stay open.
+
+**Not inside Lightning: what the operator is told (0.146.0).** A request that has a form inside the Lightning
+connection and still comes as a web request is counted (since 0.137.0) — and from this release it is also said and
+shown. The journal: `[RPC] NOT INSIDE LIGHTNING: <method> came as a web request from <the first 16 characters of the
+wallet's key>…`, once an hour for a wallet and a method. The Console: the pane "Not inside Lightning" — today's web
+requests of moved methods, how many wallets they name, which methods, and beside them today's requests inside the
+connection. The five checks of 0.145.0 are counted too, but only for a wallet that holds a channel with this node: a
+wallet of another provider asks them here as web requests by design. They are counted where their body is read and names the key,
+before its proof is checked. Nothing is refused by this; refusing is `LIJOX_WEB_FORMS=refuse`, below.
+
+**Refusing the old web forms (0.142.0, off by default).** `LIJOX_WEB_FORMS=refuse` makes this box answer 426 to the
+web form of every moved request and not carry it out. Left out, so never refused: what a wallet of another provider
+asks here by design (a Push Key's status, note, cancel and delivery; a chit's record; the kit holder; the tower),
+a diagnostic tape (a wallet sends it when its connection has failed), the public reads, `GET /lsps2/get_info` without a wallet's key, and the checks a wallet makes before it connects.
+Before turning it on, read `node lij-adapter.js --form-counts`: it lists the web forms wallets still send.
+
+**The watch-only list of payments (0.140.0).** `lij-sm.js` writes the journal's `[SM-…]` lines and never touches
+LND. It now learns of every answer the adapter writes to LND for an HTLC. A payment handed straight back to LND
+leaves the list at once; until this release it was printed as `in flight … INTERCEPTED` once or twice after it was
+over, and `/v1/outcome` answered "pending" for it for up to two and a half minutes.
 
 **A wallet that is behind its channels is not passed through to LND (0.136.0).** LND closes a channel by force the
 moment the other side reconnects with an older state; it does not ask why. What travels through the adapter's

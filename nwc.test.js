@@ -29,12 +29,13 @@ function signEvent(skb, kind, tags, content, created_at = nowS()) {
 }
 
 const wakes = [];
+let wakeAnswer = { sent: true, why: 'sent' };   // 0.143.0: what the adapter's wake call answers (lij-adapter.js wakePush)
 const logs = [];
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nwc-'));
 function make(env) {
   return createNwc({
     dataDir: dir, log: (m) => logs.push(m), env: Object.assign({ NWC_ENABLED: 'true', NWC_REQUEST_TTL_CEILING_S: '3600' }, env || {}), now,
-    sendWakePush: async (w, kind) => { wakes.push([w, kind]); },
+    sendWakePush: async (w, kind) => { wakes.push([w, kind]); return wakeAnswer; },   // 0.143.0: the wake call's answer — what happened to the push
     verifyWalletSig: async (msg, sig) => (sig === 'good:' + crypto.createHash('sha256').update(msg).digest('hex').slice(0, 8) ? WALLET : (sig === 'other' ? '03' + 'cd'.repeat(32) : '')),
     authOk: (req) => req.headers['x-adapter-secret'] === 'tok',
     publicHttpsUrl: 'https://lsp.example.test',
@@ -265,6 +266,37 @@ const asrc = require('fs').readFileSync(require('path').join(__dirname, 'lij-ada
 const pushBlock = asrc.match(/if \(path\.startsWith\('\/push\/'\)\) \{[\s\S]*?\n  \}/);
 t('J1 the /push/ block no longer carries the NWC dispatch', !!pushBlock && !/nwc\.handle/.test(pushBlock[0]));
 t('J2 the NWC routes dispatch on their own prefix', /if \(path\.startsWith\('\/v1\/nwc\/'\)\) \{\n    if \(await nwc\.handle\(req, res, path, method, ip, readBody, jsonResponse\)\) return;/.test(asrc));
+
+// ── (K) 0.143.0 (found 2026-11-20): the box wrote "[NWC] woke <wallet>" whenever the
+//      wake call returned — also when no push went out (the wallet was connected, the wake was throttled, the wallet
+//      has no push subscription, push is off). The line now says what happened, and "wakes today" counts pushes. ──
+const NK = make(); attachTo(NK); current = () => NK;
+r = await post('/v1/nwc/register', { client_pubkey: WALLET, service_pk: svcPk, client_pk: cliPk, expires_at: nowS() + 86400, ttl_s: 600, ts: nowS(), signature: goodSig('lij-nwc-register:v1|' + svcPk + '|' + cliPk + '|' + (nowS() + 86400) + '|600|' + nowS()) }, { 'x-adapter-secret': 'tok' });
+const appK = await connect(); await until(appK, (m) => m[0] === 'AUTH');
+const askK = async (text) => { const e = signEvent(cliSk, KIND_REQUEST, [['p', svcPk], ['encryption', 'nip44_v2']], text); appK.send(['EVENT', e]); const o = await until(appK, (m) => m[0] === 'OK' && m[1] === e.id); await sleep(20); return o && o[2] === true; };
+const wokeLines = () => logs.filter((m) => /^\[NWC\] woke /.test(m)).length;
+const woke0 = wokeLines(); logs.length = 0;
+wakeAnswer = { sent: true, why: 'sent' };
+t('K1 a wake whose push went out: stored, written as "[NWC] woke", counted', r.status === 200 && await askK('k1') && logs.filter((m) => /^\[NWC\] woke /.test(m)).length === 1 && NK.summary().wakes_today === 1 && NK.summary().wakes_not_sent_today === 0, JSON.stringify([logs, NK.summary()]));
+clock += 61_000; logs.length = 0;
+wakeAnswer = { sent: false, why: 'the wallet is connected and was heard 3 s ago — it needs no wake' };
+t('K2 a wake that was skipped is NOT written as "woke": the line carries the reason', await askK('k2') && logs.filter((m) => /^\[NWC\] woke /.test(m)).length === 0 && logs.some((m) => /^\[NWC\] no wake went to \S+ — the wallet is connected and was heard 3 s ago — it needs no wake$/.test(m)), JSON.stringify(logs));
+t('K3 … and it is not counted as a wake: 1 sent, 1 asked for and not sent', NK.summary().wakes_today === 1 && NK.summary().wakes_not_sent_today === 1, JSON.stringify(NK.summary()));
+clock += 61_000; logs.length = 0;
+wakeAnswer = undefined;
+t('K4 a wake call that answers nothing is not "woke" either', await askK('k3') && logs.filter((m) => /^\[NWC\] woke /.test(m)).length === 0 && logs.some((m) => /^\[NWC\] no wake went to \S+ — the wake call gave no reason$/.test(m)) && NK.summary().wakes_not_sent_today === 2, JSON.stringify(logs));
+clock += 61_000; logs.length = 0;
+wakeAnswer = true;
+t('K5 the older answer `true` still reads as a push that went out', await askK('k4') && logs.filter((m) => /^\[NWC\] woke /.test(m)).length === 1 && NK.summary().wakes_today === 2, JSON.stringify(logs));
+wakeAnswer = { sent: true, why: 'sent' };
+// the adapter's side, in the source: every way out of the wake says which it was, and the old callers' answer is unchanged
+const wp = (asrc.match(/async function wakePush\([\s\S]*?\n\}\n/) || [''])[0];
+t('K6 lij-adapter.js: wakePush answers {sent, why} on every way out (off, connected, asked moments ago, no subscription, sent, not taken)', wp.length > 0 && !/\n\s*return;\s*\n/.test(wp) && !/return;\s*\}/.test(wp) && (wp.match(/return \{ sent: false, why: /g) || []).length === 5 && (wp.match(/return \{ sent: true, why: 'sent' \}/g) || []).length === 1, String((wp.match(/return \{ sent: false, why: /g) || []).length));
+t('K7 lij-adapter.js: sendWakePush still answers true only when a push went out (the lease warning and the sent-payment watch read it)', /async function sendWakePush\(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride\) \{ const r = await wakePush\(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride\); return r\.sent \? true : undefined; \}/.test(asrc));
+t('K8 lij-adapter.js: the NWC module is handed the answer with its reason', /sendWakePush: \(pk, kind\) => wakePush\(pk, undefined, kind\),/.test(asrc));
+const csrc = require('fs').readFileSync(require('path').join(__dirname, 'console.js'), 'utf8');
+t('K9 the Console’s "wakes today" row states the wakes that were asked for and not sent', /nw\.wakes_not_sent_today/.test(csrc));
+try { appK.ws.close(); } catch (_) {}
 
 for (const c of [wallet, app, snoop, app2]) try { c.ws.close(); } catch (_) {}
 server.close();

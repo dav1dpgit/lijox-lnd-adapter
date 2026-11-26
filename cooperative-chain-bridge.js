@@ -168,6 +168,8 @@ const HEIGHT_HINT_LOOKBACK = 1000;
  *                                              when LND_REST_CA_PATH is set; absent = no check, as before
  * @returns {{stop, registrySize, registrySnapshot, streamCounts}}
  */
+const TYPE_LSPS0 = 37913;   // 0.137.0: LSPS0 (bLIP-50) — lijox-rpc.js names the same number
+
 function startBridge(opts) {
   const {
     lightningClient,
@@ -761,6 +763,17 @@ function startBridge(opts) {
     // 0.73.0: a custom message from a peer is contact — the lease's proof of life.
     try { if (typeof opts.onPeerActivity === 'function') opts.onPeerActivity(peerHex, typeId); } catch (_) {}
 
+    // 0.137.0: LSPS0 (bLIP-50, message 37913) — a request inside the Lightning connection. It goes to lijox-rpc.js
+    // with the sending peer's key; nothing of it is read here. The chain-data kinds below are untouched.
+    if (typeId === TYPE_LSPS0) {
+      if (typeof opts.onLsps0 !== 'function') return;
+      let raw;
+      try { raw = Buffer.from(event.data, 'base64'); } catch (_) { return; }
+      try { Promise.resolve(opts.onLsps0(String(peerHex).toLowerCase(), raw)).catch((e) => console.error(`[ChainBridge] LSPS0 message from ${shortPeer(peerHex)} not handled: ${e.message}`)); }
+      catch (e) { console.error(`[ChainBridge] LSPS0 message from ${shortPeer(peerHex)} not handled: ${e.message}`); }
+      return;
+    }
+
     // Filter to LiJ-reserved range (32801..=32819).
     if (!Number.isFinite(typeId) || typeId < 32801 || typeId > 32819) {
       return;
@@ -869,6 +882,9 @@ function startBridge(opts) {
         return false;
       }
     },
+    // 0.137.0: one message of any custom type to a peer — lijox-rpc.js sends its answers through this. Rejects when LND
+    // does not take it (the peer has gone); never touches a subscription.
+    sendCustom: (peerHex, typeId, bytes) => sendToPeer(String(peerHex).toLowerCase(), typeId, Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes)),
     registrySize: () => registry.size,
     registrySnapshot: () => {
       const out = [];

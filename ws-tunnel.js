@@ -28,6 +28,16 @@ const net = require('net');
 const HANDSHAKE_BYTES = 116;   // BOLT 8: act one 50 + act three 66, the initiator's handshake
 const QUIET_MS = 90000;        // a WebSocket that says nothing this long is closed
 const PASS_FRAME = 'lijox-pass:';   // 0.136.0: the text frame that carries a wallet's pass (state-marks.js names the same)
+// 0.145.0 (S72, F2b — the wallet repo's docs/design/routes/f2b-r1.md §2): A CHECK TUNNEL. A wallet makes its checks
+// before connecting (the statement and the pass, the channel state file, its channel list) on a short connection of
+// its own, under a key made for that one start — a key with no channels, on which LND can close nothing. Its first
+// frame is the TEXT frame "lijox-check". Such a tunnel is passed through WITHOUT a pass even where passes are
+// required (it carries no wallet), is asked of the gate first (gate.check() — a limit per internet address), and is
+// closed after CHECK_MAX_MS whatever happens: a check takes one to two seconds.
+const CHECK_FRAME = 'lijox-check';
+const CHECK_MAX_MS = 20000;
+const CLOSE_CHECK_REFUSED = 4429;   // too many check tunnels from this address
+const CLOSE_CHECK_OVER = 4408;      // a check tunnel's time is up
 const CLOSE_PASS_REFUSED = 4403;    // the pass presented is not good (unknown, used, expired)
 const CLOSE_PASS_REQUIRED = 4401;   // this provider passes no wallet through without a pass
 
@@ -41,6 +51,8 @@ function tunnel(ws, opts) {
   const openedAt = Date.now();
   let tcp = null, sent = 0, told = false, closed = false;
   let presented = null, passKey = null, refused = null;   // 0.136.0
+  let check = false, checkTimer = null;                   // 0.145.0: this is a check tunnel
+  const checkMaxMs = (opts && opts.checkMaxMs > 0) ? opts.checkMaxMs : CHECK_MAX_MS;
 
   const quiet = setTimeout(() => {
     if (!tcp && !closed) {
@@ -54,7 +66,7 @@ function tunnel(ws, opts) {
     if (told || closed || !tcp || sent < HANDSHAKE_BYTES || !tcp.localPort) return;
     told = true;
     if (typeof onHandshake !== 'function') return;
-    try { onHandshake({ address: tcp.localAddress, port: tcp.localPort, alive: () => !closed, passKey }); } catch (_) {}
+    try { onHandshake({ address: tcp.localAddress, port: tcp.localPort, alive: () => !closed, passKey, check, close: (why) => { if (!closed) { log.log(`[WS] the tunnel is closed here: ${why}`); try { ws.close(CLOSE_CHECK_OVER, String(why).slice(0, 100)); } catch (_) {} end(); } } }); } catch (_) {}
   };
 
   const open = () => {
@@ -92,9 +104,22 @@ function tunnel(ws, opts) {
     if (isBinary === false && !tcp && buf.length <= 200) {
       const text = buf.toString('utf8');
       if (text.startsWith(PASS_FRAME)) { presented = text.slice(PASS_FRAME.length).trim(); return; }
+      if (text === CHECK_FRAME) { check = true; return; }   // 0.145.0: kept, never sent to LND
     }
     if (!tcp) {
-      if (gate) {
+      if (check) {
+        // 0.145.0: a check tunnel carries no wallet — no pass is asked for and a presented one is not taken (it stays
+        // good for the wallet's own connection). The gate says whether this address may open another one.
+        let okc = true; try { if (gate && typeof gate.check === 'function') okc = !!gate.check(); } catch (_) { okc = true; }
+        if (!okc) return refuse(CLOSE_CHECK_REFUSED, 'too many check tunnels from this address');
+        checkTimer = setTimeout(() => {
+          if (closed) return;
+          log.log(`[WS] a check tunnel is closed after ${Math.round(checkMaxMs / 1000)} s (a check takes one to two)`);
+          try { ws.close(CLOSE_CHECK_OVER, 'the check tunnel\'s time is up'); } catch (_) {}
+          end();
+        }, checkMaxMs);
+        if (checkTimer.unref) checkTimer.unref();
+      } else if (gate) {
         if (presented !== null) {
           let r = null; try { r = gate.take(presented); } catch (_) { r = null; }
           if (!r || !r.ok) return refuse(CLOSE_PASS_REFUSED, 'the pass is not good (' + ((r && r.code) || 'error') + ')');
@@ -115,12 +140,13 @@ function tunnel(ws, opts) {
   const end = () => {
     closed = true;
     clearTimeout(quiet);
+    if (checkTimer) clearTimeout(checkTimer);
     if (tcp) tcp.destroy();
   };
   ws.on('close', end);
   ws.on('error', (err) => { log.error(`[WS] WebSocket error: ${err.message}`); end(); });
 
-  return { sentBytes: () => sent, connected: () => !!tcp, told: () => told, passKey: () => passKey, refused: () => refused };
+  return { sentBytes: () => sent, connected: () => !!tcp, told: () => told, passKey: () => passKey, refused: () => refused, check: () => check };
 }
 
 // ── The LND peer on a tunnel ──────────────────────────────────────────────────────────────────────────────────────
@@ -158,4 +184,4 @@ async function findPeerOn(local, listPeers, { schedule = FIND_SCHEDULE_MS, sleep
   return null;
 }
 
-module.exports = { tunnel, findPeerOn, sameAddress, HANDSHAKE_BYTES, QUIET_MS, FIND_SCHEDULE_MS, PASS_FRAME, CLOSE_PASS_REFUSED, CLOSE_PASS_REQUIRED };
+module.exports = { tunnel, findPeerOn, sameAddress, HANDSHAKE_BYTES, QUIET_MS, FIND_SCHEDULE_MS, PASS_FRAME, CLOSE_PASS_REFUSED, CLOSE_PASS_REQUIRED, CHECK_FRAME, CHECK_MAX_MS, CLOSE_CHECK_REFUSED, CLOSE_CHECK_OVER };

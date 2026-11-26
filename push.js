@@ -71,6 +71,8 @@ function createPushRail(deps) {
     plRecord, leaseTouch, touchWalletActive, localPubkey, log, env = process.env, now = () => Date.now(), timers = { set: setTimeout, clear: clearTimeout },
     walletReceivable = async () => ({ ok: true, mode: 'channel', fee_msat: '0' }),   // 0.83.0: the deliverToWallet law, asked first
     senderHtlc = async () => ({ ok: true }),   // 0.113.0 (5): the sender's lock on its open channel — {ok, chan_point, active, expiration_height, height} | {ok:false, reason} | {error}
+    carry = (req, fields) => fields,   // 0.140.0: (req, fields) → fields, marked with the Lightning connection the request came inside, if it did (lijox-web-form.js) — the claim-status read's proof rides its query string
+    webSeen = () => {},                // 0.140.0: (body or req, clientPk, method) — a request that has a form inside the connection was read here (the adapter counts it when it came as a web request)
     proofCheck = null,   // 0.116.0 (F4): (fields, action, clientPk, recordId) → {ok} | {ok:false, code, status} — the node key's proof (lnurlpAuthCheck); null = not required (tests)
     lndDelete = null,    // 0.116.0 (F6): DELETE a canceled invoice (DeleteCanceledInvoice) so a burned claim's hash can be claimed again here
   } = deps;
@@ -532,7 +534,8 @@ function createPushRail(deps) {
       const q = new URL(req.url || '', 'http://lsp.local').searchParams;
       const pk = String(q.get('client_pubkey') || '').toLowerCase();
       if (!isHex(pk, 66)) return j({ ok: false, error: 'client_pubkey required' }, 400);
-      { const pr = proofOf({ node_pubkey: q.get('node_pubkey') || '', nonce: q.get('nonce') || '', signature: q.get('signature') || '' }, 'push-claim-status', pk, 'claim-status:' + hash + ':' + pk); if (!pr.ok) return j({ ok: false, error: 'auth: ' + pr.code }, pr.status || 401); }   // 0.116.0 (F4)
+      try { webSeen(req, pk, 'lijox.push_claim_status'); } catch (_) {}   // 0.140.0
+      { const pr = proofOf(carry(req, { node_pubkey: q.get('node_pubkey') || '', nonce: q.get('nonce') || '', signature: q.get('signature') || '' }), 'push-claim-status', pk, 'claim-status:' + hash + ':' + pk); if (!pr.ok) return j({ ok: false, error: 'auth: ' + pr.code }, pr.status || 401); }   // 0.116.0 (F4)
       const rec = reg.in[hash];
       if (!rec) return j({ ok: false, error: 'unknown' }, 404);
       if (rec.client_pubkey !== pk) return j({ ok: false, error: 'not yours' }, 403);
@@ -543,6 +546,8 @@ function createPushRail(deps) {
     const pk = String(body.client_pubkey || '').toLowerCase();
     const hash = String(body.hash || '').toLowerCase();
     if (!isHex(pk, 66) || !isHex(hash, 64)) return j({ ok: false, error: 'client_pubkey and hash required' }, 400);
+    // 0.140.0: lock, void and claim have a form inside the connection (deliver has none: it is asked by a wallet of ANOTHER provider)
+    { const _m = pathname === '/push/lock' ? 'lijox.push_lock' : pathname === '/push/void' ? 'lijox.push_void' : pathname === '/push/claim' ? 'lijox.push_claim' : null; if (_m) { try { webSeen(body, pk, _m); } catch (_) {} } }
 
     if (pathname === '/push/lock') {
       if (!authOk(req)) return j({ ok: false, error: 'auth' }, 401);

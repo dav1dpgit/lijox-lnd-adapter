@@ -8,7 +8,7 @@ function fnFromSource(name, deps) {   // lift one top-level function (and the co
 }
 let passed = 0, failed = 0; const t = (n, ok) => { if (ok) { passed++; console.log('  ok · ' + n); } else { failed++; console.log('  FAIL · ' + n); } };
 (async () => {
-  const readBody = fnFromSource('readBody', { leaseTouch: () => {} });
+  const readBody = fnFromSource('readBody', { leaseTouch: () => {}, webFormLib: require('./lijox-web-form') });   // 0.138.0: readBody hands on the connection's key with the body (none here: these are web requests)
   const getClientIp = fnFromSource('getClientIp', { process: { env: {} } });
   // readBody: a 256 KB cap by default, the route's cap when given; the request destroyed past it
   const srv = http.createServer(async (req, res) => {

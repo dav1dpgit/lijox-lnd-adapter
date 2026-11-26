@@ -38,6 +38,8 @@ function createOnchainPayRail(deps) {
     coreRpc = null,                  // core-rpc.js createCoreRpc(...) — the float wallet's door, or null when the service is off
     sendWakePush = async () => {},   // (client_pubkey, holdMs, kind)
     proofCheck = null,               // (fields, action, clientPk, recordId) → {ok} | {ok:false, code, status}
+    carry = (req, fields) => fields, // 0.139.0: (req, fields) → fields, marked with the Lightning connection the request came inside, if it did (lijox-web-form.js) — the status read's proof rides its query string, not a body readBody parsed
+    webSeen = () => {},              // 0.139.0: (body, clientPk, method) — a request that has a form inside the connection was read here (the adapter counts it when it came as a web request)
     plRecord = () => {}, leaseTouch = () => {}, localPubkey = () => '',
     network = 'bc',                  // the address hrp this box pays on
   } = deps;
@@ -379,7 +381,7 @@ function createOnchainPayRail(deps) {
       const q = new URL(req.url || '', 'http://lsp.local').searchParams;
       const client = String(q.get('client_pubkey') || '').toLowerCase();
       if (!isHex(client, 66)) return j({ ok: false, error: 'client_pubkey required' }, 400);
-      const pr = proofOf({ node_pubkey: q.get('node_pubkey'), nonce: q.get('nonce'), signature: q.get('signature') }, 'onchain-pay', client, 'status:' + client);
+      const pr = proofOf(carry(req, { node_pubkey: q.get('node_pubkey'), nonce: q.get('nonce'), signature: q.get('signature') }), 'onchain-pay', client, 'status:' + client);   // 0.139.0: inside the connection the connection's key is the proof
       if (!pr.ok) return j({ ok: false, error: pr.code }, pr.status || 401);
       leaseTouch(client, 'onchain-pay');
       const mine = Array.from(recs.values()).filter((r) => r.client_pubkey === client).sort((a, b) => b.quoted_at - a.quoted_at).slice(0, 50).map(publicRec);
@@ -396,6 +398,7 @@ function createOnchainPayRail(deps) {
     if (!['quote', 'open', 'release'].includes(sub)) return j({ ok: false, error: 'not found' }, 404);   // the same answer as a stranger's hash gets — no existence oracle
 
     if (sub === 'quote') {
+      try { webSeen(body, client, 'lijox.onchain_quote'); } catch (_) {}   // 0.139.0
       const amount = Number(body.amount_sats), releaseFee = Number(body.release_fee_sats), reserve = Number(body.reserve_sats);
       const W = String(body.release_pubkey || '').toLowerCase(); const recipient = String(body.recipient_address || '').trim();
       const pr = proofOf(body, 'onchain-pay', client, 'quote:' + hash);
@@ -434,6 +437,7 @@ function createOnchainPayRail(deps) {
     const r = recs.get(hash);
     if (!r || r.client_pubkey !== client) return j({ ok: false, error: 'not found' }, 404);   // never described to another wallet
     if (sub === 'open') {
+      try { webSeen(body, client, 'lijox.onchain_open'); } catch (_) {}   // 0.140.0
       const pr = proofOf(body, 'onchain-pay', client, 'open:' + hash);
       if (!pr.ok) return j({ ok: false, error: pr.code }, pr.status || 401);
       if (r.state !== 'quoted') return j({ ok: false, error: 'not open for paying (' + r.state + ')' }, 409);
@@ -442,6 +446,7 @@ function createOnchainPayRail(deps) {
       return j({ ok: true, payment_hash: hash, state: r.state });
     }
     if (sub === 'release') {
+      try { webSeen(body, client, 'lijox.onchain_release'); } catch (_) {}   // 0.140.0
       const txHex = String(body.tx_hex || '').toLowerCase();
       if (!/^[0-9a-f]{100,20000}$/.test(txHex)) return j({ ok: false, error: 'tx_hex required' }, 400);
       const pr = proofOf(body, 'onchain-pay', client, 'release:' + hash + ':' + sha256Hex(Buffer.from(txHex, 'hex')));

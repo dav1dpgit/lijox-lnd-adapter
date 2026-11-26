@@ -19,7 +19,7 @@ let pass = 0, fail = 0;
 const t = (n, ok, extra) => { (ok ? pass++ : fail++); console.log((ok ? 'PASS ' : 'FAIL ') + n + (extra && !ok ? ' — ' + extra : '')); };
 
 const registryNonceStore = new registry.NonceStore();
-const ctx = { crypto, Buffer, registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore, String, Array, console };
+const ctx = { crypto, Buffer, registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore, String, Array, console, webFormLib: require('./lijox-web-form') };   // 0.138.0: lnurlpAuthCheck looks first whether the request came inside a Lightning connection (lijox-web-form.js)
 vm.createContext(ctx);
 vm.runInContext(block + '\nthis.lnurlpRegisterRecordId = lnurlpRegisterRecordId; this.lnurlpRegisterRecordIdV1 = lnurlpRegisterRecordIdV1; this.lnurlpAuthCheck = lnurlpAuthCheck;', ctx);
 const { lnurlpRegisterRecordId, lnurlpRegisterRecordIdV1, lnurlpAuthCheck } = ctx;

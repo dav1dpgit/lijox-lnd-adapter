@@ -21,6 +21,7 @@ const ctx = {
   registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore,
   pushSubscriptionRecordId: registry.pushSubscriptionRecordId,
   pushSubs, PUSH_SUBS_MAX: 10, persistPushSubs: () => {},
+  webFormLib: require('./lijox-web-form'), formCounts: { web() {} },   // 0.142.0: the handler reads the connection's mark and counts its web form
 };
 vm.createContext(ctx);
 vm.runInContext(src.slice(a, b) + '\nthis.handlePushSubscribe = handlePushSubscribe;', ctx);

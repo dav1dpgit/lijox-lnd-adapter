@@ -20,11 +20,16 @@ t('GET /lsps2/pending stamps nothing', !/touchWalletActive\(/.test(pget));
 const ppost = route("if (path === '/lsps2/pending' && method === 'POST') {", "const pending = [];");
 t('POST /lsps2/pending stamps only behind the proof over pending:<ts> (within 90 s); a plain poll still answers', /if \(body\.signature \|\| body\.nonce \|\| body\.node_pubkey\) \{[\s\S]*proofTsOk\(body\.ts\)[\s\S]*lnurlpAuthCheck\(body, 'lsps2-pending', pubkey, 'pending:' \+ String\(Math\.floor\(Number\(body\.ts\)\)\)\)[\s\S]*touchWalletActive\(pubkey\);[\s\S]*\}/.test(ppost) && (ppost.match(/touchWalletActive\(/g) || []).length === 1);
 // prefs
-const prefs = route("if (method === 'POST' && path === '/client/prefs') {", "console.log(`[prefs]");
-t('/client/prefs requires the proof over prefs:<hold_ms> before the write', /lnurlpAuthCheck\(body, 'client-prefs', String\(body\.client_pubkey\)\.toLowerCase\(\), 'prefs:' \+ String\(body\.hold_ms\)\)/.test(prefs) && prefs.indexOf("lnurlpAuthCheck(body, 'client-prefs'") < prefs.indexOf('clientPrefs[pk] = '));
+// 0.137.0: the write moved into prefsSet (one function for the web route and for lijox.prefs_set inside the Lightning
+// connection). The web route still proves the key first: its proof stands before its call of prefsSet, and the route
+// itself writes nothing.
+const prefs = route("if (method === 'POST' && path === '/client/prefs') {", "return jsonResponse(res, hr.body, hr.status);");
+t('/client/prefs requires the proof over prefs:<hold_ms> before the write', /lnurlpAuthCheck\(body, 'client-prefs', String\(body\.client_pubkey\)\.toLowerCase\(\), 'prefs:' \+ String\(body\.hold_ms\)\)/.test(prefs) && prefs.indexOf("lnurlpAuthCheck(body, 'client-prefs'") > 0 && prefs.indexOf("lnurlpAuthCheck(body, 'client-prefs'") < prefs.indexOf('prefsSet(pk, { hold_ms: body.hold_ms })') && !/clientPrefs\[pk\] = /.test(prefs) && !/touchWalletActive\(/.test(prefs));
+const pset = route("function prefsSet(pk, params) {", "\n}\n");
+t('prefsSet makes the write and the awake stamp; it is reached only from the proven web route and from the Lightning connection\'s own key', /clientPrefs\[pk\] = Object\.assign\(clientPrefs\[pk\] \|\| \{\}, \{ hold_ms: Math\.round\(params\.hold_ms\), updated: Date\.now\(\) \}\);/.test(pset) && /touchWalletActive\(pk\);/.test(pset) && (src.match(/prefsSet\(/g) || []).length === 4);
 // the note
 const note = route("if (method === 'GET' && path.startsWith('/lnurl/note/')) {", "return jsonResponse(res, { ok: true, note:");
-t('/lnurl/note requires the proof (from the query) over note:<hash>:<client> before the lookup answers', /lnurlpAuthCheck\(proofFromQuery\(parsed\.searchParams\), 'lnurl-note', who, 'note:' \+ hash \+ ':' \+ who\)/.test(note) && note.indexOf("lnurlpAuthCheck(proofFromQuery") < note.indexOf("if (!hit) return"));
+t('/lnurl/note requires the proof (from the query) over note:<hash>:<client> before the lookup answers', /lnurlpAuthCheck\(webFormLib\.carry\(req, proofFromQuery\(parsed\.searchParams\)\), 'lnurl-note', who, 'note:' \+ hash \+ ':' \+ who\)/.test(note) && note.indexOf("lnurlpAuthCheck(webFormLib.carry(req, proofFromQuery") < note.indexOf("if (!hit) return"));   // 0.142.0: the proof fields take the connection's mark with them
 // the typed-pubkey sites
 t('register_secret and the JIT buy stamp nothing', !/touchWalletActive\(promise\.client_pubkey\);  \/\* v0\.55\.1 R2 \*\//.test(src) && !/touchWalletActive\(clientPubkey\);  \/\* v0\.55\.1 R2: a buy proves awake \*\//.test(src));
 // every remaining touchWalletActive in the file sits behind a proof or a signed route

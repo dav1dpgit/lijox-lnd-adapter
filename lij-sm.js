@@ -1,4 +1,15 @@
-// lij-sm.js — LSPS2 Payment State Machine · PHASE 0.4 (SHADOW)
+// lij-sm.js — LSPS2 Payment State Machine · PHASE 0.5 (SHADOW)
+// 0.140.0 (S72, the operator's word of 2026-11-25 00:19 "Proceed with in flight repairs"): THE LIST LEARNS OF EVERY ANSWER
+// THE ADAPTER WRITES TO LND. Until now a payment the adapter handed straight back to LND (RESUME) stayed INTERCEPTED
+// until the once-a-minute count found it older than 90 s — so every forwarded payment was printed as "in flight" once
+// or twice after it was over (field, 2026-11-24: "INTERCEPTED@62s" a minute after LND had settled it), and /v1/outcome
+// answered "pending" for it in that time. The interceptor wrapper already tells its caller of every answer it writes
+// (lnd-grpc.js noteAnswer → onResolve); the adapter passes that on as the event `answered` { ck, action }. An entry all
+// of whose parts were handed back ends at once as PASSTHROUGH; one whose parts were all failed back ends as FAILED;
+// a promise or a hold is ended by its own events, as before. `hold_refused` (reported from five places since 0.119.x,
+// never handled here — each wrote "[SM-NOTE] unknown event") now carries the refusal's reason to that end. A new HTLC
+// for a hash whose entry ended as PASSTHROUGH or RESUMED starts a new entry (a sender's further try), where it used to
+// be an event on a finished one. The 90-s rule stays as the backstop.
 // ─────────────────────────────────────────────────────────────────────────
 // Design: docs/design-lsps2-state-machine.md (repo). This module OBSERVES
 // events emitted from taps in lij-adapter.js and derives one intent per
@@ -30,6 +41,8 @@ const LEGAL = {
 const intents = new Map();        // hash -> intent
 const secretByHash = new Map();   // hash -> ts
 const secretByScid = new Map();   // scid -> ts
+const hashByCk = new Map();       // 0.140.0: "chan_id:htlc_id" -> hash, so an answer written to LND finds its entry
+const CK_KEEP = 20000;
 
 function short(h) { return h ? String(h).slice(0, 16) : '????'; }
 function log(tag, msg) { console.log(`[SM-${tag}] ${msg}`); }
@@ -82,8 +95,16 @@ function secretKnown(it) {
 
 const handlers = {
   htlc_intercepted(p) {
+    // 0.140.0: an entry that ended because LND was handed the payment is over; a part LND shows now on a circuit this
+    // entry never saw is a new try of the same hash and gets an entry of its own
+    const was = p.hash ? intents.get(p.hash) : null;
+    if (was && (was.state === 'PASSTHROUGH' || was.state === 'RESUMED') && p.ck && !was.shards.has(String(p.ck))) intents.delete(p.hash);
     const it = getIntent(p.hash);
     if (!it) return;
+    if (p.ck) {
+      hashByCk.set(String(p.ck), p.hash);
+      if (hashByCk.size > CK_KEEP) { let n = hashByCk.size - CK_KEEP; for (const k of hashByCk.keys()) { if (n-- <= 0) break; hashByCk.delete(k); } }
+    }
     if (p.scid && !it.scid) it.scid = String(p.scid);
     if (p.ck && !it.shards.has(p.ck)) {
       it.shards.set(p.ck, String(p.in_msat || '0'));
@@ -119,6 +140,38 @@ const handlers = {
     if (!it) { log('NOTE', 'variable flush failed for an unbound/unknown intent'); return; }
     transition(it, 'FAILING', `variable flush failed: ${p.why || '?'}`);
     transition(it, 'FAILED', 'all parts failed back');
+  },
+
+  // 0.140.0: the adapter refused a part at the door (it arrived short, or over the promise) and fails it back — the
+  // reason is kept for the entry's end, which `answered` writes when every part has its answer
+  hold_refused(p) {
+    const it = p.hash ? intents.get(p.hash) : null;
+    if (it && !TERMINAL.has(it.state)) it.refused = String(p.why || 'refused').slice(0, 80);
+  },
+
+  // 0.140.0: one answer the adapter wrote to LND for one part — RESUME, FAIL or SETTLE (from the interceptor wrapper's
+  // own hook, so every way an answer is written passes here: the handler's return and the later writes alike).
+  answered(p) {
+    const ck = p.ck ? String(p.ck) : '';
+    const hash = ck ? hashByCk.get(ck) : null;
+    if (!hash) return;
+    const it = intents.get(hash);
+    if (!it || TERMINAL.has(it.state)) return;
+    if (!it.answers) it.answers = new Map();
+    it.answers.set(ck, String(p.action || ''));
+    for (const k of it.shards.keys()) if (!it.answers.has(k)) return;        // a part is still with the adapter
+    const acts = Array.from(it.answers.values());
+    if (acts.includes('SETTLE')) return;                                      // settled parts: the settle events end it
+    const allFail = acts.every((a) => a === 'FAIL');
+    if (it.refused && allFail) {
+      transition(it, 'FAILING', 'refused at the door: ' + it.refused);
+      transition(it, 'FAILED', 'every part failed back');
+      return;
+    }
+    if (it.promiseBound || it.hold) return;                                   // a promise or a hold: its own events end it
+    if (it.state !== 'INTERCEPTED' && it.state !== 'AGGREGATING') return;
+    if (allFail) { transition(it, 'FAILING', 'failed back by the adapter'); transition(it, 'FAILED', 'every part failed back'); }
+    else transition(it, 'PASSTHROUGH', 'handed back to LND');
   },
 
   secret_registered(p) {

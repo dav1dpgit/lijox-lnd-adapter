@@ -81,7 +81,7 @@ function matches(f, ev) {
 function createNwc(deps) {
   const {
     dataDir, log, env = process.env, now = () => Date.now(),
-    sendWakePush = async () => {},          // (walletPubkey, kind) → the existing web push, {t: kind}
+    sendWakePush = async () => {},          // (walletPubkey, kind) → the existing web push, {t: kind} · 0.143.0: answers { sent, why } (true is read as sent)
     verifyWalletSig = async () => '',       // (msgUtf8, sigZbase32) → the recovered node pubkey (66 hex) or '' — LND VerifyMessage
     authOk = () => false,                   // the route token
     publicHttpsUrl = '',                    // CONFIG.public.https_url (or a function of it — CONFIG is built later in lij-adapter.js) → the relay's wss URL
@@ -112,7 +112,8 @@ function createNwc(deps) {
 
   const nowS = () => Math.floor(now() / 1000);
   const wakeAt = new Map();          // wallet → last wake ms
-  let wakesToday = []; // timestamps
+  let wakesToday = []; // timestamps · 0.143.0: of the pushes that WENT OUT
+  let wakesNotSentToday = []; // 0.143.0: timestamps of the wakes asked for where no push went out (the reason is on the log line)
 
   // ── the registry ──
   function connsOf(wallet) { return Object.entries(reg.conns).filter(([, c]) => c.wallet === wallet); }
@@ -135,6 +136,7 @@ function createNwc(deps) {
     ev.replies = ev.replies.filter((r) => r.expires_at > t);
     if (ev.requests.length !== r0 || ev.replies.length !== p0) { persistEv(); log(`[NWC] ${r0 - ev.requests.length} request(s) and ${p0 - ev.replies.length} reply(ies) past their time — gone`); }
     wakesToday = wakesToday.filter((ms) => now() - ms < 86_400_000);
+    wakesNotSentToday = wakesNotSentToday.filter((ms) => now() - ms < 86_400_000);
     return n;
   }
 
@@ -218,8 +220,17 @@ function createNwc(deps) {
   function wake(wallet) {
     const last = wakeAt.get(wallet) || 0;
     if (now() - last < WAKE_MIN_INTERVAL_MS) { log(`[NWC] wake for ${short(wallet)} held (one per ${WAKE_MIN_INTERVAL_MS / 1000} s)`); return; }
-    wakeAt.set(wallet, now()); wakesToday.push(now());
-    Promise.resolve(sendWakePush(wallet, 'nwc')).then(() => log(`[NWC] woke ${short(wallet)}`)).catch((e) => log(`[NWC] wake for ${short(wallet)} failed: ${e && e.message}`));
+    wakeAt.set(wallet, now());
+    // 0.143.0 (found 2026-11-20): this wrote "[NWC] woke <wallet>" whenever the wake
+    // call RETURNED — and the adapter's wake call returns without sending when the wallet is connected, when a wake was
+    // asked for moments ago, when the wallet has no push subscription, and when push is off. The journal then said
+    // "woke" about a phone no push had gone to. The call now answers { sent, why }; "woke" is written, and "wakes
+    // today" counted, only for a push that went out — otherwise the line says no wake went and why.
+    Promise.resolve(sendWakePush(wallet, 'nwc')).then((r) => {
+      if (r === true || (r && r.sent === true)) { wakesToday.push(now()); log(`[NWC] woke ${short(wallet)}`); return; }
+      wakesNotSentToday.push(now());
+      log(`[NWC] no wake went to ${short(wallet)} \u2014 ${(r && typeof r.why === 'string' && r.why) || 'the wake call gave no reason'}`);
+    }).catch((e) => log(`[NWC] wake for ${short(wallet)} failed: ${e && e.message}`));
   }
 
   function onEvent(s, e) {
@@ -350,7 +361,7 @@ function createNwc(deps) {
     log(`[NWC] relay on ${RELAY_PATH} (${ENABLED ? 'ON' : 'off'}; ${Object.keys(reg.conns).length} connection(s), ${ev.requests.length} request(s) waiting)`);
   }
 
-  const summary = () => ({ connections: Object.keys(reg.conns).length, wallets: new Set(Object.values(reg.conns).map((c) => c.wallet)).size, waiting: ev.requests.length, replies_kept: ev.replies.length, wakes_today: wakesToday.filter((ms) => now() - ms < 86_400_000).length, sockets: sockets.size });
+  const summary = () => ({ connections: Object.keys(reg.conns).length, wallets: new Set(Object.values(reg.conns).map((c) => c.wallet)).size, waiting: ev.requests.length, replies_kept: ev.replies.length, wakes_today: wakesToday.filter((ms) => now() - ms < 86_400_000).length, wakes_not_sent_today: wakesNotSentToday.filter((ms) => now() - ms < 86_400_000).length, sockets: sockets.size });
   const settings = () => ({ enabled: ENABLED, request_ttl_ceiling_s: TTL_CEILING_S, max_connections: MAX_CONNS_PER_WALLET, max_waiting: MAX_WAITING_PER_CONN, wake_min_interval_s: WAKE_MIN_INTERVAL_MS / 1000, relay: relayUrlOf() });
   const capability = { enabled: ENABLED, get relay() { return ENABLED ? relayUrlOf() : null; }, request_ttl_ceiling_s: TTL_CEILING_S, max_connections: MAX_CONNS_PER_WALLET, max_waiting: MAX_WAITING_PER_CONN, encryption: ['nip44_v2'] };
 

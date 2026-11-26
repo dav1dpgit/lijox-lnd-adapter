@@ -132,7 +132,7 @@ const bytes = (n, fill) => Buffer.alloc(n, fill);
     const src = require('fs').readFileSync(require('path').join(__dirname, 'lij-adapter.js'), 'utf8');
     const s = src.indexOf('async function pushFirstBundle(');
     const e = src.indexOf('\n}\n', s) + 3;
-    check(s > 0 && /wsTunnel\(ws, \{[\s\S]{0,600}onHandshake: \(local\) => \{ pushFirstBundle\(local\)/.test(src), 't11 the proxy runs every wallet socket through the tunnel and hands the handshake to pushFirstBundle');   // 0.136.0: the gate's lines stand between (600, was 200)
+    check(s > 0 && /wsTunnel\(ws, \{[\s\S]{0,1400}onHandshake: \(local\) => \{\s*if \(local\.check\) \{ checkTunnelHandshake\(local, clientIp\)[\s\S]{0,300}pushFirstBundle\(local\)/.test(src), 't11 the proxy runs every wallet socket through the tunnel and hands the handshake to pushFirstBundle (a check tunnel\'s to checkTunnelHandshake — 0.145.0)');   // 0.136.0: the gate's lines stand between (600, was 200)
     const run = async (bridge, peers) => {
       const fn = new Function('chainBridge', 'findPeerOn', 'lndGet', 'console', src.slice(s, e) + '\n; return pushFirstBundle;')(
         bridge, (local, lp) => findPeerOn(local, lp, { sleep: async () => {} }), async () => ({ peers }), quiet);
@@ -247,9 +247,73 @@ const bytes = (n, fill) => Buffer.alloc(n, fill);
     c.send(PASS_FRAME + 'ab'.repeat(32)); await sleep(120);
     check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).length === 50 + PASS_FRAME.length + 64, 'g7 after the first bytes nothing is read as a pass');
     c.close(); S.close(); await sleep(60);
+
+    // ── 0.145.0 (F2b): a check tunnel — the text frame "lijox-check" before the first bytes ──
+    const { CHECK_FRAME, CLOSE_CHECK_REFUSED, CLOSE_CHECK_OVER } = require('./ws-tunnel');
+    check(CHECK_FRAME === 'lijox-check', 'k0 the frame that marks a check tunnel');
+    // k1 — the frame alone opens nothing; the first bytes pass; the frame is not among them; the caller is told "check"
+    S = await serve({ take: (h) => marks.takePass(h), required: () => false, check: () => true }); n0 = lndNow();
+    c = await S.open();
+    c.send(CHECK_FRAME); await sleep(80);
+    check(lndNow() === n0, 'k1 the check frame alone opens nothing to LND');
+    c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && Buffer.concat(lnd.conns[n0].got).equals(bytes(50, 1)) && S.views[0].check() === true, 'k1 the first bytes pass, and the check frame is NOT among the bytes LND got');
+    c.send(bytes(66, 3)); await sleep(120);
+    check(S.told.length === 1 && S.told[0].check === true && S.told[0].passKey === null && typeof S.told[0].close === 'function', 'k1 after the handshake the caller is told this is a check tunnel, with no wallet key, and is handed the way to close it');
+    S.told[0].close('the peer on a check tunnel holds a channel'); await sleep(120);
+    check(c.closedWith && c.closedWith.code === CLOSE_CHECK_OVER && /holds a channel/.test(c.closedWith.reason), 'k1 the caller can close a check tunnel, with the reason');
+    S.close(); await sleep(60);
+    // k2 — where passes are REQUIRED a check tunnel is passed through without one (it carries no wallet)
+    S = await serve({ take: (h) => marks.takePass(h), required: () => true, check: () => true }); n0 = lndNow();
+    c = await S.open();
+    c.send(CHECK_FRAME); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && !c.closedWith, 'k2 passes required: a check tunnel is passed through without a pass');
+    c.close(); await sleep(60);
+    c = await S.open(); n0 = lndNow();
+    c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 && c.closedWith && c.closedWith.code === CLOSE_PASS_REQUIRED, 'k2 and a wallet\'s own tunnel without a pass is still refused (4401)');
+    S.close(); await sleep(60);
+    // k3 — a pass presented on a check tunnel is NOT taken: it stays good for the wallet's own connection
+    S = await serve({ take: (h) => marks.takePass(h), required: () => false, check: () => true }); n0 = lndNow();
+    const pk3 = newPass();
+    c = await S.open();
+    c.send(PASS_FRAME + pk3); c.send(CHECK_FRAME); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && S.views[0].passKey() === null, 'k3 a pass presented beside the check frame is not taken');
+    c.close(); await sleep(60);
+    c = await S.open(); n0 = lndNow();
+    c.send(PASS_FRAME + pk3); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 + 1 && S.views[1].passKey() === PKW, 'k3 and is still good, once, on the wallet\'s own tunnel');
+    c.close(); S.close(); await sleep(60);
+    // k4 — the gate refuses (too many from this address): closed 4429, nothing reaches LND
+    let asked4 = 0;
+    S = await serve({ take: (h) => marks.takePass(h), required: () => false, check: () => { asked4++; return false; } }); n0 = lndNow();
+    c = await S.open();
+    c.send(CHECK_FRAME); c.send(bytes(50, 1)); await sleep(150);
+    check(lndNow() === n0 && asked4 === 1 && c.closedWith && c.closedWith.code === CLOSE_CHECK_REFUSED, 'k4 a check tunnel the gate refuses is closed (4429) and nothing reaches LND');
+    S.close(); await sleep(60);
+    // k5 — a check tunnel is closed when its time is up, whatever happens
+    {
+      const srv5 = new WebSocketServer({ port: 0, host: '127.0.0.1' }); await new Promise((r) => srv5.on('listening', r));
+      srv5.on('connection', (ws) => { tunnel(ws, { host: '127.0.0.1', port: lndPort, log: quiet, quietMs: 700, checkMaxMs: 400, gate: { check: () => true } }); });
+      const c5 = new WebSocket('ws://127.0.0.1:' + srv5.address().port); c5.closedWith = null;
+      c5.on('close', (code, reason) => { c5.closedWith = { code, reason: String(reason || '') }; });
+      await new Promise((r) => c5.on('open', r));
+      n0 = lndNow();
+      c5.send(CHECK_FRAME); c5.send(bytes(50, 1)); await sleep(150);
+      check(lndNow() === n0 + 1 && !c5.closedWith, 'k5 a check tunnel is open while its time runs');
+      await sleep(450);
+      check(c5.closedWith && c5.closedWith.code === CLOSE_CHECK_OVER, 'k5 and is closed when its time is up (20 s on a box; 0.4 s here)');
+      srv5.close(); await sleep(60);
+    }
+    // k6 — the frame AFTER the first bytes marks nothing, and a tunnel without it is not a check tunnel
+    S = await serve({ take: (h) => marks.takePass(h), required: () => false, check: () => { throw new Error('must not be asked'); } }); n0 = lndNow();
+    c = await S.open();
+    c.send(bytes(50, 1)); await sleep(120); c.send(CHECK_FRAME); await sleep(120);
+    check(lndNow() === n0 + 1 && S.views[0].check() === false && Buffer.concat(lnd.conns[n0].got).length === 50 + CHECK_FRAME.length, 'k6 after the first bytes nothing is read as the check frame, and the gate is not asked');
+    c.close(); S.close(); await sleep(60);
   }
 
   wss.close(); lndServer.close();
-  console.log(fails ? 'FAIL · ws-tunnel · ' + fails + ' failed' : 'PASS · ws-tunnel (t1–t11, g0–g7)');
+  console.log(fails ? 'FAIL · ws-tunnel · ' + fails + ' failed' : 'PASS · ws-tunnel (t1–t11, g0–g7, k0–k6)');
   process.exit(fails ? 1 : 0);
 })().catch((e) => { console.log('FAIL · ws-tunnel threw: ' + (e && e.stack || e)); process.exit(1); });

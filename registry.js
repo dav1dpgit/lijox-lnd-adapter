@@ -498,7 +498,7 @@ async function storeAndConfirm(channelStore, pubkeyHex, recordIn) {
  *   tryHandle returns true if the request matched and was handled; false if
  *   the path is not a registry route (caller continues dispatch).
  */
-function makeRegistryRouter({ nonceStore, channelStore, jsonResponse, errResponse, readBody }) {
+function makeRegistryRouter({ nonceStore, channelStore, jsonResponse, errResponse, readBody, callerOf }) {
   if (!nonceStore)    throw new Error('makeRegistryRouter: nonceStore required');
   if (!channelStore)  throw new Error('makeRegistryRouter: channelStore required');
   if (!jsonResponse)  throw new Error('makeRegistryRouter: jsonResponse required');
@@ -525,6 +525,24 @@ function makeRegistryRouter({ nonceStore, channelStore, jsonResponse, errRespons
     }
 
     const { node_pubkey, nonce, signature, record } = body || {};
+    // 0.144.0 (F — the wallet's channel record inside the Lightning connection, lijox.channel_record): a body that
+    // came inside a connection carries that connection's key (lijox-web-form.js; nothing on the web can set it). LND
+    // proved that key at the handshake, so the nonce and the signature are not asked for — the record is checked and
+    // stored exactly as below, under the connection's key and no other.
+    const conn = (typeof callerOf === 'function') ? callerOf(body) : null;
+    if (conn) {
+      if (!record) return fail(res, 400, 'missing_field', { required: ['record'] });
+      if (String(node_pubkey || '').toLowerCase() !== conn) return fail(res, 403, 'not_the_connections_key');
+      const rv = validateChannelRecord(record);
+      if (!rv.ok) return fail(res, 400, rv.code, { field: rv.field, reason: rv.reason });
+      const cf = await storeAndConfirm(channelStore, conn, record);
+      if (!cf.ok) {
+        console.warn(`[Registry] POST FAIL code=${cf.code} pubkey=${conn.slice(0,16)}… channel_id=${(record.channel_id || '').slice(0,16)}… (inside the connection)`);
+        return fail(res, cf.status, cf.code, cf.detail);
+      }
+      console.log(`[Registry] POST OK channel_id=${cf.record.channel_id.slice(0,16)}… pubkey=${conn.slice(0,16)}… replaced=${cf.replaced} (inside the connection)`);
+      return jsonResponse(res, { ok: true, record: cf.record, replaced: cf.replaced, previous: cf.previous, stored_at: cf.stored_at });
+    }
     if (!node_pubkey || !nonce || !signature || !record) {
       return fail(res, 400, 'missing_field', {
         required: ['node_pubkey', 'nonce', 'signature', 'record'],

@@ -542,11 +542,30 @@ function clientPrefsZaps(body, res) {
   const zpk = String(body.client_pubkey || '').toLowerCase();
   if (!/^[0-9a-f]{66}$/.test(zpk)) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
   { const zpr = lnurlpAuthCheck(body, 'client-prefs', zpk, 'prefs-zaps:' + (body.zaps ? '1' : '0')); if (!zpr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + zpr.code }, zpr.status); }
-  if (body.zaps && !zaps.on) return jsonResponse(res, { ok: false, error: 'not_offered', zaps: !!(clientPrefs[zpk] && clientPrefs[zpk].zaps === true), zaps_offered: false }, 409);
-  clientPrefs[zpk] = Object.assign(clientPrefs[zpk] || {}, { zaps: body.zaps, zaps_updated: Date.now() });
+  try { formCounts.web(zpk, 'lijox.prefs_set'); } catch (_) {}   // 0.137.0: this request has a form inside the connection
+  const zr = prefsSet(zpk, { zaps: body.zaps });
+  return jsonResponse(res, zr.body, zr.status);
+}
+/// 0.137.0: THE WALLET'S SETTINGS, ONE FUNCTION FOR BOTH FORMS — POST /client/prefs (after its proof check) and
+/// `lijox.prefs_set` inside the Lightning connection (the caller is the connection's key). `pk` is a wallet key that
+/// has been proven by one of the two; params is { zaps: true|false } or { hold_ms: 0…86,400,000 }. → { status, body }:
+/// what the web route has always answered.
+function prefsSet(pk, params) {
+  if (params && typeof params.zaps === 'boolean' && params.hold_ms === undefined) {
+    if (params.zaps && !zaps.on) return { status: 409, body: { ok: false, error: 'not_offered', zaps: !!(clientPrefs[pk] && clientPrefs[pk].zaps === true), zaps_offered: false } };
+    clientPrefs[pk] = Object.assign(clientPrefs[pk] || {}, { zaps: params.zaps, zaps_updated: Date.now() });
+    clientPrefsPersist();
+    console.log(`[prefs] ${pk.slice(0, 16)}… zaps=${params.zaps ? 'on' : 'off'}`);
+    return { status: 200, body: { ok: true, zaps: params.zaps, zaps_offered: zaps.on } };
+  }
+  if (!params || typeof params.hold_ms !== 'number' || !(params.hold_ms >= 0) || params.hold_ms > 86400000) return { status: 400, body: { ok: false, error: 'bad request' } };
+  clientPrefs[pk] = Object.assign(clientPrefs[pk] || {}, { hold_ms: Math.round(params.hold_ms), updated: Date.now() });
   clientPrefsPersist();
-  console.log(`[prefs] ${zpk.slice(0, 16)}… zaps=${body.zaps ? 'on' : 'off'}`);
-  return jsonResponse(res, { ok: true, zaps: body.zaps, zaps_offered: zaps.on });
+  const eff = clientHoldCapMs(pk);
+  touchWalletActive(pk);  /* v0.54.4 (d): prefs = awake proof */
+  console.log(`[prefs] ${pk.slice(0, 16)}… hold_ms=${params.hold_ms} effective=${eff} (lsp cap ${OFFLINE_HOLD_CAP_MS})`);
+  return { status: 200, body: { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED,   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
+    zaps: !!(clientPrefs[pk] && clientPrefs[pk].zaps === true), zaps_offered: zaps.on } };   // 0.132.0: the wallet's zap choice as this provider holds it, and whether zaps are offered — the wallet's switch shows this, not a note of its own
 }
 const zaps = require('./zap').createZaps({
   enabled: String(process.env.ZAPS_ENABLED || 'false').trim().toLowerCase() === 'true',
@@ -832,6 +851,331 @@ const peerStorage = createPeerStorage({ dataDir: DATA_DIR, log: (m) => console.l
 const { createStateMarks, signedText: stateSignedText, cleanChannels: stateCleanChannels } = require('./state-marks');
 const STATE_PASS_REQUIRED = /^(1|true|yes|on)$/i.test(String(process.env.STATE_PASS_REQUIRED || '').trim());
 const stateMarks = createStateMarks({ dataDir: DATA_DIR, log: (m) => console.log(m), required: STATE_PASS_REQUIRED });
+// 0.137.0 (S72 Tue 2026-11-24, the operator's word of 08:33 on "Section F" — the wallet repo's docs/design/routes/f2-r1.md):
+// REQUESTS INSIDE THE LIGHTNING CONNECTION. A wallet's requests to this provider were web requests, readable by whoever
+// ends this address's TLS. lijox-rpc.js carries them inside the Lightning connection instead (LSPS0, message 37913):
+// the bridge hands it each such message with the peer's key, and a method's function is called with that key as the
+// caller — no signed proof, no route token. The first request served both ways is the wallet's settings
+// (`lijox.prefs_set` = POST /client/prefs; one function, prefsSet). form-counts.js counts, per wallet key and day, who
+// still opens a tunnel without a pass and who still sends a moved request as a web request — the number the review of
+// STATE_PASS_REQUIRED and the later refusal of the web form both need (`node lij-adapter.js --form-counts`).
+const { createLijoxRpc } = require('./lijox-rpc');
+const { createFormCounts } = require('./form-counts');
+const webFormLib = require('./lijox-web-form');   // 0.138.0: a request that came inside the connection is carried out by its web route's own code
+const formCounts = createFormCounts({ dataDir: DATA_DIR, log: (m) => console.log(m) });
+const lijoxRpc = createLijoxRpc({
+  dataDir: DATA_DIR, version: require('./package.json').version, perMin: process.env.LIJOX_RPC_PER_MIN,
+  log: (m) => console.log(m),
+  send: (peerHex, type, buf) => (chainBridge && typeof chainBridge.sendCustom === 'function') ? chainBridge.sendCustom(peerHex, type, buf) : Promise.reject(new Error('the chain bridge is not running')),
+  onServed: (peerHex, method) => { if (checkPeerOf(peerHex)) return; if (method.startsWith('lijox.') && method !== 'lijox.hello' && method !== 'lijox.what_became') formCounts.rpc(peerHex, method); },   // 0.145.0: a check tunnel's key is made for one start — it is not a wallet, and is not counted as one
+  serves: (peerHex, method) => !checkPeerOf(peerHex) || CHECK_METHODS.has(method),   // 0.145.0: on a check tunnel only the check methods and lijox.hello
+});
+// 0.145.0 (S72, F2b — the wallet repo's docs/design/routes/f2b-r1.md §2): CHECK TUNNELS. A wallet makes its checks
+// before connecting on a short connection of its own, under a key made for that one start (ws-tunnel.js takes the text
+// frame "lijox-check"). What this box knows of such a peer: the internet address its tunnel came from, and until when.
+//   · it is served the check methods and lijox.hello, nothing else (`serves` above);
+//   · its requests are limited by the tunnel's internet address, as their web forms are — not by its key, which is
+//     new every time (handleHttp: `ip`);
+//   · a peer on a check tunnel that HOLDS A CHANNEL with this node is a wallet's real key in the wrong place: the
+//     tunnel is closed at once and the journal says so (checkTunnelHandshake);
+//   · no chain data is sent to it, and it is not counted as a wallet's tunnel opening.
+// The five check methods are rows of the table below. Each hands its web route the body the wallet made — the
+// wallet's REAL key and its signature are inside it, and the route checks them as on the web. The connection's key
+// is never taken as the wallet for these.
+const CHECK_METHODS = new Set(['lijox.hello', 'lijox.state', 'lijox.registry_challenge', 'lijox.state_file', 'lijox.my_channels', 'lijox.recover_close']);
+const CHECK_PEER_MS = 30000;        // a check tunnel lives 20 s at most (ws-tunnel.js); its peer is forgotten a little after
+const checkPeers = new Map();       // the one-time key (hex) → { ip, until }
+const checkPeerOf = (pk) => { const e = checkPeers.get(pk); if (!e) return null; if (Date.now() > e.until) { checkPeers.delete(pk); return null; } return e; };
+const checkTunnelLimit = windowLimiter(parseInt(process.env.CHECK_TUNNELS_PER_MIN || '12', 10) || 12, 60000);   // per internet address
+const checkCounts = { opened: 0, refused: 0, closed_for_a_channel: 0, not_found: 0 };
+lijoxRpc.register('lijox.prefs_set', (caller, params) => {
+  if (Object.keys(params).some((k) => k !== 'hold_ms' && k !== 'zaps')) return { status: 400, body: { ok: false, error: 'bad request' } };
+  return prefsSet(caller.pubkey, params);
+});
+// 0.138.0 (S72, F3a-1 — DP 2026-11-24 "Go on building step 1, and finish F"; the wallet repo's f3a-r1.md): THE SEND
+// PATH'S THREE ASKS INSIDE THE LIGHTNING CONNECTION. Each is carried out by its web route's own code (lijox-web-form.js):
+// the adapter hands handleHttp a request it makes itself, marked with the connection's key, and sends back what the
+// route answered. No money moves by these three; the payment is the Lightning payment that follows.
+//   lijox.route_build    = POST /v1/route/build     the body as the web form sends it
+//   lijox.route_report   = POST /v1/route/report    client_pubkey is the connection's key, whatever was sent; the
+//                                                   signed proof is not needed (lnurlpAuthCheck: the key named is
+//                                                   the connection's key) and is taken off if it was sent
+//   lijox.outcome        = GET  /v1/outcome?hash=   the payment hash
+const webForm = webFormLib.createWebForm({ handle: (req, res) => handleHttp(req, res), secret: () => CONFIG.adapter.secret, log: (m) => console.log(m) });
+const plainParams = (p) => (p && typeof p === 'object' && !Array.isArray(p)) ? p : null;
+lijoxRpc.register('lijox.route_build', (caller, params) => {
+  const p = plainParams(params); if (!p) return { status: 400, body: { error: 'bad request' } };
+  return webForm.call(caller.pubkey, 'POST', '/v1/route/build', p);
+});
+lijoxRpc.register('lijox.route_report', (caller, params) => {
+  const p = plainParams(params); if (!p) return { status: 400, body: { error: 'bad request' } };
+  const body = Object.assign({}, p, { client_pubkey: caller.pubkey });
+  delete body.node_pubkey; delete body.nonce; delete body.signature;
+  return webForm.call(caller.pubkey, 'POST', '/v1/route/report', body);
+});
+lijoxRpc.register('lijox.outcome', (caller, params) => {
+  const hash = String((params && params.hash) || '').toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hash)) return { status: 400, body: { ok: false, error: 'bad hash' } };
+  return webForm.call(caller.pubkey, 'GET', '/v1/outcome', null, { hash });
+});
+// 0.139.0 (S72, F3a-2 — the wallet repo's f3a-r1.md §3): THE PAGE'S ASKS INSIDE THE LIGHTNING CONNECTION. Seven requests
+// that read or quote and move no money, each carried out by its web route's own code (lijox-web-form.js). Where the web
+// form names the wallet's key, the request inside the connection is given the connection's key, whatever was sent.
+//   lijox.lnurl_fetch      = POST /v1/lnurl/fetch            { url } — the answer can be longer than one message and
+//                                                            goes back in parts (lijox-rpc.js)
+//   lijox.onchain_quote    = POST /v1/onchain-pay/quote      the body as the web form sends it, without the proof
+//   lijox.onchain_status   = GET  /v1/onchain-pay/status     this wallet's own payments
+//   lijox.push_quote       = GET  /push/quote?amount_sats=
+//   lijox.push_status      = GET  /push/status/<hash>
+//   lijox.push_receivable  = GET  /push/receivable?amount_sats=   for this wallet
+//   lijox.push_note        = GET  /push/note/<hash>?token=
+const wholeSats = (v) => (Number.isInteger(v) && v > 0 && v <= 2100000000000000) ? v : null;
+const hash64 = (v) => { const h = String(v || '').toLowerCase(); return /^[0-9a-f]{64}$/.test(h) ? h : null; };
+const BAD = (why) => ({ status: 400, body: { ok: false, error: why } });
+lijoxRpc.register('lijox.lnurl_fetch', (caller, params) => {
+  const p = plainParams(params); if (!p || typeof p.url !== 'string' || !p.url || p.url.length > 2048) return BAD('url required');
+  return webForm.call(caller.pubkey, 'POST', '/v1/lnurl/fetch', { url: p.url, client_pubkey: caller.pubkey });
+});
+lijoxRpc.register('lijox.onchain_quote', (caller, params) => {
+  const p = plainParams(params); if (!p) return BAD('bad request');
+  const body = Object.assign({}, p, { client_pubkey: caller.pubkey });
+  delete body.node_pubkey; delete body.nonce; delete body.signature;
+  return webForm.call(caller.pubkey, 'POST', '/v1/onchain-pay/quote', body);
+});
+lijoxRpc.register('lijox.onchain_status', (caller) => webForm.call(caller.pubkey, 'GET', '/v1/onchain-pay/status', null, { client_pubkey: caller.pubkey }));
+lijoxRpc.register('lijox.push_quote', (caller, params) => {
+  const n = wholeSats(params && params.amount_sats); if (!n) return BAD('amount_sats required');
+  return webForm.call(caller.pubkey, 'GET', '/push/quote', null, { amount_sats: n });
+});
+lijoxRpc.register('lijox.push_status', (caller, params) => {
+  const h = hash64(params && params.hash); if (!h) return BAD('bad hash');
+  return webForm.call(caller.pubkey, 'GET', '/push/status/' + h, null);
+});
+lijoxRpc.register('lijox.push_receivable', (caller, params) => {
+  const n = wholeSats(params && params.amount_sats); if (!n) return BAD('amount_sats required');
+  return webForm.call(caller.pubkey, 'GET', '/push/receivable', null, { client_pubkey: caller.pubkey, amount_sats: n });
+});
+lijoxRpc.register('lijox.push_note', (caller, params) => {
+  const h = hash64(params && params.hash); const token = String((params && params.token) || '').toLowerCase();
+  if (!h) return BAD('bad hash');
+  if (!/^[0-9a-f]{32}$/.test(token)) return BAD('token required');
+  return webForm.call(caller.pubkey, 'GET', '/push/note/' + h, null, { token });
+});
+// a moved request whose WEB form names no wallet: counted when it comes as a web request (form-counts.js)
+const MOVED_WEB_UNNAMED = { 'POST /v1/route/build': 'lijox.route_build', 'GET /v1/outcome': 'lijox.outcome', 'GET /push/quote': 'lijox.push_quote', 'POST /lsps2/register_secret': 'lijox.register_secret', 'GET /lease/policy': 'lijox.lease_policy' };   // 0.141.0 (F3b): the last two
+// 0.139.0: a moved request whose web form names its wallet in the query string — counted with that key.
+// NOT counted as web requests: GET /push/status/<hash> and GET /push/note/<hash>. They are public reads that a wallet
+// of ANOTHER provider makes here by design (the holder of a Push Key is asked by whoever holds the link); such a wallet
+// has no Lightning connection to this box, so its web request says nothing about an older wallet.
+const MOVED_WEB_QUERY_KEY = { 'GET /v1/onchain-pay/status': 'lijox.onchain_status', 'GET /push/receivable': 'lijox.push_receivable', 'GET /v1/jit-funding/status': 'lijox.funding_status' };   // 0.141.0 (F3b): the funding check
+// 0.141.0 (F3b): moved requests whose web form names its wallet as `client`. GET /lsps2/get_info is counted ONLY when
+// it names one: without a key it is the public read any wallet makes of a provider it is not connected to (a
+// provider's card), and that form stays.
+const MOVED_WEB_QUERY_CLIENT = { 'GET /lsps2/get_info': 'lijox.jit_info', 'GET /lsps2/pending': 'lijox.pending' };
+// 0.140.0 (S72, F3a-3 — the operator's word of 2026-11-25 00:19 on the wallet repo's f3a3-r1.md): THE REQUESTS THAT MOVE
+// MONEY, INSIDE THE LIGHTNING CONNECTION. Five of them, each registered as "moves money": lijox-rpc.js then asks for
+// `rid` (32 hex, made by the wallet once per tap), runs the route ONCE for a `rid`, keeps the answer 24 hours and
+// gives that answer again to the same `rid`; `lijox.what_became {rid}` says not known / started / done with the
+// answer. Each is carried out by its web route's own code, as F3a-1 and F3a-2. The body handed to the route is built
+// here field by field — the fields the web form sends and no others — with the connection's key as the wallet.
+//   lijox.onchain_open     = POST /v1/onchain-pay/open      { payment_hash }
+//   lijox.onchain_release  = POST /v1/onchain-pay/release   { payment_hash, tx_hex }
+//   lijox.push_lock        = POST /push/lock                { hash, amount_sats, expiry, note_ct?, note_token? }
+//   lijox.push_void        = POST /push/void                { hash, ts, signature } — the sender's own signature stays
+//   lijox.push_claim       = POST /push/claim               { hash, secret, amount_sats, expiry, holder_prefix } — 65 s
+//   lijox.push_claim_status = GET /push/claim-status/<hash>  a read, no rid
+// NOT HERE, ON PURPOSE: POST /push/deliver. It is asked of the provider that HOLDS a key by a wallet of another
+// provider, which has no Lightning connection to this box. It stays a web request.
+// A route that gave no answer within its limit (the web form's 504) is NOT kept as an answer: what the route did is
+// not known, so the `rid` stays "started" and the wallet is told the request could not be carried out.
+const CLAIM_WAIT_MS = 65000;
+const moneyCall = async (pk, httpMethod, path, body, waitMs) => {
+  const r = await webForm.call(pk, httpMethod, path, body, null, waitMs ? { waitMs } : undefined);
+  if (r && r.status === 504) throw new Error('the route gave no answer in time');
+  return r;
+};
+lijoxRpc.register('lijox.onchain_open', (caller, params) => {
+  const p = plainParams(params); const h = p && hash64(p.payment_hash); if (!h) return BAD('payment_hash required (32 bytes hex)');
+  return moneyCall(caller.pubkey, 'POST', '/v1/onchain-pay/open', { client_pubkey: caller.pubkey, payment_hash: h });
+}, { money: true });
+lijoxRpc.register('lijox.onchain_release', (caller, params) => {
+  const p = plainParams(params); const h = p && hash64(p.payment_hash); if (!h) return BAD('payment_hash required (32 bytes hex)');
+  const tx = String(p.tx_hex || '').toLowerCase(); if (!/^[0-9a-f]{100,20000}$/.test(tx)) return BAD('tx_hex required');
+  return moneyCall(caller.pubkey, 'POST', '/v1/onchain-pay/release', { client_pubkey: caller.pubkey, payment_hash: h, tx_hex: tx });
+}, { money: true });
+lijoxRpc.register('lijox.push_lock', (caller, params) => {
+  const p = plainParams(params); const h = p && hash64(p.hash); if (!h) return BAD('hash required');
+  const body = { client_pubkey: caller.pubkey, hash: h, amount_sats: p.amount_sats, expiry: p.expiry };
+  if (p.note_ct !== undefined && p.note_ct !== null && p.note_ct !== '') { body.note_ct = p.note_ct; body.note_token = p.note_token; }
+  return moneyCall(caller.pubkey, 'POST', '/push/lock', body);
+}, { money: true });
+lijoxRpc.register('lijox.push_void', (caller, params) => {
+  const p = plainParams(params); const h = p && hash64(p.hash); if (!h) return BAD('hash required');
+  return moneyCall(caller.pubkey, 'POST', '/push/void', { client_pubkey: caller.pubkey, hash: h, ts: p.ts, signature: p.signature });
+}, { money: true });
+lijoxRpc.register('lijox.push_claim', (caller, params) => {
+  const p = plainParams(params); const h = p && hash64(p.hash); if (!h) return BAD('hash required');
+  return moneyCall(caller.pubkey, 'POST', '/push/claim', { client_pubkey: caller.pubkey, hash: h, secret: p.secret, amount_sats: p.amount_sats, expiry: p.expiry, holder_prefix: p.holder_prefix }, CLAIM_WAIT_MS);
+}, { money: true });
+lijoxRpc.register('lijox.push_claim_status', (caller, params) => {
+  const h = hash64(params && params.hash); if (!h) return BAD('bad hash');
+  return webForm.call(caller.pubkey, 'GET', '/push/claim-status/' + h, null, { client_pubkey: caller.pubkey });
+});
+// (the end of the 0.140.0 registrations)
+// 0.141.0 (S72, F3b — the wallet repo's docs/design/routes/f3b-r1.md): RECEIVING AND CHANNELS INSIDE THE LIGHTNING
+// CONNECTION. Nine requests. None moves money — a buy makes a promise that ends by itself, a secret is stored under a
+// key, an open intent is a status record — so none carries a request id: asked again is safe. Each is carried out by
+// its web route's own code. Where the web form names the wallet's key, the request inside the connection is given the
+// connection's key.
+//   lijox.jit_info          = GET  /lsps2/get_info?client=<the connection's key>
+//   lijox.jit_buy           = POST /lsps2/buy                 { version, payment_size_msat? }
+//   lijox.register_secret   = POST /lsps2/register_secret     both forms. The channel form (jit_channel_scid) is taken only
+//                                                            for a promise THIS wallet bought — the web form cannot know
+//                                                            who sends it; the connection can.
+//   lijox.pending           = POST /lsps2/pending             the connection is the proof that the wallet is awake
+//   lijox.openintent        = POST /openintent                the intent as the wallet signed it; its key must be the
+//                                                            connection's (the web form only checks that the key it
+//                                                            names is connected)
+//   lijox.openintent_status = GET  /openintent/<id>
+//   lijox.funding_status    = GET  /v1/jit-funding/status?client_pubkey=<the connection's key>&funding=<txid:vout>
+//   lijox.lease_policy      = GET  /lease/policy
+//   lijox.wake_schedule     = POST /v1/wake/schedule          { times } — the connection is the proof
+const nowS = () => Math.floor(Date.now() / 1000);
+lijoxRpc.register('lijox.jit_info', (caller) => webForm.call(caller.pubkey, 'GET', '/lsps2/get_info', null, { client: caller.pubkey }));
+lijoxRpc.register('lijox.jit_buy', (caller, params) => {
+  const p = plainParams(params); if (!p) return BAD('bad request');
+  const body = { version: p.version, client_pubkey: caller.pubkey };
+  if (p.payment_size_msat !== undefined && p.payment_size_msat !== null) body.payment_size_msat = p.payment_size_msat;
+  return webForm.call(caller.pubkey, 'POST', '/lsps2/buy', body);
+});
+lijoxRpc.register('lijox.register_secret', (caller, params) => {
+  const p = plainParams(params); if (!p) return BAD('bad request');
+  const scid = String(p.jit_channel_scid || '').toLowerCase().trim();
+  if (scid) {
+    const pr = pendingJitBuys.get(scid);
+    if (pr && String(pr.client_pubkey || '').toLowerCase() !== caller.pubkey) return { status: 403, body: { ok: false, error: 'this promise was bought by another wallet' } };
+  }
+  const body = Object.assign({}, p); delete body.node_pubkey; delete body.nonce; delete body.signature;
+  return webForm.call(caller.pubkey, 'POST', '/lsps2/register_secret', body);
+});
+lijoxRpc.register('lijox.pending', (caller) => webForm.call(caller.pubkey, 'POST', '/lsps2/pending', { client_pubkey: caller.pubkey, node_pubkey: caller.pubkey, ts: nowS() }));
+lijoxRpc.register('lijox.openintent', (caller, params) => {
+  const p = plainParams(params); if (!p) return BAD('bad request');
+  if (String(p.client_pubkey || '').toLowerCase() !== caller.pubkey) return { status: 403, body: { ok: false, code: 'NOT_THE_CONNECTIONS_KEY' } };
+  return webForm.call(caller.pubkey, 'POST', '/openintent', p);
+});
+lijoxRpc.register('lijox.openintent_status', (caller, params) => {
+  const id = String((params && params.intent_id) || ''); if (!/^[0-9A-Za-z-]{8,64}$/.test(id)) return BAD('intent_id required');
+  return webForm.call(caller.pubkey, 'GET', '/openintent/' + id, null);
+});
+lijoxRpc.register('lijox.funding_status', (caller, params) => {
+  const fu = String((params && params.funding) || '').toLowerCase(); if (!/^[0-9a-f]{64}:[0-9]{1,5}$/.test(fu)) return BAD('funding must be txid:vout');
+  return webForm.call(caller.pubkey, 'GET', '/v1/jit-funding/status', null, { client_pubkey: caller.pubkey, funding: fu });
+});
+lijoxRpc.register('lijox.lease_policy', (caller) => webForm.call(caller.pubkey, 'GET', '/lease/policy', null));
+lijoxRpc.register('lijox.wake_schedule', (caller, params) => {
+  const p = plainParams(params); if (!p || !Array.isArray(p.times)) return BAD('times required');
+  return webForm.call(caller.pubkey, 'POST', '/v1/wake/schedule', { v: 1, times: p.times, ts: nowS(), node_pubkey: caller.pubkey });
+});
+// (the end of the 0.141.0 registrations)
+// 0.142.0 (S72, F3c and the rest of F3 — the wallet repo's docs/design/routes/f3c-r1.md; the operator's word of
+// 2026-11-25 09:59 "everything move from the web form as possible in F"): THE REST OF THE WALLET'S REQUESTS INSIDE THE
+// LIGHTNING CONNECTION, FROM ONE TABLE. Each is carried out by its web route's own code, with the body or the query the
+// wallet's web request has. What a row adds:
+//   key    body fields written with the connection's key (the route's challenge proof is then not needed: nonce and
+//          signature are dropped, and the proof check passes on the connection's mark)
+//   same   a body field that must BE the connection's key — for a route that checks a signature the wallet makes by
+//          itself (it rides as before); another key is refused before the route is asked
+//   qkey   query fields written with the connection's key · q  query fields taken from the request
+//   tail   what follows the path (params.id), and its pattern
+//   ts     `ts` is set to this box's time
+//   money  the request moves money: it carries `rid` (run once, the answer kept 24 h, lijox.what_became)
+//   open   the web form is never refused: wallets that are not this provider's ask it by design (the tower, the kit
+//          holder, a chit's record), or a wallet sends it when it has no connection at all (a diagnostic tape)
+const REST142 = [
+  ['lijox.lnurl_register',      'POST', '/lnurl/register',       { key: ['client_pubkey'] }],
+  ['lijox.lnurl_release',       'POST', '/lnurl/release',        { key: ['client_pubkey'] }],
+  ['lijox.lnurl_display',       'POST', '/lnurl/display',        { key: ['client_pubkey'] }],
+  ['lijox.lnurl_note',          'GET',  '/lnurl/note/',          { tail: /^[0-9a-f]{64}$/, qkey: ['client_pubkey'] }],
+  ['lijox.lnurl_register_open', 'GET',  '/lnurl/register/open',  { q: ['name'], qkey: ['client_pubkey'] }],
+  ['lijox.heartbeat',           'POST', '/v1/heartbeat',         { key: ['client_pubkey', 'node_pubkey'], ts: true }],
+  ['lijox.push_subscribe',      'POST', '/lsps2/push-subscribe', { key: ['node_pubkey'] }],
+  ['lijox.subs_seller',         'POST', '/v1/subs/seller',       { key: ['node_pubkey'] }],
+  ['lijox.tapedrop',            'POST', '/tapedrop',             { key: ['client_pubkey', 'node_pubkey'], open: true }],
+  ['lijox.nwc_register',        'POST', '/v1/nwc/register',      { same: 'client_pubkey' }],
+  ['lijox.nwc_unregister',      'POST', '/v1/nwc/unregister',    { same: 'client_pubkey' }],
+  ['lijox.tower_voucher',       'POST', '/v1/tower/voucher',     { open: true }],
+  ['lijox.tower_put',           'POST', '/v1/tower/put',         { open: true }],
+  ['lijox.tower_status',        'POST', '/v1/tower/status',      { open: true }],
+  ['lijox.tower_drop',          'POST', '/v1/tower/drop',        { open: true }],
+  ['lijox.kit_put',             'POST', '/v1/kit',               { open: true }],
+  ['lijox.delegate_register',   'POST', '/delegate/register',    { money: true }],
+  ['lijox.delegate_void',       'POST', '/delegate/void',        { money: true }],
+  ['lijox.delegate_refund',     'POST', '/delegate/refund',      { money: true }],
+  ['lijox.delegate_claims',     'GET',  '/delegate/claims',      { q: ['issuer', 'ts', 'sig'] }],
+  ['lijox.delegate_refunds',    'GET',  '/delegate/refunds',     { q: ['issuer', 'ts', 'sig'] }],
+  ['lijox.delegate_slip',       'GET',  '/delegate/slip/',       { tail: /^[0-9a-f]{64}$/, open: true }],
+  // 0.144.0 (S72, F — the wallet repo's docs/design/routes/f4-r1.md): two more rows of the same table.
+  //   lijox.channel_record  the record a wallet's engine sends when a channel is ready: stored under the connection's
+  //                         key; the challenge and the signature are not asked for (registry.js takes the connection's
+  //                         mark). Its web form is refused with the others when the operator sets LIJOX_WEB_FORMS=refuse.
+  //   lijox.mix_seat        a Mix seat taken in the wallet's own name (signed by its node key): the request names the
+  //                         wallet's key beside its fresh seat key, so it belongs inside. `same`: only a body that names
+  //                         the connection's own key is taken — a ring-signed seat names no wallet, must never be tied
+  //                         to one, and is refused here; it stays a web request. `open`: the web form is never refused
+  //                         (ring-signed seats and the wallets of other providers use it).
+  ['lijox.channel_record',      'POST', '/lsps/registry/channels', { key: ['node_pubkey'] }],
+  ['lijox.mix_seat',            'POST', '/tatara/seat',          { same: 'node_pubkey', open: true }],
+  // 0.145.0 (S72, F2b — the wallet repo's docs/design/routes/f2b-r1.md): THE CHECKS A WALLET MAKES BEFORE IT CONNECTS.
+  // No key rule on any of them: the body is handed on as the wallet made it — its REAL key and that key's signature
+  // inside — and the route checks them as on the web. They are asked on a check tunnel, where the connection's key is
+  // a key made for one start and says nothing. `open`: their web forms are never refused (a wallet of another
+  // provider asks the statement and the state file's holder by design, and an older page has no other way).
+  ['lijox.state',               'POST', '/v1/state',             { open: true }],
+  ['lijox.registry_challenge',  'GET',  '/lsps/registry/challenge', { open: true }],
+  ['lijox.state_file',          'POST', '/v1/peer-storage/',     { tail: /^(put|meta|get)$/, open: true }],
+  ['lijox.my_channels',         'POST', '/lsps/registry/my-channels', { open: true }],
+  ['lijox.recover_close',       'POST', '/lsps/registry/recover-close', { open: true }],
+];
+for (const [name142, http142, path142, o142] of REST142) {
+  lijoxRpc.register(name142, (caller, params) => {
+    const p = plainParams(params) || {};
+    let pth = path142, query = null, body = null;
+    if (o142.tail) { const id = String(p.id === undefined || p.id === null ? '' : p.id).toLowerCase(); if (!o142.tail.test(id)) return BAD('id required'); pth = path142 + id; }
+    if (http142 === 'GET') {
+      query = {};
+      for (const k of (o142.q || [])) { if (p[k] !== undefined && p[k] !== null) query[k] = String(p[k]); }
+      for (const k of (o142.qkey || [])) query[k] = caller.pubkey;
+    } else {
+      body = Object.assign({}, p); delete body.rid;
+      if (o142.tail) delete body.id;   // 0.145.0: a POST row with a tail — the tail is the path's, not the body's
+      if (o142.same && String(body[o142.same] || '').toLowerCase() !== caller.pubkey) return { status: 403, body: { ok: false, error: 'the connection\'s key is not the request\'s key' } };
+      if (o142.key) { delete body.nonce; delete body.signature; for (const k of o142.key) body[k] = caller.pubkey; }
+      if (o142.ts) body.ts = nowS();
+    }
+    return o142.money ? moneyCall(caller.pubkey, http142, pth, body) : webForm.call(caller.pubkey, http142, pth, body, query);
+  }, o142.money ? { money: true } : undefined);
+}
+// (the end of the 0.142.0 registrations)
+// 0.142.0 (F5 — the plan's last step, built as a setting that is OFF until the operator turns it on): THE WEB FORM OF A
+// MOVED REQUEST CAN BE REFUSED. `movedWebForm` names the method a web request has inside the connection, or null. It
+// leaves out every route a wallet of ANOTHER provider asks here by design (a Push Key's status, note and cancel, a
+// chit's record, the kit holder, the tower) and GET /lsps2/get_info without a wallet's key. With LIJOX_WEB_FORMS=refuse
+// such a request is answered 426 and is not carried out. Until then it is served, and counted (form-counts.js) so the
+// operator can see when no wallet sends the old forms any more.
+const MOVED_WEB_BODY = { 'POST /client/prefs': 'lijox.prefs_set', 'POST /v1/route/report': 'lijox.route_report', 'POST /v1/lnurl/fetch': 'lijox.lnurl_fetch', 'POST /v1/onchain-pay/quote': 'lijox.onchain_quote', 'POST /v1/onchain-pay/open': 'lijox.onchain_open', 'POST /v1/onchain-pay/release': 'lijox.onchain_release', 'POST /push/lock': 'lijox.push_lock', 'POST /push/claim': 'lijox.push_claim', 'POST /lsps2/pending': 'lijox.pending', 'POST /lsps2/buy': 'lijox.jit_buy', 'POST /openintent': 'lijox.openintent', 'POST /v1/wake/schedule': 'lijox.wake_schedule' };
+const movedWebForm = (method, path, sp) => {
+  const k = method + ' ' + path;
+  if (MOVED_WEB_UNNAMED[k]) return MOVED_WEB_UNNAMED[k];
+  if (MOVED_WEB_QUERY_KEY[k]) return MOVED_WEB_QUERY_KEY[k];
+  if (MOVED_WEB_BODY[k]) return MOVED_WEB_BODY[k];
+  if (MOVED_WEB_QUERY_CLIENT[k]) return /^[0-9a-f]{66}$/i.test(String((sp && sp.get('client')) || '')) ? MOVED_WEB_QUERY_CLIENT[k] : null;
+  if (method === 'GET' && path.startsWith('/openintent/')) return 'lijox.openintent_status';
+  if (method === 'GET' && path.startsWith('/push/claim-status/')) return 'lijox.push_claim_status';
+  for (const [n, h, p, o] of REST142) { if (!o.open && h === method && (o.tail ? path.startsWith(p) && path.length > p.length : path === p)) return n; }
+  return null;
+};
+const REFUSE_WEB_FORMS = String(process.env.LIJOX_WEB_FORMS || '').trim().toLowerCase() === 'refuse';
 // 0.128.0 (S69, LIJOX watch duty W1 — the wallet repo's docs/lijox-watch-standard-r1.md): THE TOWER. This box keeps
 // wallets' encrypted penalty transactions (tower.js) and reads every block for the old states they answer
 // (tower-watch.js; the blocks come from LND's own ChainKit). OFF unless TOWER_ENABLED=true. When it is on and the key
@@ -1037,7 +1381,7 @@ const copyWatch = new CopyWatch();
 // node key; the relay keeps the encrypted requests for a sleeping phone and wakes it; nothing here reads a request.
 const nwc = createNwc({
   dataDir: DATA_DIR, log: (m) => console.log(m),
-  sendWakePush: (pk, kind) => sendWakePush(pk, undefined, kind),
+  sendWakePush: (pk, kind) => wakePush(pk, undefined, kind),   // 0.143.0: the answer with its reason — the [NWC] line says what happened
   authOk: (req) => authOk(req),
   publicHttpsUrl: () => CONFIG.public.https_url,   // a function: CONFIG is built further down
   verifyWalletSig: async (msg, sig) => {
@@ -1074,6 +1418,8 @@ const pushRail = createPushRail({
   localPubkey: () => LOCAL_PUBKEY, log: (m) => console.log(m),
   walletReceivable: (pk, msat) => walletReceivable(pk, msat),   // 0.83.0: receivability first
   proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),   // 0.116.0 (F4): the node key's proof on the claim routes
+  carry: (req, fields) => webFormLib.carry(req, fields),   // 0.140.0: the claim-status read's proof rides the query string — the connection's mark is put on those fields
+  webSeen: (x, pk, m) => { if (!webFormLib.callerOf(x)) formCounts.web(pk, m); },   // 0.140.0: lock, void, claim and the claim-status read that came as web requests are counted with their wallet
   lndDelete: (p) => lndRequest('DELETE', p, null),   // 0.116.0 (F6): DeleteCanceledInvoice
 });
 // 0.133.0 (S70): a payment a wallet sent that was settled or failed here while that wallet is offline — the wake, tied
@@ -1116,6 +1462,8 @@ const onchainPay = createOnchainPayRail({
   },
   sendWakePush: (pk, ms, kind) => sendWakePush(pk, ms, kind),
   proofCheck: (fields, action, clientPk, recordId) => lnurlpAuthCheck(fields, action, clientPk, recordId),
+  carry: (req, fields) => webFormLib.carry(req, fields),   // 0.139.0: the status read's proof rides the query string — the connection's mark is put on those fields
+  webSeen: (body, pk, m) => { if (!webFormLib.callerOf(body)) formCounts.web(pk, m); },   // 0.139.0: a quote that came as a web request is counted with its wallet
   plRecord: (k, f) => plRecord(k, f), leaseTouch: (pk, s) => leaseTouch(pk, s), localPubkey: () => LOCAL_PUBKEY,
   network: 'bc',   // mainnet addresses — the UM890's chain (CONFIG is defined further down; the adapter has no testnet mode)
 });
@@ -1187,6 +1535,55 @@ function tapesSweep(dir, incomingBytes, maxBytes, keepMs, nowMs) {
   }
   return { ok: total + incomingBytes <= maxBytes, total, unlinked };
 }
+// 0.143.0 (found 2026-11-20: "the tape store is at its 256 MiB cap"): WHAT THE STORE
+// HOLDS, AND THE ROOM A NEW TAPE CAN STILL GET. Once the store has filled it sits at its cap by design: each new tape
+// pushes out tapes past the keep window, just enough to fit. That is routine. What is not routine is the store
+// running out of tapes past the window — then the NEW tape is refused (507) and is kept nowhere on this box. The room
+// = the free bytes + the bytes held by tapes past the window; it is exactly what tapesSweep can give (tapes-cap.test).
+// Nothing here deletes: the rule for what is deleted stays the operator's of 0.115.0. Pure: dir, caps, now in.
+function tapesState(dir, maxBytes, keepMs, nowMs) {
+  const fs = require('fs'), path = require('path');
+  const out = { count: 0, total: 0, oldest_at: 0, newest_at: 0, past_keep_count: 0, past_keep_bytes: 0, room_bytes: maxBytes };
+  let files = [];
+  try { files = fs.readdirSync(dir); } catch (_) { return out; }
+  for (const f of files) {
+    let st; try { st = fs.statSync(path.join(dir, f)); } catch (_) { continue; }
+    if (!st.isFile()) continue;
+    const t = parseInt(f.split('-')[0], 10);
+    const at = Number.isFinite(t) ? t : st.mtimeMs;
+    out.count += 1; out.total += st.size;
+    if (!out.oldest_at || at < out.oldest_at) out.oldest_at = at;
+    if (at > out.newest_at) out.newest_at = at;
+    if (nowMs - at >= keepMs) { out.past_keep_count += 1; out.past_keep_bytes += st.size; }
+  }
+  out.room_bytes = Math.max(0, maxBytes - out.total) + out.past_keep_bytes;
+  return out;
+}
+const tapesRefused = { n: 0, last_ms: 0 };   // since this start
+let _tapesStateAt = 0, _tapesStateVal = null;
+function tapesStateNow(fresh) {   // the Console asks every few seconds; the folder is read at most once a minute for it
+  const n = Date.now();
+  if (fresh || !_tapesStateVal || n - _tapesStateAt > 60000) { _tapesStateVal = tapesState(TAPES_DIR, TAPES_MAX_BYTES, TAPES_KEEP_DAYS * 86400000, n); _tapesStateAt = n; }
+  return _tapesStateVal;
+}
+function tapesRoomWords(st) {
+  const mib = (b) => (b / 1048576).toFixed(b < 10485760 ? 1 : 0);
+  return `room a new tape can still get: ${mib(st.room_bytes)} MiB (${mib(Math.max(0, TAPES_MAX_BYTES - st.total))} free + ${mib(st.past_keep_bytes)} held by ${st.past_keep_count} tape(s) older than ${TAPES_KEEP_DAYS} days)`;
+}
+function tapesNote(sw, pk) {
+  if (sw.ok && !sw.unlinked) return;
+  const st = tapesStateNow(true), mib = (b) => Math.round(b / 1048576);
+  if (sw.unlinked) console.log(`[TapeDrop] the store is at its cap (${mib(TAPES_MAX_BYTES)} MiB) \u2014 ${sw.unlinked} tape(s) older than ${TAPES_KEEP_DAYS} days deleted to make room, as set; ${tapesRoomWords(st)}`);
+  if (!sw.ok) {
+    tapesRefused.n += 1; tapesRefused.last_ms = Date.now();
+    console.warn(`[TapeDrop] STORE FULL \u2014 the tape from ${pk.slice(0, 16)}\u2026 was REFUSED and is not kept: ${mib(sw.total)} MiB of ${mib(TAPES_MAX_BYTES)} held, every tape younger than ${TAPES_KEEP_DAYS} days (those are never deleted). Refused since this start: ${tapesRefused.n}. The two settings that decide: TAPES_MAX_BYTES, TAPES_KEEP_DAYS`);
+  }
+}
+function tapeStoreReport() {
+  const st = tapesStateNow(false);
+  return { count: st.count, bytes: st.total, cap_bytes: TAPES_MAX_BYTES, keep_days: TAPES_KEEP_DAYS, oldest_ms: st.oldest_at, past_keep_count: st.past_keep_count, past_keep_bytes: st.past_keep_bytes, room_bytes: st.room_bytes, refused: tapesRefused.n, refused_last_ms: tapesRefused.last_ms };
+}
+setTimeout(() => { try { const st = tapesStateNow(true); console.log(`[TapeDrop] the tape store: ${st.count} tape(s), ${Math.round(st.total / 1048576)} MiB of ${Math.round(TAPES_MAX_BYTES / 1048576)}` + (st.oldest_at ? `, the oldest ${Math.floor((Date.now() - st.oldest_at) / 86400000)} days old` : '') + ` \u2014 ${tapesRoomWords(st)}` + (st.room_bytes < 16 * 1048576 ? ' \u2014 LOW: when it reaches 0 a new tape is refused' : '')); } catch (e) {} }, 7000);
 // 0.119.0 (S64, Kimi round 2 F24 — engine v358 / page v1074): a tape is evidence filed under a wallet's key. Until now
 // the only check was that the claimed pubkey was a connected peer — any connected peer could file a tape under any other
 // connected wallet's key. A page from v1074 sends the tape as TEXT (tape_json) with the node key's proof over
@@ -1220,8 +1617,8 @@ async function handleTapeDrop(req, res, ip) {
   }
   const fname = require('path').join(TAPES_DIR, (proven ? '' : 'claimed-') + Date.now() + '-' + id8 + '.json');
   const sw = tapesSweep(TAPES_DIR, Buffer.byteLength(payload), TAPES_MAX_BYTES, TAPES_KEEP_DAYS * 86400000, Date.now());   // 0.115.0 (F17)
-  if (sw.unlinked) console.log(`[TapeDrop] store at the cap (${Math.round(sw.total / 1048576)} MiB of ${Math.round(TAPES_MAX_BYTES / 1048576)}) — ${sw.unlinked} tape(s) older than ${TAPES_KEEP_DAYS} days unlinked`);
-  if (!sw.ok) { console.warn(`[TapeDrop] store FULL (${Math.round(sw.total / 1048576)} MiB, every tape younger than ${TAPES_KEEP_DAYS} days) — drop from ${pk.slice(0, 16)}… refused`); return reply(507, { ok: false, code: 'TAPES_FULL' }); }
+  tapesNote(sw, pk);   // 0.143.0: the journal line for a routine sweep or a refusal, each with the room left; the refusals are counted
+  if (!sw.ok) return reply(507, { ok: false, code: 'TAPES_FULL' });
   try { require('fs').writeFileSync(fname, payload); } catch (e) { return reply(500, { ok: false, code: 'WRITE_FAILED' }); }
   let digest = '';
   try {
@@ -1233,7 +1630,7 @@ async function handleTapeDrop(req, res, ip) {
   return reply(200, { ok: true });
 }
 
-async function handleOpenIntent(req, res, path, method, ip) {
+async function handleOpenIntent(req, res, path, method, ip, viaConn) {
   const reply = (code, obj) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(obj)); };
   if (method === 'POST' && path === '/openintent') {
     if (oiRateLimited(ip)) return reply(429, { ok: false, code: 'RATE_LIMITED' });
@@ -1243,6 +1640,7 @@ async function handleOpenIntent(req, res, path, method, ip) {
     const pk = String(b.client_pubkey || '').toLowerCase();
     const amt = Number(b.amount_sats);
     if (!id || !/^[0-9a-f]{66}$/.test(pk) || !(amt > 0) || !b.sig) return reply(400, { ok: false, code: 'BAD_FIELDS' });
+    if (!viaConn) { try { formCounts.web(pk, 'lijox.openintent'); } catch (_) {} }   // 0.141.0 (F3b): this request has a form inside the connection
     if (openIntents[id]) {
       const st0 = await openIntentObserve(openIntents[id]);
       return reply(200, { ok: true, state: st0.state, funding_txid: st0.funding_txid || null, expiry_ms: openIntents[id].expiry_ms });
@@ -1732,6 +2130,14 @@ if (process.argv.includes('--tower-drill')) {
   console.log('\nDrill request written: ' + file + '\nThe running adapter reads it within a minute. It sends ' + (Number(process.env.TOWER_DRILL_SATS) || 20000) + ' sats of this box through two on-chain transactions and gets them back less the two fees.\nFollow it in the journal (lines marked [TOWER-DRILL]) or on the Console\'s Tower card.\n');
   process.exit(0);
 }
+// 0.137.0: `node lij-adapter.js --form-counts [days]` prints what form-counts.js has counted (30 days unless a number
+// follows): how many wallets were seen, which opened a tunnel without a pass, which sent a moved request as a web
+// request. It reads the file the running adapter writes once a minute and changes nothing.
+if (process.argv.includes('--form-counts')) {
+  const days = Number(process.argv[process.argv.indexOf('--form-counts') + 1]) || 30;
+  console.log('\n' + formCounts.reportText(days) + '\n\nRead from ' + require('path').join(DATA_DIR, 'form-counts.json') + ' (the running adapter writes it once a minute). Nothing was changed.\n');
+  process.exit(0);
+}
 const ADAPTER_LOGIC_VERSION = 'v' + require('./package.json').version; /* O3: JIT_REMOTE_RESERVE_SATS honored at gRPC open (field 25) — the deferred REST-path reserve override, un-deferred; startup line tells the truth */ /* P7: /health default answers wallet needs only (detail behind HEALTH_DETAIL=on incl. lnd_version + counters); /health/jit admin-gated unless detail on */ /* step 1: first-run doctor — startup-only checks (cert readable, macaroon present, data-dir write probe, REST+macaroon+identity-match with 5s timeout, gRPC TCP probe), plain-sentence failures, LIJOX_DOCTOR=off escape; banner reads this const */ void ADAPTER_LOGIC_VERSION;
 try { SM = require('./lij-sm.js'); }
 catch (e) { SM = { emit: () => {} }; console.warn('[SM] shadow module not loaded:', e.message); }
@@ -2083,6 +2489,10 @@ function lnurlpRegisterRecordIdV1(name, hashes) {   // 0.112.0's form, kept for 
 // The check both routes make: fields present and well-formed, the signer is the record's key, the signature holds over
 // the rebuilt record, then (and only then) the nonce is spent. Returns { ok:true } or { ok:false, code, status }.
 function lnurlpAuthCheck(body, action, clientPk, recordId) {
+  // 0.138.0: a request that came inside the Lightning connection needs no signed proof — LND proved the connection's key
+  // at the handshake. It passes when the key it names IS that key, and is refused when it names another.
+  const viaConn = webFormLib.callerOf(body);
+  if (viaConn) return viaConn === String(clientPk).toLowerCase() ? { ok: true, via: 'connection' } : { ok: false, code: 'the connection\'s key is not the record\'s key', status: 403 };
   const nodePk = String((body && body.node_pubkey) || '').toLowerCase();
   const nonce = String((body && body.nonce) || '');
   const signature = String((body && body.signature) || '');
@@ -2175,6 +2585,7 @@ async function routeReportHandle(body, res, ip) {
   const failures = Array.isArray(body && body.failures) ? body.failures : null;
   if (!/^[0-9a-f]{66}$/.test(pk) || !/^[0-9a-f]{64}$/.test(hash) || !failures) { routeReports.refused++; return errResponse(res, 'client_pubkey, payment_hash and failures required', 400); }
   if (failures.length > 64) { routeReports.refused++; return errResponse(res, 'too many failures in one report', 400); }
+  if (!webFormLib.callerOf(body)) { try { formCounts.web(pk, 'lijox.route_report'); } catch (_) {} }   // 0.138.0: this request has a form inside the connection
   const auth = lnurlpAuthCheck(body, 'route-report', pk, routeReportRecordId(hash, failures));
   if (!auth.ok) { routeReports.refused++; routeReportNote(`${pk.slice(0, 16)}… ${hash.slice(0, 12)}…: refused (${auth.code})`); return errResponse(res, 'route report refused: ' + auth.code, auth.status); }
   const handout = routeHandouts.get(hash);
@@ -3028,9 +3439,14 @@ setTimeout(() => { jitFunding.boot().then(() => jitFunding.sweep(true)).catch((e
 
 // Best-effort wake. Never throws into the HTLC path; a dead subscription
 // (404/410 from the push service) is pruned so we don't keep retrying it.
-async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting" · 0.121.0: `extra` rides in the payload (the lease warning's days), `ttlSOverride` keeps it at the push service longer; answers true when a push went out
+// 0.143.0 (found 2026-11-20): the wake has ONE place that knows what happened to it,
+// and it says so. wakePush answers { sent, why } on every way out; sendWakePush (every older caller) answers as it
+// always did — true when a push went out, nothing otherwise. The NWC module is handed wakePush, so its journal line
+// no longer says "woke" about a phone no push went to.
+async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride) { const r = await wakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride); return r.sent ? true : undefined; }
+async function wakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride) {   // 0.86.0: `kind` — 'nwc' is a content-free "a request is waiting" · 0.121.0: `extra` rides in the payload (the lease warning's days), `ttlSOverride` keeps it at the push service longer
   const _wakeT0 = Date.now();   // 0.88.1: the hold's end is counted from here (the caller has just armed it)
-  if (!PUSH_ENABLED) return;
+  if (!PUSH_ENABLED) return { sent: false, why: 'push is switched off on this provider' };
   const key = (pubkeyHex || '').toLowerCase();
   // 0.76.0 (S46, DP ruled "B"): NO WAKE FOR A WALLET THAT IS LIVE RIGHT NOW. The push exists
   // for a wallet that is not running; a running one shows the payment itself, and the OS
@@ -3039,7 +3455,7 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride
   // or asleep phone still gets its wake. Read before the throttle so a skip stamps nothing.
   try {
     const lv = await walletLiveNow(key);
-    if (lv.live) { console.log(`[PUSH] wake skipped for ${key.slice(0,16)}… — wallet live (peer + heartbeat ${lv.heard_s}s ago)`); return; }
+    if (lv.live) { console.log(`[PUSH] wake skipped for ${key.slice(0,16)}… — wallet live (peer + heartbeat ${lv.heard_s}s ago)`); return { sent: false, why: `the wallet is connected and was heard ${lv.heard_s} s ago \u2014 it needs no wake` }; }
   } catch (_) {}
   // v0.43.0 (S31): per-wallet throttle - MPP shards and resume-notify must
   // not machine-gun the device. One wake per wallet per 20s window (was 60s;
@@ -3048,13 +3464,13 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride
   const _wLast = global._lijWakePushAt[key] || 0;
   if (Date.now() - _wLast < 20000) {
     console.log(`[PUSH] wake throttled for ${key.slice(0,16)}... (${Date.now() - _wLast}ms since last)`);
-    return;
+    return { sent: false, why: `a wake was asked for this wallet ${Math.round((Date.now() - _wLast) / 1000)} s ago (one per 20 s)` };
   }
   global._lijWakePushAt[key] = Date.now();
   const sub = pushSubs[key];
   if (!sub) {
     console.log(`[PUSH] no subscription for ${key.slice(0,16)}… — no wake sent`);
-    return;
+    return { sent: false, why: 'this wallet has no push subscription here' };
   }
   try {
     // v0.55.6 (S36, DP UX fix): the wake payload now CARRIES the wallet's own
@@ -3077,7 +3493,7 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride
     const ttlS = (typeof ttlSOverride === 'number' && ttlSOverride > 0) ? Math.round(ttlSOverride) : Math.max(60, Math.round((holdMs > 0 ? holdMs : clientHoldCapMs(key)) / 1000));   // the push service keeps it as long as before · 0.121.0: or as long as the caller says
     await webpush.sendNotification(sub, JSON.stringify(msg), { TTL: ttlS });   // 0.86.0: t = 'nwc' for an NWC request
     console.log(`[PUSH] wake sent to ${key.slice(0,16)}… (${msg.hold_s ? 'hold_s=' + msg.hold_s : 'no hold stated'}${msg.t !== 'wake' ? ', t=' + msg.t : ''})`);
-    return true;   // 0.121.0
+    return { sent: true, why: 'sent' };   // 0.121.0: true to the older callers (sendWakePush)
   } catch (e) {
     const status = e && e.statusCode;
     console.error(`[PUSH] wake send failed for ${key.slice(0,16)}…: ${e.message} (status=${status})`);
@@ -3086,6 +3502,7 @@ async function sendWakePush(pubkeyHex, holdMsOverride, kind, extra, ttlSOverride
       persistPushSubs();
       console.log(`[PUSH] pruned dead subscription for ${key.slice(0,16)}…`);
     }
+    return { sent: false, why: 'the push service did not take it' + (status ? ' (status ' + status + ')' : '') + ((status === 404 || status === 410) ? ' \u2014 that subscription is dead and was removed' : '') };
   }
 }
 
@@ -3100,15 +3517,17 @@ async function handlePushSubscribe(req, res) {
   } catch (e) {
     return jsonResponse(res, { error: 'invalid_json' }, 400);
   }
-  const { node_pubkey, nonce, signature, subscription } = body || {};
-  if (!node_pubkey || !nonce || !signature || !subscription) {
+  const viaConnPs = webFormLib.callerOf(body);   // 0.142.0: inside the Lightning connection the connection's key is the proof — no nonce, no signature
+  const { nonce, signature, subscription } = body || {};
+  const node_pubkey = viaConnPs || (body || {}).node_pubkey;
+  if (viaConnPs ? !subscription : (!node_pubkey || !nonce || !signature || !subscription)) {
     return jsonResponse(res, { error: 'missing_field',
       required: ['node_pubkey', 'nonce', 'signature', 'subscription'] }, 400);
   }
   if (!/^[0-9a-fA-F]{66}$/.test(node_pubkey)) {
     return jsonResponse(res, { error: 'field_bad', field: 'node_pubkey' }, 400);
   }
-  if (!/^[0-9a-fA-F]{64}$/.test(nonce)) {
+  if (!viaConnPs && !/^[0-9a-fA-F]{64}$/.test(nonce)) {
     return jsonResponse(res, { error: 'field_bad', field: 'nonce' }, 400);
   }
   if (typeof subscription !== 'object' || !subscription.endpoint ||
@@ -3118,7 +3537,7 @@ async function handlePushSubscribe(req, res) {
   // 0.119.0 (F13): the proof binds the subscription (pushSubscriptionRecordId); the old form (nothing bound, engines
   // before v358) is accepted for this one release and logged.
   const subRecord = pushSubscriptionRecordId(subscription);
-  let sig = registryVerifySignature(registryBuildSignedMessage('push-subscribe', nonce, node_pubkey, subRecord), signature, node_pubkey);
+  let sig = viaConnPs ? { ok: true } : registryVerifySignature(registryBuildSignedMessage('push-subscribe', nonce, node_pubkey, subRecord), signature, node_pubkey);
   if (!sig.ok) {
     sig = registryVerifySignature(registryBuildSignedMessage('push-subscribe', nonce, node_pubkey), signature, node_pubkey);
     if (sig.ok) console.log(`[PUSH] subscription for ${String(node_pubkey).toLowerCase().slice(0, 16)}… signed in the OLD form (nothing of it bound — an engine before v358); accepted this release`);
@@ -3126,10 +3545,11 @@ async function handlePushSubscribe(req, res) {
   if (!sig.ok) {
     return jsonResponse(res, { error: sig.code || 'bad_signature' }, 401);
   }
-  const nres = registryNonceStore.consume(nonce);
+  const nres = viaConnPs ? { ok: true } : registryNonceStore.consume(nonce);
   if (!nres.ok) {
     return jsonResponse(res, { error: nres.code }, 401);
   }
+  if (!viaConnPs) { try { formCounts.web(String(node_pubkey).toLowerCase(), 'lijox.push_subscribe'); } catch (_) {} }   // 0.142.0: this request has a form inside the connection
   const key = node_pubkey.toLowerCase();
   const isNew = !Object.prototype.hasOwnProperty.call(pushSubs, key);
   if (isNew && Object.keys(pushSubs).length >= PUSH_SUBS_MAX) {
@@ -6062,6 +6482,22 @@ async function waitForPeer(pubkey, timeoutMs = 30000) {
   }
   throw new Error(`Peer ${pubkey} did not connect within ${timeoutMs}ms — ensure browser wallet has established WebSocket connection first`);
 }
+// 0.146.0 (the operator, 2026-11-25: "When not going through lightning I want to know as both the wallet user and the
+// LSP user"): ONE OF THE FIVE CHECKS THAT CAME AS A WEB REQUEST is counted with its wallet (form-counts.js then says it
+// in the journal and the Console shows today's count) — but only for a wallet that HOLDS A CHANNEL WITH THIS NODE. A
+// wallet of another provider asks the statement and the state file's holder here by design, as web requests; that is
+// not a request that should have been inside this node's Lightning connection. Counted in readBody — the one place
+// every posted body is read — so the four routes themselves are not touched; and counted where the body NAMES the key,
+// before its proof is checked. (The challenge names no wallet and is not counted.)
+const CHECK_WEB_PATHS = [['/v1/state', 'lijox.state'], ['/v1/peer-storage/', 'lijox.state_file'], ['/lsps/registry/my-channels', 'lijox.my_channels'], ['/lsps/registry/recover-close', 'lijox.recover_close']];
+function checkCameAsWeb(req, body) {
+  if (webFormLib.callerOf(req)) return;   // it came inside a connection
+  const path = String((req && req.url) || '').split('?')[0];
+  const hit = CHECK_WEB_PATHS.find(([p]) => (p.endsWith('/') ? path.startsWith(p) && path.length > p.length : path === p));
+  const pk = String((body && body.node_pubkey) || '').toLowerCase();
+  if (!hit || !/^0[23][0-9a-f]{64}$/.test(pk)) return;
+  hasChannelWith(pk).then((own) => { if (own) { try { formCounts.web(pk, hit[1]); } catch (_) {} } }, () => {});
+}
 async function hasChannelWith(pubkey) {
   const data = await lndGet('/v1/channels');
   const channels = data.channels || [];
@@ -6195,8 +6631,12 @@ function startWebSocketProxy() {
       port: CONFIG.lnd.peer_port,
       // 0.136.0: a pass the wallet presents is taken before anything is opened to LND; without one the wallet is
       // passed through as before unless STATE_PASS_REQUIRED is set (state-marks.js)
-      gate: { take: (h) => stateMarks.takePass(h), required: () => stateMarks.required() },
-      onHandshake: (local) => { pushFirstBundle(local).catch((e) => console.warn(`[WS] first chain data: ${e.message}`)); },
+      // 0.145.0: check — a check tunnel (the text frame "lijox-check") is counted against its internet address
+      gate: { take: (h) => stateMarks.takePass(h), required: () => stateMarks.required(), check: () => { const okc = checkTunnelLimit.hit(clientIp).ok; if (okc) checkCounts.opened++; else checkCounts.refused++; return okc; } },
+      onHandshake: (local) => {
+        if (local.check) { checkTunnelHandshake(local, clientIp).catch((e) => console.warn(`[WS] check tunnel: ${e.message}`)); return; }   // 0.145.0: no chain data on a check tunnel
+        pushFirstBundle(local).catch((e) => console.warn(`[WS] first chain data: ${e.message}`));
+      },
     });
     ws.on('close', () => console.log(`[WS] Peer disconnected: ${clientIp}`));
   });
@@ -6217,9 +6657,34 @@ function startWebSocketProxy() {
 // names an inbound peer by the address it came from — the tunnel's end) and the bridge sends the bundle at once.
 // Type 32803 is odd: a peer that does not know it ignores it; the engine takes a bundle whether or not it asked.
 // The wallet still subscribes and is answered as before. No peer matched, or no bridge: nothing sent, nothing changed.
+// 0.145.0 (F2b): THE PEER ON A CHECK TUNNEL. LND names an inbound peer by the address it came from — the tunnel's own
+// end — so the key on the tunnel is known a moment after its handshake. That key is noted with the internet address
+// the tunnel came from (handleHttp limits its requests by that address). A key that holds a channel with this node
+// is a wallet's REAL key on a check tunnel: only a broken or hostile wallet does that, and LND would talk channels
+// with it — the tunnel is closed at once. Nothing is sent to a check tunnel unasked.
+async function checkTunnelHandshake(local, clientIp) {
+  const found = await findPeerOn(local, async () => ((await lndGet('/v1/peers')) || {}).peers || []);
+  if (!found) {
+    checkCounts.not_found++;
+    if (local.alive()) console.log(`[WS] check tunnel: no LND peer on the tunnel's address (port ${local.port}) within 2 s — its requests will be limited by their key`);
+    return;
+  }
+  let holds = false; try { holds = await hasChannelWith(found.peerHex); } catch (_) { holds = false; }
+  if (holds) {
+    checkCounts.closed_for_a_channel++;
+    console.warn(`[WS] check tunnel: the key on it (${found.peerHex.slice(0, 16)}…) HOLDS A CHANNEL with this node — a check tunnel is for a key made for one start; the tunnel is closed`);
+    try { local.close('the key on a check tunnel holds a channel with this node'); } catch (_) {}
+    return;
+  }
+  checkPeers.set(found.peerHex, { ip: 'check:' + clientIp, until: Date.now() + CHECK_PEER_MS });
+  if (checkPeers.size > 2000) { const t = Date.now(); for (const [k, e] of checkPeers) if (t > e.until) checkPeers.delete(k); }
+  console.log(`[WS] check tunnel: its one-time key ${found.peerHex.slice(0, 16)}… found ${found.ms} ms after its handshake (the check methods are served to it, limited by its internet address)`);
+}
+
 async function pushFirstBundle(local) {
   if (!chainBridge || typeof chainBridge.pushBundle !== 'function') return;
   const found = await findPeerOn(local, async () => ((await lndGet('/v1/peers')) || {}).peers || []);
+  try { if (found || local.alive()) formCounts.tunnel(found ? found.peerHex : (local.passKey || null), !!local.passKey); } catch (_) {}   // 0.137.0: one tunnel opening, with a pass or without, under the wallet's key
   if (!found) {
     if (local.alive()) console.log(`[WS] no LND peer on the tunnel's address (port ${local.port}) within 2 s — the wallet asks for its chain data as before`);
     return;
@@ -6280,6 +6745,8 @@ function httpsPost(endpoint, body) {
 // field in place + offered ('1'/'0') + quota_bytes + keep_days_silent + form. A record without the block signs as before.
 // 0.135.0 (lij-worker 0.22.0, S71): a record that carries a `chan_confs` block is signed as 'lijox-register:v6:' + every
 // v5 field in place (the tower's four as '0', '0', '0', '' without a tower) + min + max. Without the block: as before.
+// 0.144.0 (lij-worker 0.24.0, S72 — F4): a record that carries an `rpc` list is signed as 'lijox-register:v7:' + every
+// v6 field in place (the chan_confs block's two as '0', '0' without the block) + the list's words joined by ','.
 function canonicalRegisterMsg(f) {
   const s = (v) => (v === null || v === undefined) ? '' : String(v);
   const n = (v) => String(Number(v) || 0);
@@ -6289,6 +6756,18 @@ function canonicalRegisterMsg(f) {
     n(f.fee_ppm), n(f.fee_base_sats), n(f.channel_open_fee_sats),
     n(f.max_channel_size_sats), (f.supports_jit ? '1' : '0'),
   ];
+  if (f.rpc && f.rpc.length) {
+    // 0.24.0: v7 — a record that says which request forms this provider takes inside the Lightning connection (`rpc`,
+    // today the one word 'lsps0'). Every v6 field in place (the chan_confs block's two as '0', '0' where the record
+    // has none), then ONE field: the words joined by ','.
+    const t = f.tatara || {};
+    const tf = TATARA_FIELDS.map(([k, kind]) => kind === 'list' ? (t[k] || []).map((x) => n(x)).join(',')
+      : kind === 'bool' ? (t[k] ? '1' : '0') : kind === 'int' ? n(t[k]) : s(t[k]));
+    const rf = (f.routes || []).map((r) => [s(r.reach), s(r.endpoint), s(r.wss_url), s(r.filter_url)].join('|')).join(';');
+    const w = f.tower || {};
+    const c = f.chan_confs || {};
+    return 'lijox-register:v7:' + fields.concat([s(f.filter_url), (f.filter_sp ? '1' : '0')], tf, [rf], [(w.offered ? '1' : '0'), n(w.quota_bytes), n(w.keep_days_silent), s(w.form)], [n(c.min), n(c.max)], [f.rpc.map((x) => s(x)).join(',')]).map(encodeURIComponent).join(':');
+  }
   if (f.chan_confs) {
     // 0.22.0: v6 — a record that states how many confirmations this provider asks for before a channel the WALLET funds
     // can be used. Every v5 field in place (the tower's four as '0', '0', '0', '' where the record keeps no tower), then
@@ -6559,6 +7038,10 @@ async function registerWithRegistry() {
     if (tower) { body.tower = { offered: !!towerState.watching, quota_bytes: TOWER_QUOTA_BYTES, keep_days_silent: TOWER_KEEP_DAYS, form: 'teos-v1' }; towerState.registered_offered = body.tower.offered; console.log('[Registry] tower block: ' + (body.tower.offered ? 'offered' : 'NOT offered (not watching)') + ' · ' + TOWER_QUOTA_BYTES + ' bytes a wallet key · ' + TOWER_KEEP_DAYS + ' days'); }
     // 0.135.0 (S71): what this provider states about the confirmations for a channel a wallet funds (lijox-register:v6)
     body.chan_confs = { min: chanConfs.min, max: chanConfs.max };
+    // 0.144.0 (S72, F4): this provider's signed word that it takes requests inside the Lightning connection
+    // (lijox-register:v7). Stated only while the path is up (the chain bridge carries it) — the same condition as the
+    // `rpc` field on /health. WHICH methods it serves a wallet asks inside the connection (lijox.hello).
+    if (chainBridge && lijoxRpc.capability && lijoxRpc.capability.lsps0 === true) body.rpc = ['lsps0'];
     const signWith = async (canonical) => {
       const signed = await lndPost('/v1/signmessage', {
         msg: Buffer.from(canonical, 'utf8').toString('base64'),
@@ -6575,23 +7058,28 @@ async function registerWithRegistry() {
     // mirror between the doors has nothing to level. A registry older than lij-worker 0.13.0 does not know routes
     // (its canonical is v3): that one gets the first door alone, signed once more for it.
     body.signature = await signWith(canonicalRegisterMsg(body));
-    let v3 = null, v4 = null, v5 = null;
+    let v3 = null, v4 = null, v5 = null, v6 = null;
     const errors = [];
     for (const reg of CONFIG.registries) {
       let result = await httpsPost(`${reg}/lsps/register`, body).catch((e) => ({ ok: false, error: e.message }));
+      if (result && !result.ok && body.rpc && /signature does not verify/i.test(String(result.error || ''))) {   // 0.144.0: a registry older than lij-worker 0.24.0 does not know the rpc list
+        console.log('[Registry] ' + reg + ' does not know the rpc list (its answer: ' + result.error + ') — registering without it (v6)');
+        if (!v6) { v6 = Object.assign({}, body); delete v6.rpc; delete v6.signature; v6.signature = await signWith(canonicalRegisterMsg(v6)); }
+        result = await httpsPost(`${reg}/lsps/register`, v6).catch((e) => ({ ok: false, error: e.message }));
+      }
       if (result && !result.ok && body.chan_confs && /signature does not verify/i.test(String(result.error || ''))) {   // 0.135.0: a registry older than lij-worker 0.22.0 does not know the chan_confs block
         console.log('[Registry] ' + reg + ' does not know the chan_confs block (its answer: ' + result.error + ') — registering without it (v5)');
-        if (!v5) { v5 = Object.assign({}, body); delete v5.chan_confs; delete v5.signature; v5.signature = await signWith(canonicalRegisterMsg(v5)); }
+        if (!v5) { v5 = Object.assign({}, body); delete v5.rpc; delete v5.chan_confs; delete v5.signature; v5.signature = await signWith(canonicalRegisterMsg(v5)); }
         result = await httpsPost(`${reg}/lsps/register`, v5).catch((e) => ({ ok: false, error: e.message }));
       }
       if (result && !result.ok && body.tower && /signature does not verify/i.test(String(result.error || ''))) {   // 0.129.0: a registry older than lij-worker 0.21.0 does not know the tower block
         console.log('[Registry] ' + reg + ' does not know the tower block (its answer: ' + result.error + ') — registering without it (v4)');
-        if (!v4) { v4 = Object.assign({}, body); delete v4.chan_confs; delete v4.tower; delete v4.signature; v4.signature = await signWith(canonicalRegisterMsg(v4)); }
+        if (!v4) { v4 = Object.assign({}, body); delete v4.rpc; delete v4.chan_confs; delete v4.tower; delete v4.signature; v4.signature = await signWith(canonicalRegisterMsg(v4)); }
         result = await httpsPost(`${reg}/lsps/register`, v4).catch((e) => ({ ok: false, error: e.message }));
       }
       if (result && !result.ok && body.routes && /signature does not verify/i.test(String(result.error || ''))) {
         console.log('[Registry] ' + reg + ' does not know routes (its answer: ' + result.error + ') — registering the first door alone (v3)');
-        if (!v3) { v3 = Object.assign({}, body); delete v3.routes; delete v3.chan_confs; delete v3.tower; delete v3.signature; v3.signature = await signWith(canonicalRegisterMsg(v3)); }
+        if (!v3) { v3 = Object.assign({}, body); delete v3.rpc; delete v3.routes; delete v3.chan_confs; delete v3.tower; delete v3.signature; v3.signature = await signWith(canonicalRegisterMsg(v3)); }
         result = await httpsPost(`${reg}/lsps/register`, v3).catch((e) => ({ ok: false, error: e.message }));
       }
       console.log('[Registry] Registered at ' + reg + ':', result);
@@ -6996,6 +7484,7 @@ async function consoleSnapshot() {
     channels, wallets, wallet_count: walletCount, pending: pend, unconfirmed, summary_note: consoleNotes.summary.text || '',
     delegate: (() => { try { return lijDelegate.report(); } catch (_) { return null; } })(),   // 0.77.0: the delegate rail's guardrails
     nwc: Object.assign({}, nwc.settings(), nwc.summary()),   // 0.86.0: connections, waiting requests, wakes today
+    not_inside: (() => { try { return formCounts.today(); } catch (_) { return null; } })(),   // 0.146.0: today's moved requests that came as web requests
     onchain_pay: (() => { try { return onchainPay.summary(); } catch (_) { return null; } })(),   // 0.120.0: the Float pane — the float, the open payments, the take-backs due, fees and chain costs
     tower: (() => { try { return towerReport(); } catch (_) { return null; } })(),   // 0.128.0
     jit_funding: (() => { try { return jitFunding.snapshot(); } catch (_) { return null; } })(),   // 0.124.0: the held fundings — the records, the counts, the key
@@ -7008,7 +7497,7 @@ async function consoleSnapshot() {
     deliver_opening: [...deliverOpening.entries()].map(([pk, o]) => ({ wallet: pk.slice(0, 16), size_sats: o.sizeSats, tag: o.tag, age_s: Math.round((Date.now() - o.at) / 1000), after_deadline: !!o.deadline })),   // 0.117.0 (F21)
     inflight_parked: [...jitInflight.values()].map((r) => ({ hash: r.hash.slice(0, 16), circuits: r.circuits.length, kind: r.kind, age_s: Math.round((Date.now() - r.at) / 1000), fail_by: r.auto_fail_height ? r.auto_fail_height - JIT_INFLIGHT_HEADROOM_BLOCKS : null })),   // 0.114.0 (F1)
     routing_reports: { received: routeReports.received, imported: routeReports.imported, refused: routeReports.refused, cap_per_hour: ROUTE_REPORT_MAX_PAIRS_PER_HOUR, handouts_remembered: routeHandouts.size, last: routeReports.last.slice(-10) },   // 0.113.0 (S63): the wallets' routing reports and what went into LND
-    lease: (() => { const r = leaseStatusReport(); delete r.channels; return r; })(),   // 0.111.0: the lease's figures (was the public /lease/status; the per-channel rows ride the channels) uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape,
+    lease: (() => { const r = leaseStatusReport(); delete r.channels; return r; })(),   // 0.111.0: the lease's figures (was the public /lease/status; the per-channel rows ride the channels) uptime_s: Math.round(process.uptime()), tapes, last_tape_ms: lastTape, tape_store: tapeStoreReport(),
   };
 }
 
@@ -7065,7 +7554,8 @@ function readBody(req, maxBytes) {
         const parsed = body ? JSON.parse(body) : {};
         // 0.73.0: any POST that names its wallet is proof of life for the lease
         if (parsed && typeof parsed.client_pubkey === 'string') leaseTouch(parsed.client_pubkey, 'api:' + String(req.url || '').split('?')[0]);
-        resolve(parsed);
+        try { checkCameAsWeb(req, parsed); } catch (_) {}   // 0.146.0: one of the five checks that came as a web request is counted with its wallet
+        resolve(webFormLib.carry(req, parsed));   // 0.138.0: a body from a request that came inside a connection carries that connection's key
       }
       catch (e) { reject(new Error('Invalid JSON')); }
     });
@@ -7082,6 +7572,7 @@ const registryRouter = makeRegistryRouter({
   jsonResponse,
   errResponse,
   readBody,
+  callerOf: webFormLib.callerOf,   // 0.144.0: a channel record that came inside a connection is stored under that connection's key (lijox.channel_record)
 });
 
 // ── CORS handling (v0.9) ──────────────────────────────────────────────────────
@@ -7901,9 +8392,22 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   const parsed = new url.URL(req.url, `http://localhost:${CONFIG.adapter.port}`);
   const path   = parsed.pathname;
   const method = req.method;
-  const ip     = getClientIp(req);
-
-  console.log(LOG_CLIENT_IP ? `[HTTP] ${method} ${path} from ${ip}` : `[HTTP] ${method} ${path}`);  // v0.48 (P4): IP logging is opt-in
+  const viaConn = webFormLib.callerOf(req);   // 0.138.0: the key of the connection this request came inside, or null for a web request
+  // 0.142.0: a request inside the connection has no internet address — until now every one of them was limited as the
+  // one address "unknown", so the per-address limits of the routes behind (the Push note read, the kit holder, …) were
+  // shared by all wallets. Inside the connection the limit is per wallet.
+  const viaCheck = viaConn ? checkPeerOf(viaConn) : null;   // 0.145.0: the request came inside a CHECK tunnel — its key is new every time, so it is limited by the tunnel's internet address, as its web form is
+  const ip      = viaCheck ? viaCheck.ip : viaConn ? 'peer:' + viaConn : getClientIp(req);
+  console.log(viaConn ? `[HTTP] ${method} ${path} inside the connection of ${viaConn.slice(0, 16)}…` : (LOG_CLIENT_IP ? `[HTTP] ${method} ${path} from ${ip}` : `[HTTP] ${method} ${path}`));  // v0.48 (P4): IP logging is opt-in
+  if (!viaConn && MOVED_WEB_UNNAMED[method + ' ' + path]) { try { formCounts.web(null, MOVED_WEB_UNNAMED[method + ' ' + path]); } catch (_) {} }
+  if (!viaConn && MOVED_WEB_QUERY_KEY[method + ' ' + path]) { try { formCounts.web(String(parsed.searchParams.get('client_pubkey') || '').toLowerCase(), MOVED_WEB_QUERY_KEY[method + ' ' + path]); } catch (_) {} }   // 0.139.0
+  if (!viaConn && MOVED_WEB_QUERY_CLIENT[method + ' ' + path]) { try { const _c = String(parsed.searchParams.get('client') || '').toLowerCase(); if (/^[0-9a-f]{66}$/.test(_c)) formCounts.web(_c, MOVED_WEB_QUERY_CLIENT[method + ' ' + path]); } catch (_) {} }   // 0.141.0
+  if (!viaConn && method === 'GET' && path.startsWith('/openintent/')) { try { formCounts.web(null, 'lijox.openintent_status'); } catch (_) {} }   // 0.141.0
+  // 0.142.0: the web forms of the table's requests are counted here (the wallet's key is in the body: counted without it;
+  // the push subscription is counted with its key where the body is read) — and, when the operator has set
+  // LIJOX_WEB_FORMS=refuse, the web form of ANY moved request is refused here and not carried out (F5).
+  const moved142 = viaConn ? null : movedWebForm(method, path, parsed.searchParams);
+  if (moved142 && REST142.some((r) => r[0] === moved142) && moved142 !== 'lijox.push_subscribe') { try { formCounts.web(null, moved142); } catch (_) {} }
 
   // v0.9: CORS headers on every response, plus OPTIONS preflight short-circuit
   setCorsHeaders(req, res);
@@ -7915,6 +8419,10 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     res.writeHead(204);
     res.end();
     return;
+  }
+  if (moved142 && REFUSE_WEB_FORMS) {   // 0.142.0 (F5): after the CORS headers, so a wallet's page can read the answer
+    console.log(`[RPC] the web form of ${moved142} was refused (${method} ${path}) — LIJOX_WEB_FORMS=refuse`);
+    return jsonResponse(res, { ok: false, error: 'this request is taken inside the Lightning connection only', code: 'INSIDE_ONLY', method: moved142 }, 426);
   }
 
   // 0.109.0 (S61, DP 2026-10-19 — the Black start page at every provider, a LIJOX standard like the watchtower): GET
@@ -7998,6 +8506,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
                                            connected: (rawCounters.connected !== undefined ? rawCounters.connected : null) },
         kit_holder:      kitHolder.capability,   // 0.79.0: LIJOX Black Start BS1 — this box keeps sealed escape kits
         tower:           towerCapability(),   // 0.128.0: LIJOX watch duty W1 — this box keeps wallets' encrypted penalty transactions and watches the chain for them (offered only while it is watching)
+        rpc:             chainBridge ? lijoxRpc.capability : null,   // 0.137.0: { lsps0: true } — this provider takes requests inside the Lightning connection (LSPS0, message 37913); what it serves there it says inside the connection (lijox.hello). null without the chain bridge: no message stream
         state_pass:      stateMarks.capability,    // 0.136.0: this box keeps a wallet's high marks and gives the pass for its tunnel (required: whether a wallet without a pass is refused)
         peer_storage:    peerStorage.capability,   // 0.126.0: this box holds a wallet's channel state file (BOLT #1110's file over HTTPS; max_bytes 65531)
         recover_page:    RECOVER_BUILD,          // 0.109.0: the Black start page served at /recover (its build), null when the release carries none
@@ -8166,13 +8675,13 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
   // /delegate (client-signed objects, possession-gated at the handler).
   if (path === '/openintent' || path.startsWith('/openintent/')) {
     return handleOpenIntent(req, res, path, method,
-      String(req.headers['cf-connecting-ip'] || (req.socket && req.socket.remoteAddress) || '?'));
+      viaConn ? 'peer:' + viaConn : String(req.headers['cf-connecting-ip'] || (req.socket && req.socket.remoteAddress) || '?'), viaConn);   // 0.141.0 (F3b): a request inside the connection is limited per wallet, not all of them as one address
   }
 
   // ── TAPEDROP (v0.36.0) — mobile flight-recorder evidence pipe.
   if (method === 'POST' && path === '/tapedrop') {
     return handleTapeDrop(req, res,
-      String(req.headers['cf-connecting-ip'] || (req.socket && req.socket.remoteAddress) || '?'));
+      viaConn ? 'peer:' + viaConn : String(req.headers['cf-connecting-ip'] || (req.socket && req.socket.remoteAddress) || '?'));   // 0.142.0: per wallet inside the connection
   }
 
   // All other routes require auth
@@ -8338,7 +8847,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       if (e) { hit = e; owner = String(rec.client_pubkey || '').toLowerCase(); break; }
     }
     // 0.116.0 (F14, the second half): the owner proves the key — the proof fields in the query, over `note:<hash>:<client>`
-    { const npr = lnurlpAuthCheck(proofFromQuery(parsed.searchParams), 'lnurl-note', who, 'note:' + hash + ':' + who); if (!npr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + npr.code }, npr.status); }
+    { const npr = lnurlpAuthCheck(webFormLib.carry(req, proofFromQuery(parsed.searchParams)), 'lnurl-note', who, 'note:' + hash + ':' + who); if (!npr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + npr.code }, npr.status); }
     if (!hit) return jsonResponse(res, { ok: false, error: 'unknown hash' }, 404);
     if (owner !== who) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
     touchWalletActive(who);
@@ -8354,7 +8863,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     const oName = String(parsed.searchParams.get('name') || '').toLowerCase();
     const oWho = String(parsed.searchParams.get('client_pubkey') || '').toLowerCase();
     if (!lnurlpNameSafe(oName) || !/^[0-9a-f]{66}$/.test(oWho)) return jsonResponse(res, { ok: false, error: 'bad request' }, 400);
-    { const opr = lnurlpAuthCheck(proofFromQuery(parsed.searchParams), 'lnurl-note', oWho, 'register-open:' + oName + ':' + oWho); if (!opr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + opr.code }, opr.status); }
+    { const opr = lnurlpAuthCheck(webFormLib.carry(req, proofFromQuery(parsed.searchParams)), 'lnurl-note', oWho, 'register-open:' + oName + ':' + oWho); if (!opr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + opr.code }, opr.status); }
     const oRec = lnurlpRegistry[oName];
     if (!oRec) return jsonResponse(res, { ok: false, error: 'not found' }, 404);
     if (String(oRec.client_pubkey || '').toLowerCase() !== oWho) return jsonResponse(res, { ok: false, error: 'not yours' }, 403);
@@ -8400,13 +8909,9 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     // 0.116.0 (F10): the dial is the wallet's — the node key's proof over `prefs:<hold_ms>` (engine v355), or nothing
     { const fpr = lnurlpAuthCheck(body, 'client-prefs', String(body.client_pubkey).toLowerCase(), 'prefs:' + String(body.hold_ms)); if (!fpr.ok) return jsonResponse(res, { ok: false, error: 'auth: ' + fpr.code }, fpr.status); }
     const pk = body.client_pubkey.toLowerCase();
-    clientPrefs[pk] = Object.assign(clientPrefs[pk] || {}, { hold_ms: Math.round(body.hold_ms), updated: Date.now() });
-    clientPrefsPersist();
-    const eff = clientHoldCapMs(pk);
-    touchWalletActive(String((body && body.client_pubkey) || '').toLowerCase());  /* v0.54.4 (d): prefs = awake proof */
-    console.log(`[prefs] ${pk.slice(0, 16)}… hold_ms=${body.hold_ms} effective=${eff} (lsp cap ${OFFLINE_HOLD_CAP_MS})`);
-    return jsonResponse(res, { ok: true, hold_ms_effective: OFFLINE_HOLD_ENABLED ? eff : 0, lsp_cap_ms: OFFLINE_HOLD_CAP_MS, hold_enabled: OFFLINE_HOLD_ENABLED,   // 0.80.0: the truth, not the ceiling — a provider that does not hold answers 0 and says why
-      zaps: !!(clientPrefs[pk] && clientPrefs[pk].zaps === true), zaps_offered: zaps.on });   // 0.132.0: the wallet's zap choice as this provider holds it, and whether zaps are offered — the wallet's switch shows this, not a note of its own
+    try { formCounts.web(pk, 'lijox.prefs_set'); } catch (_) {}   // 0.137.0: this request has a form inside the connection
+    const hr = prefsSet(pk, { hold_ms: body.hold_ms });   // 0.137.0: the one function both forms call
+    return jsonResponse(res, hr.body, hr.status);
   }
   // 0.116.0 (S63, Kimi round 2 F10 — DP "Agreed"): THE AWAKE PROOF. The page sends this every 30 s while it is open:
   // the node key's proof (engine v355 lsp_proof, action "heartbeat") over `hb:<unix s>`; within 90 s of now. It is the
@@ -8431,6 +8936,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     let wb; try { wb = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
     const wpk = String((wb && wb.node_pubkey) || '').toLowerCase();
     if (!/^[0-9a-f]{66}$/.test(wpk)) return jsonResponse(res, { ok: false, error: 'node_pubkey required' }, 400);
+    if (!viaConn) { try { formCounts.web(wpk, 'lijox.wake_schedule'); } catch (_) {} }   // 0.141.0 (F3b): this request has a form inside the connection
     if (!proofTsOk(wb.ts)) return jsonResponse(res, { ok: false, error: 'ts outside the 90-s window' }, 400);
     const wt = subsLib.wakeTimes(wb.times, Math.floor(Date.now() / 1000));
     if (!wt.ok) return jsonResponse(res, { ok: false, error: wt.error }, 400);
@@ -8520,6 +9026,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!lim.ok) { lnurlFetchCounts.refused++; return errResponse(res, 'Rate limit exceeded', 429); }
     let fbody; try { fbody = await readBody(req); } catch (e) { return errResponse(res, 'Invalid JSON body', 400); }
     try { const cp = String((fbody && fbody.client_pubkey) || '').toLowerCase(); if (/^[0-9a-f]{66}$/.test(cp)) leaseTouch(cp, 'api:/v1/lnurl/fetch'); } catch (_) {}
+    if (!webFormLib.callerOf(fbody)) { try { formCounts.web(String((fbody && fbody.client_pubkey) || '').toLowerCase(), 'lijox.lnurl_fetch'); } catch (_) {} }   // 0.139.0: this request has a form inside the connection
     lnurlFetchCounts.asked++;
     const out = await lnurlFetch.fetchForWallet(fbody && fbody.url);
     if (out.ok) lnurlFetchCounts.served++; else lnurlFetchCounts.refused++;
@@ -8996,6 +9503,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!pubkey || pubkey.length !== 66 || !/^[0-9a-f]{66}$/.test(pubkey)) {
       return errResponse(res, 'client_pubkey must be 66 lowercase hex chars');
     }
+    if (!viaConn) { try { formCounts.web(pubkey, 'lijox.pending'); } catch (_) {} }   // 0.141.0 (F3b): this request has a form inside the connection
     // 0.116.0 (F10): the poll stamps "awake" only with the node key's proof over `pending:<unix s>` (engine v355); a poll
     // without one still answers — it just proves nothing
     if (body.signature || body.nonce || body.node_pubkey) {
@@ -9159,6 +9667,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
     if (!clientPubkey || clientPubkey.length !== 66 || !/^[0-9a-f]{66}$/.test(clientPubkey)) {
       return errResponse(res, 'client_pubkey must be 66 lowercase hex chars (compressed secp256k1 pubkey)');
     }
+    if (!viaConn) { try { formCounts.web(clientPubkey, 'lijox.jit_buy'); } catch (_) {} }   // 0.141.0 (F3b): this request has a form inside the connection
 
     // Reap expired promises before insert (cheap; bounded by map size).
     reapExpiredJitBuys();
@@ -9712,6 +10221,7 @@ async function main() {
 
       chainBridge = startBridge({
         onPeerActivity: (peerHex, typeId) => leaseTouch(peerHex, 'msg:' + typeId),   // 0.73.0
+        onLsps0: (peerHex, buf) => lijoxRpc.onMessage(peerHex, buf),   // 0.137.0: a request inside the Lightning connection
         lightningClient,
         chainNotifierClient,
         walletKitClient,
@@ -9721,6 +10231,8 @@ async function main() {
         restTls:  lndRestTls(),   // 0.95.0 (D3): the same certificate rule as every other REST call
       });
       console.log('[Startup] Cooperative chain bridge: started');
+      console.log(`[RPC] requests inside the Lightning connection: on (LSPS0, message 37913) — ${lijoxRpc.methodNames().length} methods: ${lijoxRpc.methodNames().join(', ')}`);
+      console.log(`[RPC] the web forms of the moved requests: ${REFUSE_WEB_FORMS ? 'REFUSED (LIJOX_WEB_FORMS=refuse)' : 'served and counted (LIJOX_WEB_FORMS=refuse closes them — first read `node lij-adapter.js --form-counts`)'}`);
     } catch (e) {
       console.error('[Startup] Cooperative chain bridge failed to start:', e.message);
       console.error('[Startup] Continuing without bridge — set CHAIN_BRIDGE_ENABLED=false to suppress');
@@ -9795,7 +10307,10 @@ async function main() {
       routerClient = makeRouterClient(grpcOpts);
       lightningOpenChannelClient = makeLightningOpenChannelClient(grpcOpts);
       htlcInterceptor = subscribeHtlcInterceptor(routerClient, handleInterceptedHtlc, 'Interceptor',
-        { onResolve: (ck, action) => sentWatch.noteResolution(ck, action) });   // 0.133.0: each answer written to LND is remembered for the sorting
+        { onResolve: (ck, action) => {
+          sentWatch.noteResolution(ck, action);   // 0.133.0: each answer written to LND is remembered for the sorting
+          try { SM.emit('answered', { ck: String((ck && ck.chan_id) || '0') + ':' + String((ck && ck.htlc_id) || '0'), action: String(action || '') }); } catch (_) {}   // 0.140.0: and told to the watch-only list, so a payment handed back to LND leaves it at once
+        } });
       console.log('[Startup] HtlcInterceptor: subscribed (LSPS2 Phase D.2 — trampoline-via-interceptor)');
 
       // v0.18: kick off reconnect-poll timer for offline-HTLC processing.
@@ -9922,6 +10437,7 @@ function shutdown(signal) {
   if (htlcInterceptor) {
     try { htlcInterceptor.stop(); } catch (e) { console.error('[Shutdown] interceptor stop error:', e.message); }
   }
+  try { formCounts.flush(); } catch (_) {}   // 0.137.0: the last minute's counts
   try { sentWatch.flush(); } catch (_) {}   // 0.133.0: the answers given to LND and the wakes sent, written before the exit
   if (chainBridge) {
     try { chainBridge.stop(); } catch (e) { console.error('[Shutdown] bridge stop error:', e.message); }

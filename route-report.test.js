@@ -35,6 +35,7 @@ const ctx = {
   crypto, Buffer, String, Array, Number, Map, Set, Date, Math, JSON, console, parseInt, process: { env: {} },
   registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore,
   LOCAL_PUBKEY: LOCAL,
+  webFormLib: require('./lijox-web-form'), formCounts: { web: () => {} },   // 0.138.0: the report has a form inside the connection; its web form is counted
   lndPost: async (p, body) => { lndCalls.push({ p, body }); return lndAnswer; },
   errResponse: (res, msg, status) => { res.out = { status: status || 400, data: { ok: false, error: msg } }; return true; },
   jsonResponse: (res, data, status) => { res.out = { status: status || 200, data }; return true; },

@@ -13,6 +13,7 @@ const grab = (startMarker, endMarker) => { const a = src.indexOf(startMarker), b
 const tdBlock = grab('function tapedropRecordId(tapeId, tapeJson) {', 'async function handleOpenIntent(');
 const authBlock = grab('function lnurlpAuthCheck(body, action, clientPk, recordId) {', '// 0.116.0 (S63, engine v355\'s lsp_proof): the same check for a GET');
 const sweepBlock = src.match(/function tapesSweep\([\s\S]*?\n}\n/)[0];
+const stateBlock = grab('function tapesState(dir, maxBytes, keepMs, nowMs) {', 'function tapeStoreReport() {');   // 0.143.0: the store's state, the note for a sweep or a refusal, the count of refusals
 
 let passed = 0, failed = 0;
 const t = (n, ok, extra) => { if (ok) { passed++; console.log('  ok · ' + n); } else { failed++; console.log('  FAIL · ' + n + (extra ? ' — ' + extra : '')); } };
@@ -26,13 +27,14 @@ const ctx = {
   require,
   registryBuildSignedMessage: registry.buildSignedMessage, registryVerifySignature: registry.verifySignature, registryNonceStore,
   TAPES_DIR: dir, TAPES_MAX_BYTES: 1024 * 1024, TAPES_KEEP_DAYS: 30,
+  webFormLib: require('./lijox-web-form'),   // 0.138.0: lnurlpAuthCheck looks first whether the request came inside a Lightning connection
   tdRateLimited: () => false,
   readBody: async (req) => req.body,
   peersConnectedSet: async () => peers,
   telemetrySeen: () => {},
 };
 vm.createContext(ctx);
-vm.runInContext(sweepBlock + '\n' + authBlock + '\n' + tdBlock + '\nthis.handleTapeDrop = handleTapeDrop; this.tapedropRecordId = tapedropRecordId;', ctx);
+vm.runInContext(sweepBlock + '\n' + stateBlock + '\n' + authBlock + '\n' + tdBlock + '\nthis.handleTapeDrop = handleTapeDrop; this.tapedropRecordId = tapedropRecordId; this.tapesRefused = tapesRefused; this.tapesState = tapesState;', ctx);
 const { handleTapeDrop, tapedropRecordId } = ctx;
 
 const priv = crypto.randomBytes(32); const pub = Buffer.from(secp256k1.publicKeyCreate(priv, true)).toString('hex');
@@ -89,6 +91,27 @@ t('unsigned from a connected peer: taken this release, the file named claimed-�
 
 // the engine's list names the action (the twin's side of the rule)
 t('the engine\'s PROOF_ACTIONS carries "tapedrop" (lij-core registry_client.rs)', (() => { try { const rs = fs.readFileSync(path.join(__dirname, '..', 'lightning-in-a-jar', 'lij', 'lij-core', 'src', 'registry_client.rs'), 'utf8'); return /PROOF_ACTIONS: &\[&str\] = &\[[^\]]*"tapedrop"/.test(rs); } catch (e) { return true; /* the engine repo is not beside this one here — the engine's own test pins the list */ } })());
+
+// 0.143.0 (found 2026-11-20): a store full of tapes younger than the keep days — the NEW tape is refused. The refusal is
+// counted and written as what it is, with the room; nothing young is deleted to make room (the rule is unchanged).
+for (const f of files()) fs.unlinkSync(path.join(dir, f));
+log.length = 0;
+const big = (i) => JSON.stringify({ kind: 'console_ring', reason: 'fill-' + i, ts: i, lines: ['y'.repeat(250000)] });
+const codes = [];
+for (let i = 0; i < 6; i++) { const tx = big(i); const rr = await drop(Object.assign({ client_pubkey: pub, tape_id: 'fill-' + i, tape_json: tx }, proof(tapedropRecordId('fill-' + i, tx)))); codes.push(rr.code); }
+t('0.143.0: a 1 MiB store takes four 250 KB tapes and refuses the fifth and sixth (507)', JSON.stringify(codes) === '[200,200,200,200,507,507]', JSON.stringify(codes));
+t('0.143.0: nothing young was deleted to make room — the four tapes are all there', files().length === 4 && files().every((f) => /-fill-[0-3]\.json$/.test(f)), JSON.stringify(files()));
+t('0.143.0: each refusal is counted', ctx.tapesRefused.n === 2 && ctx.tapesRefused.last_ms > 0, JSON.stringify(ctx.tapesRefused));
+t('0.143.0: the journal says the tape was REFUSED and is not kept, how full the store is, and the count', log.filter((m) => /^\[TapeDrop\] STORE FULL — the tape from [0-9a-f]{16}… was REFUSED and is not kept: 1 MiB of 1 held, every tape younger than 30 days \(those are never deleted\)\. Refused since this start: [12]\. The two settings that decide: TAPES_MAX_BYTES, TAPES_KEEP_DAYS$/.test(m)).length === 2, JSON.stringify(log.filter((m) => /STORE/.test(m))));
+const stNow = ctx.tapesState(dir, 1024 * 1024, 30 * 86400000, Date.now());
+t('0.143.0: the state says why: 4 tapes, none older than the keep days, less room than one such tape needs', stNow.count === 4 && stNow.past_keep_bytes === 0 && stNow.room_bytes < 250000, JSON.stringify(stNow));
+// a routine sweep: one tape older than the keep days is there — it goes, the new tape is taken, the line says "as set" with the room
+const oldName = (Date.now() - 40 * 86400000) + '-old-1.json';
+fs.renameSync(path.join(dir, files()[0]), path.join(dir, oldName));
+log.length = 0;
+{ const tx = big(9); const rr = await drop(Object.assign({ client_pubkey: pub, tape_id: 'fill-9', tape_json: tx }, proof(tapedropRecordId('fill-9', tx))));
+  t('0.143.0: with one tape older than the keep days in the store, the new tape is taken (200) and that old one is gone', rr.code === 200 && !files().includes(oldName) && files().some((f) => /-fill-9\.json$/.test(f)), JSON.stringify([rr.code, files()]));
+  t('0.143.0: that sweep is written as routine ("as set"), with the room a new tape can still get', log.some((m) => /^\[TapeDrop\] the store is at its cap \(1 MiB\) — 1 tape\(s\) older than 30 days deleted to make room, as set; room a new tape can still get: [0-9.]+ MiB \([0-9.]+ free \+ 0\.0 held by 0 tape\(s\) older than 30 days\)$/.test(m)), JSON.stringify(log.filter((m) => /cap/.test(m)))); }
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log((failed ? 'FAIL' : 'PASS') + ' · tapedrop-proof · ' + passed + ' passed, ' + failed + ' failed');

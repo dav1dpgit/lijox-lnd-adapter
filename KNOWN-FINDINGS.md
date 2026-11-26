@@ -1046,3 +1046,145 @@ yet say how many such wallets still connect; that count is needed before the set
 confidence, and it is not built. (4) The marks name each stated wallet's channels (funding outpoints the box already
 sees in LND) and are kept in `DATA_DIR/state-marks/`; a pass is kept in memory only and is gone at a restart — the
 wallet asks again.
+
+**0.137.0.** Requests inside the Lightning connection — what this release does, and what it does not yet do. It builds
+the path (LSPS0, message 37913, `lijox-rpc.js`) and serves one request on it, the wallet's settings. Its limits, as
+built: (1) Every other request a wallet makes is still a web request; they move in later releases, group by group.
+(2) The checks a wallet makes before it connects (`POST /v1/state`, the channel state file, "which channels do you
+hold") are web requests and stay so in this release: they protect the connection and cannot ride inside it; a short
+connection under a one-time key is designed for them and not built. (3) No method that transfers money is served yet;
+`rid` and its 24-hour store are built and tested so the first such method starts on them. A request whose function
+throws leaves its `rid` "started": what was done is not known to the path, a repeat runs nothing, and each money
+method's own design must say how "started" is settled. (4) An answer for a peer that has disconnected is dropped; the
+wallet's own deadline ends its wait. (5) The path needs the chain bridge: with `CHAIN_BRIDGE_ENABLED=false` there is
+no message stream, `/health` says `rpc: null`, and wallets use the web form. (6) The counts of `form-counts.js` name
+a tunnel's wallet only when LND shows the peer within two seconds of its handshake; a tunnel whose wallet was not
+named is counted apart. Found while building it: nothing in work already released.
+
+**0.138.0.** The send path's three asks inside the connection (`lijox.route_build`, `lijox.route_report`,
+`lijox.outcome`), carried out by their web routes' own code — what it does not yet do. (1) Only a route that reads its
+body with `readBody()` hands the connection's key on to the proof check. A route with a reader of its own (for one,
+`POST /lnurl/register`) is refused there with "signature required" if it is asked inside a connection before it has
+been taught; that is the safe way for it to fail, and no such route is registered as a method yet. (2) A proof that
+rides a query string (`proofFromQuery`) is not met by the connection yet; the GET routes that use one are not moved
+yet. (3) The web form of the route request and of the outcome check names no wallet, so `--form-counts` counts those
+that still come as web requests by method only, not by wallet. (4) A handler that never answers is given 25 s, then
+the wallet is told 504; the wallet's own deadlines are shorter (15 s for a route, 8 s for an outcome). (5) Nothing
+here was run against LND before the release: the three routes' code is the code that already answers them on the
+web, and the path under them is the one 0.137.0 proved on a box. Found while building it: nothing in work already
+released.
+
+**0.139.0.** The wallet page's seven asks inside the connection (`lijox.lnurl_fetch`, `lijox.onchain_quote`,
+`lijox.onchain_status`, `lijox.push_quote`, `lijox.push_status`, `lijox.push_receivable`, `lijox.push_note`) — what
+it does not yet do. (1) 0.138.0's point (2) is met for one route: the on-chain status read's proof from the query
+string carries the connection's mark. The other three GET routes with a proof in the query (the Push claim's status,
+the payer's-note read, the Register's read of its open requests) are not taught and not moved. (2) `lijox.push_status` and `lijox.push_note`
+answer a wallet connected to this box. A wallet of another provider still reads them over the web, as it must; that
+web form stays for good and is not counted as an older form. (3) An on-chain quote makes a record and two hold
+invoices that stand for 15 minutes. If its answer is lost on the way back, the record stands until it expires and
+counts against the float for that time — the same as when a web answer is lost. The wallet asks again with a new
+payment hash. (4) `lijox.lnurl_fetch` inside the connection is limited per wallet where the web form is limited per
+address. (5) Nothing here was run against LND before the release: the routes' code is the code that already answers
+on the web. Found while building it: nothing in work already released.
+
+**0.140.0.** The requests that move money inside the connection (`lijox.onchain_open`, `lijox.onchain_release`,
+`lijox.push_lock`, `lijox.push_void`, `lijox.push_claim`, with `rid`; the read `lijox.push_claim_status`), and the
+watch-only list told of every answer written to LND — what it does not yet do. (1) A stored answer is the answer to
+that request; what happened later is not in it. A claim answered "on their way" answers so to its `rid` for 24
+hours. News is read with the status reads. (2) A refusal is an answer and is kept like any other: a wallet that wants
+the request carried out again makes a new `rid`. (3) The kept answers live in `DATA_DIR/lijox-rid/`, one file per
+wallet key; 2,000 a wallet in 24 hours, then 429. (4) A route that outlives its limit (25 s; 65 s for a claim) leaves
+its `rid` "started" for good: the path cannot say what the route did, and the wallet reads the state with the status
+read. (5) The provider still cannot say how a payment it forwarded to an outside node ended: `/v1/outcome` answers
+"unknown" for it (from this release at once, where it used to say "pending" for up to two and a half minutes first). Listening
+to LND's own HTLC events is designed after this work. (6) Two GET routes with a proof in the query are still not
+taught the connection's mark: the payer's-note read and the Register's read of its open requests. (7) Nothing here
+was run against LND before the release. Found while building it: `hold_refused` had been reported to the list from
+five places and handled in none (a `[SM-NOTE] unknown event` line each time); an entry whose whole set of parts was
+refused stayed on the list for good.
+
+**0.141.0.** Receiving and channels inside the connection (nine methods, none with `rid`) — what it does not yet do,
+and what was found while reading the routes. (1) FOUND: the web form of `POST /openintent` does not check the
+intent's signature; it checks only that the key the intent names is connected at that moment. Anyone who knows a
+connected wallet's node key can register an intent in its name. The effect is a status record, ten a minute per
+address; no money and no channel follow from it. Inside the connection the intent must name the connection's key.
+The web form stays as it is until the release that refuses the moved requests as web requests. (2) FOUND: the web
+form of `POST /lsps2/register_secret` cannot tell who sends it (the route token is shared by every wallet); since
+0.111.0 the first registration for a promise wins. Inside the connection a channel secret is taken only from the
+wallet that bought the promise. The plain form (an invoice's hash) names no wallet in either form. (3)
+`GET /lsps2/get_info` is counted as a web form only when it names a wallet (`?client=`); without one it is the read
+any wallet makes of a provider it is not connected to, and it is not refused later. (4) `f3b-forms.test.js` compares
+both forms on the real routes for five of the nine; `/lsps2/get_info`, `/lsps2/buy` and `/lsps2/register_secret` are
+tested as registrations only (what each hands to its route). They have not run on LND. (5) `GET /lsps2/pending`
+(the old unsigned poll) has no form inside the connection; the signed POST's form is the one moved.
+
+**0.142.0.** The rest of the wallet's requests inside the connection (22 methods from one table) and the setting
+that refuses the old web forms — what it does not yet do, and what was found. (1) FOUND AND REPAIRED: since 0.138.0
+every request inside the connection was limited as the one internet address "unknown", so the per-address limits of
+the routes behind it (the Push note read, the kit holder, the open intent before 0.141.0) were shared by all wallets.
+From this release such a request is limited per wallet. (2) `f3c-forms.test.js` compares both forms on the real
+routes for the two routes whose code changed (the push subscription, a note read with its proof in the query). The
+other twenty are tested as registrations: what each hands to its route. None has run on LND. (3) The three chit
+requests that move money carry `rid`; whether `/delegate/register` moves money by itself was not settled by
+reading (it answers a funding invoice the wallet then pays) — it is treated as if it did. (4) `LIJOX_WEB_FORMS=refuse`
+is off by default and is not tested against a real wallet: a wallet that has not yet heard this box's `lijox.hello`
+answer sends web forms, and with the setting on those are refused until it has. Turn it on only after
+`--form-counts` shows no web forms for some days. (5) NOT MOVED: the checks a wallet makes before it connects
+(`/v1/state`, `/v1/peer-storage/…`, `/lsps/registry/my-channels`, `/lsps/registry/recover-close`) — they need the
+connection on a one-time key, which is not built; `/health`, `/rates` and the registry (public reads with no wallet
+key); `/push/deliver` and every request a wallet makes of a provider it is not connected to.
+
+**0.143.0.** The wake line and the tape store, said as they are — what this release does not do. (1) The NWC module
+holds a wallet to one wake a minute and stamps that minute BEFORE the wake's outcome is known: a wake that was not
+sent (the wallet was connected) still holds the next one for a minute. Unchanged; the journal now shows both lines.
+(2) The tape store's rule is unchanged: tapes older than the keep days are deleted first, a younger tape never, and
+when none older is left the NEW tape is refused. This release measures and shows that; it does not choose what to
+give up. A tape's file name does not carry the wallet's key, so no wallet has a share of its own: one wallet can use
+up the room for all (twenty tapes an hour from one internet address, 256 KB each). (3) Read in the wallet's page:
+a channel-close tape the box refuses stays on the phone and is sent again on its next pass; the page's other tape
+sender was not read. (4) The state of the store is read from the folder at most once a minute for the Console.
+(5) Not run on LND or against a real push service: the tests use the module with a stand-in wake call, and the
+source of `wakePush` is checked for an answer on every way out.
+
+**0.144.0.** The channel record and a Mix seat inside the connection; the `rpc` list on the registry record — what
+this release does not do, and what was found. (1) FOUND: the census behind 0.142.0 missed the Mix requests. They were
+read for this release. One names the wallet's key and moves: a seat taken in the wallet's own name
+(`lijox.mix_seat`). The others stay web requests on purpose: a ring-signed seat proves "one of this provider's
+Mix-on wallets" and never which — inside the connection the provider would know which, so it is refused there; the
+seat actions are signed by the seat key and are not tied to a wallet; the forwards are asked of other providers.
+(2) `lijox.channel_record` is tested through both forms on the real route (`f4-forms.test.js`, registry.js with its
+own stores). `lijox.mix_seat` is tested as a registration only; `POST /tatara/seat` itself is not changed. Neither
+has run on LND. (3) The `rpc` list is put on the record only while the path inside the connection is up (the chain
+bridge on). The stand-in boot of the build script runs with the bridge off, so the record it registers carries no
+list; the list on a record signed by LND, and a real registry taking it, are not seen until a box runs this
+release against lij-worker 0.24.0. The fall-back for an older registry is run in `f4-forms.test.js` on the
+adapter's own loop with stand-in registries. (4) A wallet reads the list from the registry's copy of the record. No
+wallet release checks the provider's signature on a registry record itself — the registry does, when it takes the
+record. Whoever serves or carries the registry read could take the list out; a wallet then acts as it does without
+it (it asks the provider on its `/health` hint; the wallet page that follows this release asks without a hint). (5) STILL NOT MOVED: the
+checks a wallet makes before it connects (`/v1/state`, `/v1/peer-storage/…`, `/lsps/registry/my-channels`,
+`/lsps/registry/recover-close`) — they need the connection on a one-time key, which is not built.
+
+**0.146.0.** "Not inside Lightning" — what this release does not do. (1) The five checks are counted where the body
+NAMES a wallet's key, before the key's proof is checked: someone who knows a wallet's key and that it holds a
+channel here can make the journal line and the Console's count appear for it. Each of those routes is limited per
+internet address. (2) One LND call (`/v1/channels`) is made for each such web request, to learn whether the key
+holds a channel. (3) The journal line is once an hour per wallet and method and is kept in memory: after a restart
+the first such request is said again. (4) The Console's pane shows today by the box's UTC day, as form-counts.js
+keeps it. (5) Not run on a box.
+
+**0.145.0.** Check tunnels and the five check methods — what this release does not do. (1) NOT RUN AGAINST LND: a
+check tunnel was run against the adapter's own tunnel code with a stand-in for LND's port (`ws-tunnel.test.js`
+k0–k6), the registrations against a stand-in for the web form, and `checkTunnelHandshake` with stand-ins for LND's
+peer list and channel list (`f2b-forms.test.js`). What LND does with a peer under a new key each time is read from
+its source (f2-r1 §1: a peer without a channel takes one of `num-restricted-slots`, default 100, while connected).
+(2) The peer on a check tunnel is known to this box a moment AFTER its handshake (LND's peer list is asked, up to
+2 seconds). A request that arrives before that is served as from any connected key and limited by that key. The
+limit on check tunnels per internet address bounds what this is worth to anyone. (3) A key on a check tunnel that
+holds a channel gets the tunnel closed — but by then LND and that wallet may have exchanged their channel messages.
+The rule protects against nothing the wallet has already done; it stops the tunnel being used further and writes the
+fact down. A correct wallet never does it (its engine refuses to make a check connection under its own key).
+(4) The web forms of the five stay open and are not counted as moved: a wallet of another provider asks the
+statement and the state file's holder by design. (5) The per-address limit of check tunnels counts the address this
+box sees. Behind a relay or Cloudflare that is the address the relay hands on (`getClientIp`), as for every other
+limit here.
