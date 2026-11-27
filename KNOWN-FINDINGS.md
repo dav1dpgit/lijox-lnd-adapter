@@ -1165,6 +1165,19 @@ it (it asks the provider on its `/health` hint; the wallet page that follows thi
 checks a wallet makes before it connects (`/v1/state`, `/v1/peer-storage/…`, `/lsps/registry/my-channels`,
 `/lsps/registry/recover-close`) — they need the connection on a one-time key, which is not built.
 
+**0.146.1.** The three name routes inside the Lightning connection — a defect of 0.142.0 to 0.146.0, repaired. (1) WHAT
+WAS WRONG: `/lnurl/register`, `/lnurl/display` and `/lnurl/release` read their own body and never put the
+connection's mark on it, so each asked a request inside the connection for a signature — which the table's own rule
+takes off. Seen on a box on 2026-11-26: a wallet that switched provider was answered `auth: signature required`, and
+its name stayed with the provider it left (not released, not transferred at the shared host). The same held for a
+name asked for, a refill of its payment hashes and a display name sent inside the connection; on that box the
+journal shows no such refusal, only the release. (2) WHY NO TEST SAW IT: `f3c-forms.test.js` runs the table on a
+stand-in for the web form and, on the real routes, only the two routes 0.142.0 changed. `name-routes-inside.test.js`
+now runs the three routes as written, in both forms, with real signatures. (3) NOT REPAIRED BY THIS RELEASE: a name
+that stayed behind at a provider while this defect was live is still there until its wallet releases it (the wallet
+does so at its next switch away from that provider) — nothing here goes back and frees it. (4) The stand-ins of the
+new test: the shared host's name calls (recorded, answered "ok"), the store, the address host. (5) Not run on a box.
+
 **0.146.0.** "Not inside Lightning" — what this release does not do. (1) The five checks are counted where the body
 NAMES a wallet's key, before the key's proof is checked: someone who knows a wallet's key and that it holds a
 channel here can make the journal line and the Console's count appear for it. Each of those routes is limited per

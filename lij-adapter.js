@@ -9047,7 +9047,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       req.on('error', () => resolve(null));
     });
     let body = null;
-    try { body = JSON.parse(bodyStr); } catch (e) {}
+    try { body = webFormLib.carry(req, JSON.parse(bodyStr)); } catch (e) {}   // 0.146.1: this route reads its own body — the connection's mark is put on it, as readBody() does (a request inside the connection was asked for a signature here since 0.142.0)
     if (!body || !lnurlpNameSafe(String(body.name || '').toLowerCase())   // 0.113.1 (F18): __proto__ / constructor / prototype refused
         || !/^[0-9a-f]{66}$/.test((body.client_pubkey || '').toLowerCase())
         || !Array.isArray(body.hashes)) {
@@ -9136,7 +9136,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       req.on('error', () => resolve(null));
     });
     let dsp = null;
-    try { dsp = JSON.parse(dspStr); } catch (e) {}
+    try { dsp = webFormLib.carry(req, JSON.parse(dspStr)); } catch (e) {}   // 0.146.1: the connection's mark, as in /lnurl/register
     const dspName = String((dsp && dsp.name) || '').toLowerCase();
     const dspPk = String((dsp && dsp.client_pubkey) || '').toLowerCase();
     const dspText = (dsp && typeof dsp.display === 'string') ? dsp.display : null;
@@ -9170,7 +9170,7 @@ const handleHttp = async (req, res) => {   // 0.113.1 (F18): the handler is a na
       req.on('error', () => resolve(null));
     });
     let rel = null;
-    try { rel = JSON.parse(relStr); } catch (e) {}
+    try { rel = webFormLib.carry(req, JSON.parse(relStr)); } catch (e) {}   // 0.146.1: the connection's mark, as in /lnurl/register — without it a wallet's name stayed with the provider it left
     const relName = String((rel && rel.name) || '').toLowerCase();
     const relPk = String((rel && rel.client_pubkey) || '').toLowerCase();
     if (!lnurlpNameSafe(relName) || !/^[0-9a-f]{66}$/.test(relPk)) {   // 0.113.1 (F18): __proto__ / constructor / prototype refused

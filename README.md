@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.146.0, 2026-11-25). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: pre-release (0.146.1, 2026-11-26). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -64,7 +64,7 @@ WHAT YOU NEED BEFORE STARTING
 1. GET THE CODE — pinned to a release, verified
        git clone https://github.com/dav1dpgit/lijox-lnd-adapter && cd lijox-lnd-adapter
        git fetch --tags
-       git checkout v0.146.0         # the newest tag — the last row of RELEASES.md
+       git checkout v0.146.1         # the newest tag — the last row of RELEASES.md
    Verify integrity against that row (since 0.57.0 every row lists
    each file's own sha256; a file the row calls unchanged keeps the
    hash of the last row that named it):
