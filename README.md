@@ -1,6 +1,6 @@
 # LIJOX Adapter
 
-**Status: pre-release (0.146.1, 2026-11-26). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
+**Status: 0.146.1 (2026-11-26). Runs live on the author's two LND nodes and, since 2026-11-19, on an independent operator's Start9 node. No third-party audit.** Every release is an annotated git tag with each file's sha256 in `RELEASES.md`; the author's two nodes deploy a tag's files and compare their hashes to that table. `KNOWN-FINDINGS.md` records defects found in the field, with dates. `MACAROON.md` is the least-privilege LND macaroon recipe the adapter needs. This repository starts from a clean first commit; the private development history is not published.
 
 The standard the adapter implements is at [dav1dpgit/LIJOX](https://github.com/dav1dpgit/LIJOX); the wallet at [dav1dpgit/lightninginajar](https://github.com/dav1dpgit/lightninginajar).
 
@@ -22,7 +22,7 @@ construction.
 
 LICENSE: MIT (see LICENSE).
 
-STATUS: pre-release. Identity is fully operator-config (the adapter
+STATUS: identity is fully operator-config (the adapter
 refuses to start without it), state lives under one data root, a
 first-run doctor checks your setup in plain sentences, and the
 macaroon recipe is least-privilege (MACAROON.md). Known limitation,
